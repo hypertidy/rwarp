@@ -11,6 +11,39 @@
 //!       resample source pixels at the transformed coordinate
 //!
 //! The scanline loop is shared; only the per-pixel resampling differs.
+//!
+//! ## Downsampling and kernel scaling
+//!
+//! These kernels use fixed filter support: 2×2 for bilinear, 4×4 for cubic,
+//! 6×6 for lanczos. At approximately 1:1 source/destination ratio (or when
+//! upsampling), results are bit-identical to GDAL.
+//!
+//! When downsampling significantly (source/destination ratio > ~1.3:1),
+//! GDAL scales the filter support to cover the appropriate source area
+//! (antialiasing). rwarp does not implement this — at 4.5:1 ratio bilinear
+//! outputs differ from GDAL by up to ~1600 intensity units on steep gradients.
+//!
+//! **The practical solution is overview pre-selection.** The planning layer
+//! (`collect_chunk_list`) knows the source/destination ratio from the source
+//! window size vs destination size. Select the overview level whose
+//! resolution is closest to the destination resolution before calling
+//! `warp_resample`. This keeps the effective ratio near 1:1 and matches
+//! GDAL's `-ovr AUTO` path.
+//!
+//! ## Nodata handling
+//!
+//! **Nearest-neighbour**: nodata pixels in source are skipped; destination
+//! retains its fill value.
+//!
+//! **Bilinear**: if any of the 4 contributing source pixels is nodata, the
+//! destination pixel is set to nodata. At edges, valid pixels are weighted
+//! and renormalized (weight sum < 1e-5 → nodata).
+//!
+//! **Cubic**: if any pixel in the 4×4 neighbourhood is nodata, falls back
+//! to bilinear with the same nodata rule.
+//!
+//! **Lanczos**: if any pixel in the 6×6 neighbourhood is nodata, falls back
+//! to cubic.
 
 use crate::transform::{transform_scanline, Transformer};
 
@@ -390,7 +423,7 @@ fn lanczos_sample(
         return cubic_sample(src, ncol, nrow, buf_x, buf_y, nodata);
     }
 
-    // Compute and normalise weights
+    // Compute and normalize weights
     let mut wx = [0.0f64; 6];
     let mut wy = [0.0f64; 6];
     let mut wx_sum = 0.0;

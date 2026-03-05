@@ -26,6 +26,25 @@
 //! - Split: `nMiddle = (nPoints-1)/2`. Left half: nMiddle points [0..nMiddle-1].
 //!   Right half: nPoints-nMiddle points [nMiddle..nPoints-1]. No overlap.
 //! - Separate forward/reverse error thresholds (we simplify to one for now).
+//!
+//! ## Validation
+//!
+//! Validated bit-identical to `GDALApproxTransform` on Sentinel-2 B04 over
+//! Macquarie Island (256×256 tile, EPSG:32755 → EPSG:3031). The default
+//! `max_error = 0.125` matches `gdalwarp`'s default error threshold
+//! (`dfErrorThreshold` in `gdalwarp_lib.cpp` line 1598).
+//!
+//! ## When to use ApproxTransformer vs GenImgProjTransformer
+//!
+//! Use `ApproxTransformer` (wrapping `GenImgProjTransformer`) to match
+//! `gdalwarp`'s default production path. Use `GenImgProjTransformer`
+//! directly when you need exact per-pixel PROJ transforms — this is ~6×
+//! slower but avoids the small fraction of pixels that differ from exact
+//! transforms due to interpolation error.
+//!
+//! For source window planning (`compute_source_window`), always use the
+//! exact transformer — the planning step is cheap and correctness matters
+//! more than speed there.
 
 use crate::transform::Transformer;
 

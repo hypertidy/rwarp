@@ -46,13 +46,48 @@
 //!
 //! ## What we skip (vs GDAL)
 //!
-//! - `CHECK_WITH_INVERT_PROJ` retry (PROJ-4 era workaround)
-//! - `aDstXYSpecialPoints` pole detection (could add later)
-//! - `SAMPLE_GRID` / `SAMPLE_STEPS` warp options (we use fixed defaults)
+//! - `CHECK_WITH_INVERT_PROJ` retry (PROJ-4 era workaround, not needed)
+//! - `aDstXYSpecialPoints` pole detection (planned, not yet implemented)
+//! - `SAMPLE_GRID` / `SAMPLE_STEPS` warp options (fixed defaults used)
+//! - Warp memory budget (not applicable — rwarp operates per-tile)
+//!
+//! ## Antimeridian handling
+//!
+//! When a destination tile straddles the antimeridian (e.g. a Fiji LCC tile
+//! crossing 180°), source X coordinates are bimodal: pixels on one side map
+//! to columns near 0, pixels on the other map to columns near `src_width`.
+//! `compute_source_window` detects this via the >90% width heuristic and
+//! snaps to full source width — correct but reading up to 70× more source
+//! pixels than necessary.
+//!
+//! `collect_chunk_list` resolves this by recursive subdivision: it detects
+//! the low fill ratio, calls `find_discontinuity_range` to locate the gap
+//! in source X coordinates, and splits the destination tile into
+//! left/gap/right sub-tiles each with a compact source window. On GEBCO
+//! tile \[5,3\] (Fiji LCC) this reduces source pixels from 97.9M to 1.4M —
+//! a 70× reduction. Adjacent non-straddling tiles are unaffected.
+//!
+//! This is a cogcache innovation: GDAL achieves the same result indirectly
+//! via warp memory budget subdivision, which rwarp does not implement.
+//!
+//! ## GCP transformers
+//!
+//! `compute_source_window` and `collect_chunk_list` accept any [`Transformer`],
+//! including [`crate::gcp_transform::GcpTransformer`]. GCP-warped imagery
+//! (e.g. Sentinel-2 L1C granules with GCPs instead of a geotransform) can
+//! be planned with the same API as geotransform-based sources.
 
 use crate::transform::Transformer;
 
-/// Result of compute_source_window.
+/// Result of [`compute_source_window`].
+///
+/// Describes the rectangle of source pixels needed to produce a given
+/// destination window. All coordinates are in source pixel space
+/// (0-based, top-left origin).
+///
+/// A `fill_ratio` below ~0.5 suggests the destination window should be
+/// subdivided — use [`collect_chunk_list`] to do this automatically.
+/// A `fill_ratio` of exactly 0.01 indicates the antimeridian snap fired.
 #[derive(Debug, Clone)]
 pub struct SourceWindow {
     /// Column offset in source raster (0-based)

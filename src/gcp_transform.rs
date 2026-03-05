@@ -21,6 +21,36 @@
 //!
 //! Both directions (pixel→geo and geo→pixel) are fit independently at
 //! construction time. No iterative inversion at transform time.
+//!
+//! ## Integration with the warp pipeline
+//!
+//! `GcpTransformer` implements [`crate::Transformer`], so it composes with
+//! `ApproxTransformer`, `compute_source_window`, `collect_chunk_list`, and
+//! `warp_resample` identically to `GenImgProjTransformer`. A GCP-warped
+//! source is planned and executed with the same API as a geotransform-based
+//! source:
+//!
+//! ```rust,ignore
+//! let gcp_t = GcpTransformer::new(&pixel, &line, &geo_x, &geo_y, 0)?;
+//! let approx_t = ApproxTransformer::new(gcp_t, 0.125);
+//! let chunks = collect_chunk_list(&approx_t, src_size, dst_off, dst_size,
+//!                                  1, 0.5, 8, None);
+//! ```
+//!
+//! ## Limitations vs GDAL
+//!
+//! GDAL's GCP transformer also supports thin-plate spline (TPS) warping as
+//! an alternative to polynomials. TPS handles irregularly distributed GCPs
+//! and large distortions better than polynomials but is more expensive.
+//! TPS is not implemented in rwarp.
+//!
+//! For Sentinel-2 L1C granules (typically 4 corner GCPs), order 1 (affine)
+//! is sufficient. Order 2 requires ≥6 GCPs; order 3 requires ≥10 GCPs.
+//!
+//! ## Status
+//!
+//! GCP polynomial fitting and transform: complete and tested.
+//! Integration with the full cogcache/vwarp pipeline: in progress.
 
 use crate::Transformer;
 

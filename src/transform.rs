@@ -15,7 +15,7 @@
 //!     }
 //!   }
 //!
-//! The ApproxTransformer wraps the ENTIRE GenImgProjTransform, not just
+//! The ApproxTransformer wraps the GenImgProjTransform and not just
 //! the reprojection step. The error threshold of 0.125 is in the output
 //! space of GenImgProjTransform = source pixel coordinates (since the
 //! warp kernel always calls with bDstToSrc=TRUE).
@@ -31,6 +31,29 @@
 //! that wraps just the reprojection inside GenImgProjTransformer, but this
 //! is NEVER used by default gdalwarp. It's a separate code path for other
 //! callers.
+//!
+//! ## Cell-centre convention
+//!
+//! GDAL's warp kernel constructs destination pixel coordinates as
+//! `iDstX + 0.5` (cell centres, not top-left corners). The high-level
+//! [`transform_scanline`] function handles this automatically. The raw
+//! [`Transformer::transform`] method receives whatever coordinates the
+//! caller provides — integer pixel indices give top-left corner coordinates,
+//! not centres. This is a silent half-pixel shift that is easy to miss.
+//!
+//! ## Axis order
+//!
+//! [`proj::Proj::new_known_crs`] normalises axis order to easting/northing
+//! (lon/lat) for EPSG codes. Raw PROJ strings or WKT2 definitions with
+//! explicit lat/lon axis order may not be normalized. Prefer EPSG codes.
+//!
+//! ## Two PROJ objects
+//!
+//! Because the `proj` crate's `Proj::convert()` always transforms in the
+//! forward direction of the pipeline it was constructed with, we create
+//! separate `Proj` instances for `dst→src` and `src→dst`. This doubles
+//! PROJ initialisation cost but is negligible for tile-serving use cases
+//! where the transformer is created once and reused across tiles.
 
 use vaster::inv_geotransform;
 
@@ -47,6 +70,17 @@ use vaster::inv_geotransform;
 /// - `dst_to_src=false`: input is src pixel coords, output is dest pixel coords
 ///
 /// For warp, the kernel always calls with dst_to_src=true.
+///
+/// The trait is intentionally minimal — it maps coordinate arrays without
+/// knowing what data values are. This makes it the right seam for future
+/// transformer plugins: curvilinear grids, displacement fields, GCP
+/// polynomials, and others all implement this trait and compose unchanged
+/// with `ApproxTransformer`, `compute_source_window`, and `warp_resample`.
+///
+/// For vector-quantity warps (velocity fields, wind, ocean currents) the
+/// optional [`Transformer::jacobian`] method provides the local frame
+/// rotation needed to correctly reproject `(u, v)` components. Scalar
+/// resampling via `warp_resample` does not call `jacobian`.
 pub trait Transformer {
     fn transform(
         &self,
@@ -54,6 +88,47 @@ pub trait Transformer {
         x: &mut [f64],
         y: &mut [f64],
     ) -> Vec<bool>;
+
+    /// Local Jacobian of the transform at a single point.
+    ///
+    /// Returns the 2×2 matrix:
+    /// ```text
+    /// [[∂x_out/∂x_in,  ∂x_out/∂y_in],
+    ///  [∂y_out/∂x_in,  ∂y_out/∂y_in]]
+    /// ```
+    /// evaluated at `(x, y)` in the input coordinate space.
+    ///
+    /// Used by vector-quantity-preserving warp kernels to rotate `(u, v)`
+    /// fields from the source index-grid frame into the destination CRS
+    /// frame. This is the generalized form of the north-arrow correction:
+    /// "north" (or any reference direction) rotates relative to the display
+    /// grid as you move across a projection, and `(u, v)` components stored
+    /// in index-grid coordinates need the same correction when reprojected.
+    ///
+    /// Scalar resampling via `warp_resample` does not call this method.
+    ///
+    /// The default implementation uses central finite differences (step 1e-5).
+    /// Implementors with analytic Jacobians (e.g. from `proj_factors`) should
+    /// override for accuracy and performance.
+    fn jacobian(&self, dst_to_src: bool, x: f64, y: f64) -> Option<[[f64; 2]; 2]> {
+        let h = 1e-5_f64;
+
+        let mut xp = [x + h, x - h];
+        let mut yp = [y,     y    ];
+        let okx = self.transform(dst_to_src, &mut xp, &mut yp);
+        if !okx[0] || !okx[1] { return None; }
+        let dxdx = (xp[0] - xp[1]) / (2.0 * h);
+        let dydx = (yp[0] - yp[1]) / (2.0 * h);
+
+        let mut xq = [x,     x    ];
+        let mut yq = [y + h, y - h];
+        let oky = self.transform(dst_to_src, &mut xq, &mut yq);
+        if !oky[0] || !oky[1] { return None; }
+        let dxdy = (xq[0] - xq[1]) / (2.0 * h);
+        let dydy = (yq[0] - yq[1]) / (2.0 * h);
+
+        Some([[dxdx, dxdy], [dydx, dydy]])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,14 +288,17 @@ impl Transformer for GenImgProjTransformer {
 // Convenience: transform scanlines
 // ---------------------------------------------------------------------------
 
+
 /// Build destination pixel coordinates for a scanline and transform to source.
 ///
 /// Matches GDAL's pattern at the top of GWKNearestThread (line 5560):
+/// ```text
 ///   for (iDstX = 0; iDstX < nDstXSize; iDstX++) {
 ///       padfX[iDstX] = iDstX + 0.5 + nDstXOff;
 ///       padfY[iDstX] = iDstY + 0.5 + nDstYOff;
 ///   }
 ///   pfnTransformer(..., TRUE, nDstXSize, padfX, padfY, padfZ, pabSuccess);
+/// ```
 pub fn transform_scanline(
     transformer: &impl Transformer,
     dst_y: usize,
