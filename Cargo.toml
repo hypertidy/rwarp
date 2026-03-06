@@ -11,4 +11,4 @@ categories = ["science::geo"]
 exclude = ["*.Rproj", ".Rproj.user",".Rhistory"]
 [dependencies]
 proj = { version = "0.28", features = ["bundled_proj"] }
-vaster = { git = "https://github.com/hypertidy/vaster-rs" }
+vaster = { version = "0.1.0" }
