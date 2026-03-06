@@ -1,3 +1,13 @@
+#![doc = concat!(
+    "> ⚠️ **v", env!("CARGO_PKG_VERSION"), " — early development release.** ",
+    "This crate closely follows GDAL's warp algorithms but is an independent ",
+    "implementation — it is not affiliated with or endorsed by the GDAL project. ",
+    "The logic is validated against GDAL output in the [cogcache](https://github.com/rgdal-dev/cogcache) ",
+    "package but has not been formally verified or tested in production. ",
+    "This crate will change significantly. Feedback and testing are *very* welcome.\n\n",
+    "---",
+)]
+
 //! # rwarp
 //!
 //! A Rust implementation of the GDAL warp pipeline: coordinate transforms,
