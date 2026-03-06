@@ -8,7 +8,7 @@ description = "GDAL warp pipeline in Rust: coordinate transforms, approximate tr
 repository = "https://github.com/hypertidy/rwarp"
 keywords = ["gdal", "warp", "geospatial", "raster", "reprojection"]
 categories = ["science::geo"]
-exclude = ["*.Rproj", ".Rproj.user",]
+exclude = ["*.Rproj", ".Rproj.user",".Rhistory"]
 [dependencies]
 proj = { version = "0.28", features = ["bundled_proj"] }
 vaster = { git = "https://github.com/hypertidy/vaster-rs" }
