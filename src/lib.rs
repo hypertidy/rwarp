@@ -116,7 +116,7 @@
 //!
 //! GDAL source commit used for analysis: `a3b7b01d3e` (GDAL 3.13.0dev,
 //! 2026-02-23). GDAL is MIT-licensed. This crate is an independent
-//! implementation, not a port and as such stands to criticism on its own terms. We
+//! implementation, not a port. We
 //! think it's also very useful as a way to investigate and carry forward the value
 //! of the existing GDAL C++ implementation which has years of battle-tested logic
 //! within.
