@@ -44,8 +44,11 @@
 //! ## Axis order
 //!
 //! [`proj::Proj::new_known_crs`] normalises axis order to easting/northing
-//! (lon/lat) for EPSG codes. Raw PROJ strings or WKT2 definitions with
-//! explicit lat/lon axis order may not be normalized. Prefer EPSG codes.
+//! (lon/lat). Raw PROJ strings (`+proj=...`) must declare `+type=crs` to be
+//! interpreted as CRS definitions rather than pipeline operations; without it
+//! `proj_create_crs_to_crs` receives an operation object and returns NULL.
+//! The [`GenImgProjTransformer::new`] constructor handles this automatically
+//! via `ensure_crs`. WKT2 and EPSG codes need no adjustment.
 //!
 //! ## Two PROJ objects
 //!
@@ -57,6 +60,13 @@
 
 use vaster::inv_geotransform;
 
+fn ensure_crs<'a>(s: &'a str) -> std::borrow::Cow<'a, str> {
+    if s.starts_with("+proj=") && !s.contains("+type=crs") {
+        std::borrow::Cow::Owned(format!("{s} +type=crs"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
 // ---------------------------------------------------------------------------
 // Transformer trait
 // ---------------------------------------------------------------------------
@@ -161,31 +171,34 @@ pub struct GenImgProjTransformer {
 }
 
 impl GenImgProjTransformer {
-    pub fn new(
-        src_crs: &str,
-        src_gt: [f64; 6],
-        dst_crs: &str,
-        dst_gt: [f64; 6],
-    ) -> Result<Self, String> {
-        let src_inv_gt = inv_geotransform(&src_gt)
-            .ok_or_else(|| "Source geotransform not invertible".to_string())?;
-        let dst_inv_gt = inv_geotransform(&dst_gt)
-            .ok_or_else(|| "Dest geotransform not invertible".to_string())?;
+pub fn new(
+    src_crs: &str,
+    src_gt: [f64; 6],
+    dst_crs: &str,
+    dst_gt: [f64; 6],
+) -> Result<Self, String> {
+    let src_inv_gt = inv_geotransform(&src_gt)
+        .ok_or_else(|| "Source geotransform not invertible".to_string())?;
+    let dst_inv_gt = inv_geotransform(&dst_gt)
+        .ok_or_else(|| "Dest geotransform not invertible".to_string())?;
 
-        let proj_dst_to_src = proj::Proj::new_known_crs(dst_crs, src_crs, None)
-            .map_err(|e| format!("PROJ dst→src failed: {}", e))?;
-        let proj_src_to_dst = proj::Proj::new_known_crs(src_crs, dst_crs, None)
-            .map_err(|e| format!("PROJ src→dst failed: {}", e))?;
+    let src = ensure_crs(src_crs);
+    let dst = ensure_crs(dst_crs);
 
-        Ok(Self {
-            src_gt,
-            src_inv_gt,
-            dst_gt,
-            dst_inv_gt,
-            proj_dst_to_src,
-            proj_src_to_dst,
-        })
-    }
+    let proj_dst_to_src = proj::Proj::new_known_crs(&dst, &src, None)
+        .map_err(|e| format!("PROJ dst→src failed: {}", e))?;
+    let proj_src_to_dst = proj::Proj::new_known_crs(&src, &dst, None)
+        .map_err(|e| format!("PROJ src→dst failed: {}", e))?;
+
+    Ok(Self {
+        src_gt,
+        src_inv_gt,
+        dst_gt,
+        dst_inv_gt,
+        proj_dst_to_src,
+        proj_src_to_dst,
+    })
+}
 }
 
 impl Transformer for GenImgProjTransformer {

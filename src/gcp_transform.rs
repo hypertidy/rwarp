@@ -304,6 +304,10 @@ fn fit_polynomial(
 /// M is nt×nt stored row-major in a flat vec. rhs is overwritten with
 /// the solution. Returns `None` if the matrix is singular.
 fn solve_linear_system(m: &mut [f64], rhs: &mut [f64], nt: usize) -> Option<Vec<f64>> {
+    // Find matrix scale for relative singularity check
+    let m_max = m.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let tol = 1e-12 * m_max.max(1e-30); // relative threshold, floor to avoid 0
+
     // Forward elimination with partial pivoting
     for col in 0..nt {
         // Find pivot
@@ -317,7 +321,7 @@ fn solve_linear_system(m: &mut [f64], rhs: &mut [f64], nt: usize) -> Option<Vec<
             }
         }
 
-        if max_val < 1e-15 {
+        if max_val < tol {
             return None; // Singular
         }
 

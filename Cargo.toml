@@ -1,6 +1,6 @@
 [package]
 name = "rwarp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Michael Sumner <mdsumner@gmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -9,6 +9,7 @@ repository = "https://github.com/hypertidy/rwarp"
 keywords = ["gdal", "warp", "geospatial", "raster", "reprojection"]
 categories = ["science::geo"]
 exclude = ["*.Rproj", ".Rproj.user",".Rhistory"]
+
 [dependencies]
-proj = { version = "0.28", features = ["bundled_proj"] }
+proj = { version = "0.31.0", features = ["pkg_config"] }
 vaster = { version = "0.1.0" }
