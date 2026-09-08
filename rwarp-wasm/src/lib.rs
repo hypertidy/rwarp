@@ -15,7 +15,7 @@ use rwarp::approx::ApproxTransformer;
 use rwarp::CrsTransform;
 use rwarp::source_window::{compute_source_window, SourceWindow};
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::warp::{warp_resample_u8, ResampleAlg};
+use rwarp::warp::{warp_resample_t, warp_resample_u8, ResampleAlg};
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,33 @@ impl WarperCore {
         }
         Ok(warp_resample_u8(
             &self.approx, src, src_w, src_h, 4, src_xoff, src_yoff, dst_w, dst_h, Some(3), alg,
+        ))
+    }
+}
+
+impl WarperCore {
+    /// Warp a single-band `f32` buffer, values in, values out. `nodata`
+    /// (and NaN) marks invalid source pixels; unmapped destination pixels
+    /// come back as `nodata` if given, else NaN.
+    #[allow(clippy::too_many_arguments)]
+    pub fn warp_f32(
+        &self,
+        src: &[f32],
+        src_w: usize,
+        src_h: usize,
+        src_xoff: usize,
+        src_yoff: usize,
+        dst_w: usize,
+        dst_h: usize,
+        nodata: Option<f32>,
+        alg: ResampleAlg,
+    ) -> Result<Vec<f32>, String> {
+        if src.len() != src_w * src_h {
+            return Err(format!("source buffer is {} values, expected {}x{}", src.len(), src_w, src_h));
+        }
+        Ok(warp_resample_t(
+            &self.approx, src, src_w, src_h, 1, src_xoff, src_yoff, dst_w, dst_h,
+            Some(nodata.unwrap_or(f32::NAN)), None, alg,
         ))
     }
 }
@@ -157,6 +184,35 @@ impl Warper {
             .warp_rgba(
                 src, src_w as usize, src_h as usize, src_xoff as usize, src_yoff as usize,
                 dst_w as usize, dst_h as usize, alg,
+            )
+            .map_err(|e| JsError::new(&e))
+    }
+}
+
+#[wasm_bindgen]
+impl Warper {
+    /// Warp a single-band `Float32Array` (`src_w * src_h`) into a
+    /// `dst_w * dst_h` `Float32Array` of values. Pass `nodata` as NaN for
+    /// "none"; unmapped output pixels are `nodata` (or NaN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn warp_f32(
+        &self,
+        src: &[f32],
+        src_w: u32,
+        src_h: u32,
+        src_xoff: u32,
+        src_yoff: u32,
+        dst_w: u32,
+        dst_h: u32,
+        nodata: f32,
+        alg: &str,
+    ) -> Result<Vec<f32>, JsError> {
+        let alg = parse_alg(alg).map_err(|e| JsError::new(&e))?;
+        let nd = if nodata.is_nan() { None } else { Some(nodata) };
+        self.core
+            .warp_f32(
+                src, src_w as usize, src_h as usize, src_xoff as usize, src_yoff as usize,
+                dst_w as usize, dst_h as usize, nd, alg,
             )
             .map_err(|e| JsError::new(&e))
     }
@@ -307,5 +363,21 @@ mod tests {
             }
             eprintln!("{alg:?}: {:.2} ms/tile", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
         }
+    }
+
+    #[test]
+    fn warp_f32_carries_values_and_nodata() {
+        let (src_gt, src_size) = webmerc(8);
+        let core = WarperCore::new("EPSG:3857", src_gt, LAEA_TAS, tile_gt(400_000.0), 0.125).unwrap();
+        let win = core.source_window([256, 256], src_size, 1).unwrap();
+        let (w, h) = (win.xsize as usize, win.ysize as usize);
+        // Column gradient in metres-ish, with a nodata stripe.
+        let src: Vec<f32> = (0..w * h).map(|i| if (i % w) % 50 == 0 { -1.0 } else { (i % w) as f32 * 0.25 }).collect();
+        let out = core.warp_f32(&src, w, h, win.xoff as usize, win.yoff as usize, 256, 256, Some(-1.0), ResampleAlg::Bilinear).unwrap();
+        assert_eq!(out.len(), 256 * 256);
+        let valid: Vec<f32> = out.iter().copied().filter(|v| *v != -1.0).collect();
+        assert!(valid.len() > 256 * 200, "most pixels valid: {}", valid.len());
+        assert!(valid.iter().any(|v| v.fract() != 0.0), "fractions survive");
+        assert!(out.iter().all(|v| !v.is_nan()));
     }
 }

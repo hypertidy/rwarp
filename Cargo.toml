@@ -22,7 +22,7 @@ proj4rs = ["dep:proj4rs"]
 [dependencies]
 proj = { version = "0.31.0", features = ["pkg_config"], optional = true }
 proj4rs = { version = "0.1.10", default-features = false, features = ["crs-definitions"], optional = true }
-vaster = { version = "0.1.0" }
+vaster = { version = "0.2.0" }
 
 [workspace]
 exclude = ["rwarp-wasm"]

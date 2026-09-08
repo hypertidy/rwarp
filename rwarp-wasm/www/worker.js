@@ -6,7 +6,8 @@
 // Message out: { id, image: ImageData | null, info: string }
 
 import init, { Warper } from "../pkg/rwarp_wasm.js";
-import { readCogWindowRgba } from "./cog.js";
+import { readCogWindowRgba, readCogWindowF32 } from "./cog.js";
+import { colorizeSingle } from "./colormap.js";
 
 const MAX_SOURCE_TILES = 64;   // refuse tiles that would need more than this
 const MAX_COG_PIXELS = 4 << 20; // and COG windows larger than this
@@ -63,9 +64,21 @@ async function warpTile(msg) {
         return { image: null, info: `window ${x1 - x0}x${y1 - y0} px too large, skipping` };
       }
       const t0 = performance.now();
-      const rgba = await readCogWindowRgba(source, lv, x0, y0, x1, y1);
-      const t1 = performance.now();
-      const out = warper.warp_rgba(rgba, x1 - x0, y1 - y0, x0, y0, dstW, dstH, alg);
+      let out, t1;
+      if (source.style.bands.length >= 3) {
+        // RGB: colour is the data; warp the u8 composite.
+        const rgba = await readCogWindowRgba(source, lv, x0, y0, x1, y1);
+        t1 = performance.now();
+        out = warper.warp_rgba(rgba, x1 - x0, y1 - y0, x0, y0, dstW, dstH, alg);
+      } else {
+        // Single band: warp the values, then colourise the result, so the
+        // kernel interpolates data rather than colours and nodata stays exact.
+        const vals = await readCogWindowF32(source, lv, x0, y0, x1, y1);
+        t1 = performance.now();
+        const nd = source.nodata === null ? NaN : source.nodata;
+        const warped = warper.warp_f32(vals, x1 - x0, y1 - y0, x0, y0, dstW, dstH, nd, alg);
+        out = colorizeSingle(warped, dstW * dstH, source.style, source.nodata);
+      }
       const ms = (performance.now() - t1).toFixed(1);
       const image = new ImageData(new Uint8ClampedArray(out.buffer, out.byteOffset, out.length), dstW, dstH);
       return { image, info: `ovr${lv.id} ${x1 - x0}x${y1 - y0} px, read ${(t1 - t0).toFixed(0)} ms, warp ${ms} ms` };

@@ -85,6 +85,15 @@ function fmtName(format, bits) {
   return (format === 3 ? "float" : format === 2 ? "int" : "uint") + bits;
 }
 
+/// Worker side: read one band of `[x0, y0, x1, y1]` at level `lv` as Float32
+/// (values, not colours), for warping in data space.
+export async function readCogWindowF32(source, lv, x0, y0, x1, y1) {
+  const tiff = await openCog(source.url);
+  const im = await tiff.getImage(Number(lv.id));
+  const [arr] = await im.readRasters({ window: [x0, y0, x1, y1], samples: [source.style.bands[0]] });
+  return arr instanceof Float32Array ? arr : Float32Array.from(arr);
+}
+
 /// Worker side: read `[x0, y0, x1, y1]` (pixels, level `lv`) and return RGBA.
 export async function readCogWindowRgba(source, lv, x0, y0, x1, y1) {
   const tiff = await openCog(source.url);

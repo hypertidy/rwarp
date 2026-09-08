@@ -469,28 +469,70 @@ fn lanczos_sample(
 // Interleaved u8 (multi-band, one pass)
 // =========================================================================
 
-/// Warp a pixel-interleaved `u8` image (`(row, col, band)` layout, e.g. RGBA)
-/// in a single pass.
+/// A pixel sample type the generic kernel can resample.
 ///
-/// Compared with calling [`warp_resample`] once per band this transforms
-/// each destination scanline once, computes kernel weights once per output
-/// pixel, and reads bands from contiguous memory. Semantics otherwise match
-/// the per-band kernels: same weights, same edge fallbacks (lanczos -> cubic
-/// -> bilinear), same rounding.
+/// Integer types round half away from zero (GDAL's `GWKRoundValueT`) and
+/// saturate at the type's range; floats pass through and treat NaN as
+/// nodata.
+pub trait Sample: Copy + PartialEq + 'static {
+    fn to_f64(self) -> f64;
+    fn from_f64(v: f64) -> Self;
+    /// The value written for unmapped / nodata destination pixels when no
+    /// nodata value is given.
+    fn zero() -> Self;
+    #[inline]
+    fn is_nan(self) -> bool { false }
+}
+
+macro_rules! int_sample {
+    ($($t:ty),*) => {$(
+        impl Sample for $t {
+            #[inline] fn to_f64(self) -> f64 { self as f64 }
+            #[inline] fn from_f64(v: f64) -> Self {
+                let r = if v >= 0.0 { (v + 0.5).floor() } else { (v - 0.5).ceil() };
+                r.clamp(<$t>::MIN as f64, <$t>::MAX as f64) as $t
+            }
+            #[inline] fn zero() -> Self { 0 }
+        }
+    )*};
+}
+int_sample!(u8, i8, u16, i16, u32, i32);
+
+impl Sample for f32 {
+    #[inline] fn to_f64(self) -> f64 { self as f64 }
+    #[inline] fn from_f64(v: f64) -> Self { v as f32 }
+    #[inline] fn zero() -> Self { 0.0 }
+    #[inline] fn is_nan(self) -> bool { self.is_nan() }
+}
+impl Sample for f64 {
+    #[inline] fn to_f64(self) -> f64 { self }
+    #[inline] fn from_f64(v: f64) -> Self { v }
+    #[inline] fn zero() -> Self { 0.0 }
+    #[inline] fn is_nan(self) -> bool { self.is_nan() }
+}
+
+/// Warp a pixel-interleaved image of any [`Sample`] type in a single pass.
 ///
-/// Validity is per pixel, not per band. If `alpha_band` is given, a source
-/// pixel whose value in that band is `0` is nodata. Destination pixels that
-/// are unmapped or fall on nodata are written as all zeros (fully transparent
-/// when the alpha band is present).
+/// Layout is `(row, col, band)`; `nbands = 1` is a plain single-band raster.
+/// Each destination pixel is transformed once and the kernel weights are
+/// computed once, then applied to every band from contiguous memory. Same
+/// weights, edge fallbacks (lanczos -> cubic -> bilinear) and rounding as
+/// [`warp_resample`], so single-band integer output is identical to it.
 ///
-/// # Arguments
-/// * `src` - `src_ncol * src_nrow * nbands` bytes, band-interleaved by pixel
-/// * `src_col_off`, `src_row_off` - buffer offset in the full source image
-/// * `alpha_band` - index of the alpha band within a pixel, if any
+/// Validity is per pixel. A source pixel is nodata if any of:
+/// - `mask_band` is given and the pixel's value in that band is zero
+///   (an alpha band);
+/// - `nodata` is given and any band of the pixel equals it;
+/// - any band is NaN (floating types).
+///
+/// Destination pixels that are unmapped or land on nodata are written as
+/// `nodata` if given, else [`Sample::zero`]. With a `mask_band`, the mask
+/// band of the output is itself resampled like any other band, so an alpha
+/// channel survives the warp.
 #[allow(clippy::too_many_arguments)]
-pub fn warp_resample_u8(
+pub fn warp_resample_t<T: Sample>(
     transformer: &impl Transformer,
-    src: &[u8],
+    src: &[T],
     src_ncol: usize,
     src_nrow: usize,
     nbands: usize,
@@ -498,14 +540,16 @@ pub fn warp_resample_u8(
     src_row_off: usize,
     dst_ncol: usize,
     dst_nrow: usize,
-    alpha_band: Option<usize>,
+    nodata: Option<T>,
+    mask_band: Option<usize>,
     alg: ResampleAlg,
-) -> Vec<u8> {
+) -> Vec<T> {
     assert_eq!(src.len(), src_ncol * src_nrow * nbands, "source buffer size mismatch");
-    assert!(alpha_band.map_or(true, |a| a < nbands), "alpha_band out of range");
+    assert!(mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
 
-    let img = Interleaved { src, ncol: src_ncol, nrow: src_nrow, nb: nbands, alpha: alpha_band };
-    let mut out = vec![0u8; dst_ncol * dst_nrow * nbands];
+    let img = Interleaved { src, ncol: src_ncol, nrow: src_nrow, nb: nbands, mask: mask_band, nodata };
+    let fill = nodata.unwrap_or_else(T::zero);
+    let mut out = vec![fill; dst_ncol * dst_nrow * nbands];
     let mut acc = vec![0.0f64; nbands];
     let mut row_acc = vec![0.0f64; nbands];
 
@@ -542,7 +586,7 @@ pub fn warp_resample_u8(
             };
             if hit {
                 for b in 0..nbands {
-                    out[o + b] = gdal_round(acc[b]).clamp(0, 255) as u8;
+                    out[o + b] = T::from_f64(acc[b]);
                 }
             }
         }
@@ -550,27 +594,62 @@ pub fn warp_resample_u8(
     out
 }
 
-/// View over a pixel-interleaved u8 buffer with per-pixel validity.
-struct Interleaved<'a> {
-    src: &'a [u8],
+/// Warp a pixel-interleaved `u8` image (RGB, RGBA, ...) in a single pass.
+/// If `alpha_band` is given, source pixels with alpha 0 are nodata and
+/// unmapped destination pixels come back all-zero (transparent).
+///
+/// This is [`warp_resample_t`] with no nodata value and `alpha_band` as the
+/// mask band.
+#[allow(clippy::too_many_arguments)]
+pub fn warp_resample_u8(
+    transformer: &impl Transformer,
+    src: &[u8],
+    src_ncol: usize,
+    src_nrow: usize,
+    nbands: usize,
+    src_col_off: usize,
+    src_row_off: usize,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    alpha_band: Option<usize>,
+    alg: ResampleAlg,
+) -> Vec<u8> {
+    warp_resample_t(
+        transformer, src, src_ncol, src_nrow, nbands, src_col_off, src_row_off,
+        dst_ncol, dst_nrow, None, alpha_band, alg,
+    )
+}
+
+/// View over a pixel-interleaved buffer with per-pixel validity.
+struct Interleaved<'a, T: Sample> {
+    src: &'a [T],
     ncol: usize,
     nrow: usize,
     nb: usize,
-    alpha: Option<usize>,
+    mask: Option<usize>,
+    nodata: Option<T>,
 }
 
-impl<'a> Interleaved<'a> {
+impl<'a, T: Sample> Interleaved<'a, T> {
     #[inline]
-    fn px(&self, p: usize) -> &'a [u8] {
+    fn px(&self, p: usize) -> &'a [T] {
         &self.src[p * self.nb..(p + 1) * self.nb]
     }
 
     #[inline]
-    fn valid(&self, p: usize) -> bool {
-        match self.alpha {
-            Some(a) => self.src[p * self.nb + a] != 0,
-            None => true,
+    fn valid_px(&self, pix: &[T]) -> bool {
+        if let Some(a) = self.mask {
+            if pix[a] == T::zero() { return false; }
         }
+        match self.nodata {
+            Some(nd) => pix.iter().all(|&v| v != nd && !v.is_nan()),
+            None => pix.iter().all(|&v| !v.is_nan()),
+        }
+    }
+
+    #[inline]
+    fn valid(&self, p: usize) -> bool {
+        self.valid_px(self.px(p))
     }
 
     /// Mirrors `bilinear_sample`. Returns false for nodata / no support.
@@ -589,8 +668,8 @@ impl<'a> Interleaved<'a> {
             }
             let (a, b, c, d) = (self.px(p00), self.px(p10), self.px(p01), self.px(p11));
             for ((((o, &a), &b), &c), &d) in acc.iter_mut().zip(a).zip(b).zip(c).zip(d) {
-                *o = (a as f64 * rx + b as f64 * (1.0 - rx)) * ry
-                    + (c as f64 * rx + d as f64 * (1.0 - rx)) * (1.0 - ry);
+                *o = (a.to_f64() * rx + b.to_f64() * (1.0 - rx)) * ry
+                    + (c.to_f64() * rx + d.to_f64() * (1.0 - rx)) * (1.0 - ry);
             }
             return true;
         }
@@ -606,7 +685,7 @@ impl<'a> Interleaved<'a> {
             if cx >= 0 && cx < ncol && cy >= 0 && cy < nrow {
                 let p = cy as usize * self.ncol + cx as usize;
                 if self.valid(p) {
-                    for (o, &v) in acc.iter_mut().zip(self.px(p)) { *o += v as f64 * w; }
+                    for (o, &v) in acc.iter_mut().zip(self.px(p)) { *o += v.to_f64() * w; }
                     wsum += w;
                 }
             }
@@ -671,14 +750,11 @@ impl<'a> Interleaved<'a> {
         let nb = self.nb;
         for (jj, &wyj) in wy.iter().enumerate() {
             for v in row_acc.iter_mut() { *v = 0.0; }
-            // One contiguous run of wx.len() pixels per row.
             let start = ((y0 as usize + jj) * self.ncol + x0 as usize) * nb;
             let run = &self.src[start..start + wx.len() * nb];
             for (pix, &wxi) in run.chunks_exact(nb).zip(wx) {
-                if let Some(a) = self.alpha {
-                    if pix[a] == 0 { return false; }
-                }
-                for (r, &v) in row_acc.iter_mut().zip(pix) { *r += v as f64 * wxi; }
+                if !self.valid_px(pix) { return false; }
+                for (r, &v) in row_acc.iter_mut().zip(pix) { *r += v.to_f64() * wxi; }
             }
             for (o, &r) in acc.iter_mut().zip(row_acc.iter()) { *o += r * wyj; }
         }
@@ -817,5 +893,70 @@ mod tests {
         }
         let out = warp_resample_u8(&Id, &src, w, h, 3, 0, 0, w, h, None, ResampleAlg::Bilinear);
         assert_eq!(out, src);
+    }
+
+    // ---- generic kernel -----------------------------------------------
+
+    #[test]
+    fn generic_i32_single_band_matches_reference_kernel() {
+        let (w, h) = (40, 33);
+        let mut band: Vec<i32> = (0..w * h).map(|i| ((i * 7919) % 1000) as i32 - 500).collect();
+        // Sprinkle nodata.
+        for i in (0..w * h).step_by(37) { band[i] = -9999; }
+        for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
+            let reference = warp_resample(&Shift, &band, w, h, 0, 0, 37, 30, -9999, alg);
+            let generic = warp_resample_t(&Shift, &band, w, h, 1, 0, 0, 37, 30, Some(-9999), None, alg);
+            assert_eq!(reference, generic, "{alg:?}");
+        }
+    }
+
+    #[test]
+    fn generic_f32_matches_i32_on_integer_data_and_keeps_fractions() {
+        let (w, h) = (24, 20);
+        let band: Vec<i32> = (0..w * h).map(|i| ((i * 31) % 200) as i32).collect();
+        let bandf: Vec<f32> = band.iter().map(|&v| v as f32).collect();
+        for alg in [ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
+            let vi = warp_resample_t(&Shift, &band, w, h, 1, 0, 0, 20, 18, Some(-1), None, alg);
+            let vf = warp_resample_t(&Shift, &bandf, w, h, 1, 0, 0, 20, 18, Some(-1.0), None, alg);
+            let mut fractional = 0;
+            for i in 0..vi.len() {
+                if vi[i] == -1 { assert_eq!(vf[i], -1.0); continue; }
+                // The integer path is the rounded float path; f32 storage can
+                // land exactly on .5 where f64 was a hair below, so allow half.
+                assert!((vf[i] as f64 - vi[i] as f64).abs() <= 0.5 + 1e-3, "{alg:?} pixel {i}: {} vs {}", vf[i], vi[i]);
+                if vf[i].fract() != 0.0 { fractional += 1; }
+            }
+            assert!(fractional > 0, "{alg:?}: float output never carried a fraction");
+        }
+    }
+
+    #[test]
+    fn generic_nan_is_nodata_and_fill_is_nodata() {
+        let (w, h) = (16, 16);
+        let mut src: Vec<f32> = vec![10.0; w * h];
+        for r in 6..10 { for c in 6..10 { src[r * w + c] = f32::NAN; } }
+        struct Id;
+        impl Transformer for Id {
+            fn transform(&self, _: bool, x: &mut [f64], _y: &mut [f64]) -> Vec<bool> { vec![true; x.len()] }
+        }
+        for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic] {
+            let out = warp_resample_t(&Id, &src, w, h, 1, 0, 0, w, h, Some(-9999.0), None, alg);
+            assert_eq!(out[8 * w + 8], -9999.0, "{alg:?}: hole should be filled with nodata");
+            assert_eq!(out[2 * w + 2], 10.0, "{alg:?}: flat field preserved");
+            assert!(out.iter().all(|v| !v.is_nan()), "{alg:?}: NaN leaked into output");
+        }
+        // Without a nodata value the fill is zero.
+        let out = warp_resample_t(&Id, &src, w, h, 1, 0, 0, w, h, None, None, ResampleAlg::Bilinear);
+        assert_eq!(out[8 * w + 8], 0.0);
+    }
+
+    #[test]
+    fn generic_u16_saturates_and_rounds() {
+        assert_eq!(u16::from_f64(65535.7), 65535);
+        assert_eq!(u16::from_f64(-3.0), 0);
+        assert_eq!(u16::from_f64(2.5), 3);
+        assert_eq!(i16::from_f64(-2.5), -3);
+        assert_eq!(i32::from_f64(-0.4), 0);
+        assert_eq!(u8::from_f64(255.49), 255);
     }
 }

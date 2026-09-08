@@ -51,8 +51,9 @@ tile size, per-level resolution and matrix size, URL template). Three kinds:
   nodata/NaN transparent; 3-band u8 passes through as RGB), then warps the
   RGBA. Colormaps in `www/colormap.js` are polynomial fits, no assets.
   The file's CRS comes from GeoKeys (EPSG codes only; override in the panel
-  for user-defined CRSs). Colour-then-warp is a display choice: kernels
-  interpolate colours, not values. A numeric kernel in rwarp would lift that.
+  for user-defined CRSs). Single-band data is warped as Float32 values
+  (`Warper.warp_f32`, nodata and NaN respected) and colourised afterwards;
+  RGB composites are warped as u8.
 
 The worker never sees a service type, only the grid. The source must send
 CORS headers, since tiles are decoded through a canvas.
