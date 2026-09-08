@@ -35,13 +35,24 @@ function txt(el, local) {
 }
 
 /// Read a WMTS 1.0.0 capabilities document and build the grid for `layerId`.
+/// With no `layerId`, a single-layer document (the ArcGIS Server case) is
+/// used as-is; a multi-layer one fails with the list of identifiers.
 export async function wmtsSource(capabilitiesUrl, layerId, opts = {}) {
   const resp = await fetch(capabilitiesUrl);
   if (!resp.ok) throw new Error(`capabilities ${resp.status}`);
   const xml = new DOMParser().parseFromString(await resp.text(), "text/xml");
   const layers = [...xml.getElementsByTagNameNS("*", "Layer")];
-  const layer = layers.find(l => txt(l, "Identifier") === layerId);
-  if (!layer) throw new Error(`layer ${layerId} not in capabilities (${layers.length} layers)`);
+  const ids = layers.map(l => txt(l, "Identifier"));
+  let layer;
+  if (layerId) {
+    layer = layers.find(l => txt(l, "Identifier") === layerId);
+    if (!layer) throw new Error(`layer ${layerId} not in capabilities; available: ${ids.join(", ")}`);
+  } else if (layers.length === 1) {
+    layer = layers[0];
+    layerId = ids[0];
+  } else {
+    throw new Error(`capabilities has ${layers.length} layers, give one: ${ids.join(", ")}`);
+  }
 
   const tmsName = opts.tileMatrixSet
     || txt(layer.getElementsByTagNameNS("*", "TileMatrixSetLink")[0], "TileMatrixSet");
