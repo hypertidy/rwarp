@@ -10,7 +10,7 @@
 //!   ApproxTransformer {                    ← GDALApproxTransform (max_error=0.125)
 //!     wraps: GenImgProjTransformer {       ← GDALGenImgProjTransform
 //!       step 1: dst pixel → dst geo         (apply dst geotransform)
-//!       step 2: dst geo → src geo           (PROJ coordinate transform)
+//!       step 2: dst geo -> src geo          (CRS coordinate transform)
 //!       step 3: src geo → src pixel         (apply inv src geotransform)
 //!     }
 //!   }
@@ -41,32 +41,27 @@
 //! caller provides — integer pixel indices give top-left corner coordinates,
 //! not centres. This is a silent half-pixel shift that is easy to miss.
 //!
-//! ## Axis order
+//! ## CRS backend
 //!
-//! [`proj::Proj::new_known_crs`] normalises axis order to easting/northing
-//! (lon/lat). Raw PROJ strings (`+proj=...`) must declare `+type=crs` to be
-//! interpreted as CRS definitions rather than pipeline operations; without it
-//! `proj_create_crs_to_crs` receives an operation object and returns NULL.
-//! The [`GenImgProjTransformer::new`] constructor handles this automatically
-//! via `ensure_crs`. WKT2 and EPSG codes need no adjustment.
+//! The CRS -> CRS step is abstracted behind [`crate::crs::CrsTransform`].
+//! [`GenImgProjTransformer::new`] builds the pair with whichever backend the
+//! crate was compiled with (`proj` or `proj4rs` feature, see [`crate::crs`]);
+//! [`GenImgProjTransformer::with_backend`] accepts any pair of transforms.
 //!
-//! ## Two PROJ objects
+//! Geographic coordinates are lon/lat in degrees with axis order normalised
+//! to easting/northing, for every backend. Raw PROJ strings (`+proj=...`)
+//! get `+type=crs` appended automatically so libproj interprets them as
+//! CRS definitions rather than pipeline operations.
 //!
-//! Because the `proj` crate's `Proj::convert()` always transforms in the
-//! forward direction of the pipeline it was constructed with, we create
-//! separate `Proj` instances for `dst→src` and `src→dst`. This doubles
-//! PROJ initialisation cost but is negligible for tile-serving use cases
-//! where the transformer is created once and reused across tiles.
+//! ## Two transform objects
+//!
+//! A `CrsTransform` has a fixed direction, so we hold separate instances
+//! for `dst->src` and `src->dst`. This doubles initialisation cost but is
+//! negligible for tile-serving use cases where the transformer is created
+//! once and reused across tiles.
 
+use crate::crs::{crs_pair, CrsTransform};
 use vaster::inv_geotransform;
-
-fn ensure_crs<'a>(s: &'a str) -> std::borrow::Cow<'a, str> {
-    if s.starts_with("+proj=") && !s.contains("+type=crs") {
-        std::borrow::Cow::Owned(format!("{s} +type=crs"))
-    } else {
-        std::borrow::Cow::Borrowed(s)
-    }
-}
 // ---------------------------------------------------------------------------
 // Transformer trait
 // ---------------------------------------------------------------------------
@@ -151,7 +146,7 @@ pub trait Transformer {
 ///
 /// Composes:
 ///   1. Apply geotransform: pixel → geo (always exact)
-///   2. PROJ: CRS → CRS (always exact, per-point)
+///   2. CRS transform: CRS -> CRS (always exact, per-point)
 ///   3. Apply inverse geotransform: geo → pixel (always exact)
 ///
 /// The ApproxTransformer wraps this entire struct from outside (in lib.rs),
@@ -165,40 +160,49 @@ pub struct GenImgProjTransformer {
     dst_gt: [f64; 6],
     dst_inv_gt: [f64; 6],
 
-    // PROJ coordinate transforms
-    proj_dst_to_src: proj::Proj,
-    proj_src_to_dst: proj::Proj,
+    // CRS coordinate transforms
+    crs_dst_to_src: Box<dyn CrsTransform>,
+    crs_src_to_dst: Box<dyn CrsTransform>,
 }
 
 impl GenImgProjTransformer {
-pub fn new(
-    src_crs: &str,
-    src_gt: [f64; 6],
-    dst_crs: &str,
-    dst_gt: [f64; 6],
-) -> Result<Self, String> {
-    let src_inv_gt = inv_geotransform(&src_gt)
-        .ok_or_else(|| "Source geotransform not invertible".to_string())?;
-    let dst_inv_gt = inv_geotransform(&dst_gt)
-        .ok_or_else(|| "Dest geotransform not invertible".to_string())?;
+    /// Build a transformer from CRS strings using the compiled-in backend.
+    pub fn new(
+        src_crs: &str,
+        src_gt: [f64; 6],
+        dst_crs: &str,
+        dst_gt: [f64; 6],
+    ) -> Result<Self, String> {
+        let (crs_dst_to_src, crs_src_to_dst) = crs_pair(src_crs, dst_crs)?;
+        Self::with_backend(src_gt, dst_gt, crs_dst_to_src, crs_src_to_dst)
+    }
 
-    let src = ensure_crs(src_crs);
-    let dst = ensure_crs(dst_crs);
+    /// Build a transformer from caller-supplied CRS transforms.
+    ///
+    /// This is the seam for backends the crate does not ship: a JavaScript
+    /// PROJ build reached from wasm, a curvilinear lookup table, a test
+    /// double. `crs_dst_to_src` maps destination geo coords to source geo
+    /// coords; `crs_src_to_dst` is its inverse.
+    pub fn with_backend(
+        src_gt: [f64; 6],
+        dst_gt: [f64; 6],
+        crs_dst_to_src: Box<dyn CrsTransform>,
+        crs_src_to_dst: Box<dyn CrsTransform>,
+    ) -> Result<Self, String> {
+        let src_inv_gt = inv_geotransform(&src_gt)
+            .ok_or_else(|| "Source geotransform not invertible".to_string())?;
+        let dst_inv_gt = inv_geotransform(&dst_gt)
+            .ok_or_else(|| "Dest geotransform not invertible".to_string())?;
 
-    let proj_dst_to_src = proj::Proj::new_known_crs(&dst, &src, None)
-        .map_err(|e| format!("PROJ dst→src failed: {}", e))?;
-    let proj_src_to_dst = proj::Proj::new_known_crs(&src, &dst, None)
-        .map_err(|e| format!("PROJ src→dst failed: {}", e))?;
-
-    Ok(Self {
-        src_gt,
-        src_inv_gt,
-        dst_gt,
-        dst_inv_gt,
-        proj_dst_to_src,
-        proj_src_to_dst,
-    })
-}
+        Ok(Self {
+            src_gt,
+            src_inv_gt,
+            dst_gt,
+            dst_inv_gt,
+            crs_dst_to_src,
+            crs_src_to_dst,
+        })
+    }
 }
 
 impl Transformer for GenImgProjTransformer {
@@ -206,7 +210,7 @@ impl Transformer for GenImgProjTransformer {
     ///
     /// When `dst_to_src = true` (the warp kernel path):
     ///   1. Apply dst geotransform: pixel → geo
-    ///   2. PROJ: dst CRS → src CRS
+    ///   2. CRS transform: dst CRS -> src CRS
     ///   3. Apply inverse src geotransform: geo → pixel
     fn transform(
         &self,
@@ -225,15 +229,15 @@ impl Transformer for GenImgProjTransformer {
                 y[i] = self.dst_gt[3] + pixel * self.dst_gt[4] + line * self.dst_gt[5];
             }
 
-            // Step 2: PROJ dst geo → src geo (line 3148-3152)
+            // Step 2: CRS dst geo -> src geo (line 3148-3152)
             let mut success = vec![true; n];
             for i in 0..n {
-                match self.proj_dst_to_src.convert((x[i], y[i])) {
-                    Ok((rx, ry)) => {
+                match self.crs_dst_to_src.convert(x[i], y[i]) {
+                    Some((rx, ry)) => {
                         x[i] = rx;
                         y[i] = ry;
                     }
-                    Err(_) => {
+                    None => {
                         success[i] = false;
                     }
                 }
@@ -267,12 +271,12 @@ impl Transformer for GenImgProjTransformer {
 
             let mut success = vec![true; n];
             for i in 0..n {
-                match self.proj_src_to_dst.convert((x[i], y[i])) {
-                    Ok((rx, ry)) => {
+                match self.crs_src_to_dst.convert(x[i], y[i]) {
+                    Some((rx, ry)) => {
                         x[i] = rx;
                         y[i] = ry;
                     }
-                    Err(_) => {
+                    None => {
                         success[i] = false;
                     }
                 }

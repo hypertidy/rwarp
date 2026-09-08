@@ -13,9 +13,12 @@
 //! A Rust implementation of the GDAL warp pipeline: coordinate transforms,
 //! approximate transforms, source window planning, and resampling kernels.
 //!
-//! rwarp is **pure Rust with no runtime GDAL dependency**. It uses the
-//! [`proj`] crate for coordinate reference system transforms and
-//! [`vaster`] for grid arithmetic. The algorithms are independently
+//! rwarp is **pure Rust with no runtime GDAL dependency**. Coordinate
+//! reference system transforms go through the [`crs::CrsTransform`] trait,
+//! with two backends selected by Cargo feature: `proj` (default; the `proj`
+//! crate over libproj, full PROJ) or `proj4rs` (pure Rust, proj-string and
+//! EPSG-code parametric, builds for `wasm32-unknown-unknown`). Grid
+//! arithmetic uses [`vaster`]. The algorithms are independently
 //! implemented with reference to GDAL's source (commit `a3b7b01d3e`,
 //! GDAL 3.13.0dev), not translated from it.
 //!
@@ -129,6 +132,7 @@
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
 //! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510 |
 
+pub mod crs;
 pub mod transform;
 pub mod gcp_transform;
 pub mod approx;
@@ -138,3 +142,4 @@ pub mod warp;
 // Re-export the Transformer trait at the crate root so modules can
 // `use crate::Transformer` without reaching into transform::
 pub use transform::Transformer;
+pub use crs::CrsTransform;

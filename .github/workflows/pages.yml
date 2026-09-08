@@ -1,0 +1,62 @@
+# Build rwarp-wasm and publish the demo to GitHub Pages.
+# One-time setup in the repo: Settings -> Pages -> Source: "GitHub Actions".
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "rwarp-wasm/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rwarp-wasm
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - name: Native tests (proj4rs backend)
+        run: |
+          cargo test --no-default-features --features proj4rs
+          cargo test --manifest-path rwarp-wasm/Cargo.toml
+      - name: Build wasm
+        run: wasm-pack build --target web --release rwarp-wasm
+      - name: Assemble site
+        run: |
+          mkdir -p site/pkg
+          cp rwarp-wasm/www/* site/
+          cp rwarp-wasm/pkg/rwarp_wasm.js rwarp-wasm/pkg/rwarp_wasm_bg.wasm site/pkg/
+          # www/ imports ../pkg/...; on the site both live at the root.
+          sed -i 's#"\.\./pkg/#"./pkg/#' site/worker.js site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

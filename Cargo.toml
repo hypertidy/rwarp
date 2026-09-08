@@ -8,8 +8,21 @@ description = "GDAL warp pipeline in Rust: coordinate transforms, approximate tr
 repository = "https://github.com/hypertidy/rwarp"
 keywords = ["gdal", "warp", "geospatial", "raster", "reprojection"]
 categories = ["science::geo"]
-exclude = ["*.Rproj", ".Rproj.user",".Rhistory"]
+exclude = ["*.Rproj", ".Rproj.user", ".Rhistory", "rwarp-wasm"]
+
+[features]
+# Default: bind to libproj via the `proj` crate (full PROJ: proj.db, WKT,
+# datum grids). Needs a native libproj and does not build for wasm.
+default = ["proj"]
+proj = ["dep:proj"]
+# Pure-Rust backend via `proj4rs`: proj-string / EPSG-code parametric only,
+# no C dependencies, builds for wasm32-unknown-unknown.
+proj4rs = ["dep:proj4rs"]
 
 [dependencies]
-proj = { version = "0.31.0", features = ["pkg_config"] }
+proj = { version = "0.31.0", features = ["pkg_config"], optional = true }
+proj4rs = { version = "0.1.10", default-features = false, features = ["crs-definitions"], optional = true }
 vaster = { version = "0.1.0" }
+
+[workspace]
+exclude = ["rwarp-wasm"]

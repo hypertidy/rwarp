@@ -1,0 +1,22 @@
+[package]
+name = "rwarp-wasm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Michael Sumner <mdsumner@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "wasm-bindgen shim over rwarp: reproject RGBA tiles in the browser."
+repository = "https://github.com/hypertidy/rwarp"
+publish = false
+
+[lib]
+# cdylib for the wasm module; rlib so the core can be unit-tested natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rwarp = { path = "..", default-features = false, features = ["proj4rs"] }
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

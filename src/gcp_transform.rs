@@ -424,9 +424,11 @@ mod tests {
 
     #[test]
     fn test_auto_order() {
-        // With 6 GCPs, auto (0) should select order 2
-        let cols: Vec<f64> = vec![0.0, 100.0, 200.0, 0.0, 100.0, 200.0];
-        let rows: Vec<f64> = vec![0.0, 0.0, 0.0, 100.0, 100.0, 100.0];
+        // With >= 6 GCPs, auto (0) should select order 2. Use a 3x3 grid:
+        // with only two distinct row values the row^2 column of the design
+        // matrix is collinear with row, and the order-2 fit is singular.
+        let cols: Vec<f64> = vec![0.0, 100.0, 200.0, 0.0, 100.0, 200.0, 0.0, 100.0, 200.0];
+        let rows: Vec<f64> = vec![0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 200.0, 200.0, 200.0];
         let geo_x: Vec<f64> = cols.iter().map(|c| 300000.0 + c * 10.0).collect();
         let geo_y: Vec<f64> = rows.iter().map(|r| 5200000.0 + r * -10.0).collect();
 
