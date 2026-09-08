@@ -15,12 +15,8 @@ use rwarp::approx::ApproxTransformer;
 use rwarp::CrsTransform;
 use rwarp::source_window::{compute_source_window, SourceWindow};
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::warp::{warp_resample, ResampleAlg};
+use rwarp::warp::{warp_resample_u8, ResampleAlg};
 use wasm_bindgen::prelude::*;
-
-/// Fill value for unmapped destination pixels. Outside u8 range, so every
-/// source sample is treated as valid data by the kernels.
-const NODATA: i32 = -1;
 
 // ---------------------------------------------------------------------------
 // Core (native-testable)
@@ -51,10 +47,9 @@ impl WarperCore {
         compute_source_window(&self.approx, [0, 0], dst_size, src_raster_size, padding)
     }
 
-    /// Warp an interleaved RGBA buffer. Unmapped destination pixels are
-    /// fully transparent. First cut: deinterleave, warp four bands,
-    /// reinterleave. A single-pass interleaved kernel in rwarp will replace
-    /// this without changing the signature.
+    /// Warp an interleaved RGBA buffer in one pass. Source pixels with
+    /// alpha 0 are nodata; unmapped destination pixels come back fully
+    /// transparent.
     #[allow(clippy::too_many_arguments)]
     pub fn warp_rgba(
         &self,
@@ -73,45 +68,9 @@ impl WarperCore {
                 src.len(), src_w, src_h, src_w * src_h * 4
             ));
         }
-        let n_src = src_w * src_h;
-        let n_dst = dst_w * dst_h;
-        let mut out = vec![0u8; n_dst * 4];
-        let mut band = vec![0i32; n_src];
-
-        for b in 0..4 {
-            for i in 0..n_src {
-                band[i] = src[i * 4 + b] as i32;
-            }
-            let warped = warp_resample(
-                &self.approx, &band, src_w, src_h, src_xoff, src_yoff,
-                dst_w, dst_h, NODATA, alg,
-            );
-            for i in 0..n_dst {
-                let v = warped[i];
-                out[i * 4 + b] = if v == NODATA { 0 } else { v.clamp(0, 255) as u8 };
-            }
-        }
-        // Any band unmapped -> whole pixel transparent. Cheap second pass
-        // that also guards against band-wise nodata disagreement at edges
-        // under interpolating kernels.
-        if alg != ResampleAlg::NearestNeighbour {
-            let mut mask = vec![true; n_dst];
-            let mut probe = vec![255i32; n_src];
-            let w = warp_resample(
-                &self.approx, &probe, src_w, src_h, src_xoff, src_yoff,
-                dst_w, dst_h, NODATA, alg,
-            );
-            for i in 0..n_dst {
-                mask[i] = w[i] != NODATA;
-            }
-            probe.clear();
-            for i in 0..n_dst {
-                if !mask[i] {
-                    out[i * 4..i * 4 + 4].fill(0);
-                }
-            }
-        }
-        Ok(out)
+        Ok(warp_resample_u8(
+            &self.approx, src, src_w, src_h, 4, src_xoff, src_yoff, dst_w, dst_h, Some(3), alg,
+        ))
     }
 }
 
@@ -331,5 +290,22 @@ mod tests {
         assert_eq!(parse_alg("Nearest").unwrap(), ResampleAlg::NearestNeighbour);
         assert_eq!(parse_alg("bilinear").unwrap(), ResampleAlg::Bilinear);
         assert!(parse_alg("mode").is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn timing_one_tile() {
+        let (src_gt, src_size) = webmerc(8);
+        let core = WarperCore::new("EPSG:3857", src_gt, LAEA_TAS, tile_gt(400_000.0), 0.125).unwrap();
+        let win = core.source_window([256, 256], src_size, 1).unwrap();
+        let (w, h) = (win.xsize as usize, win.ysize as usize);
+        let src = synthetic(w, h);
+        for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                core.warp_rgba(&src, w, h, win.xoff as usize, win.yoff as usize, 256, 256, alg).unwrap();
+            }
+            eprintln!("{alg:?}: {:.2} ms/tile", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        }
     }
 }

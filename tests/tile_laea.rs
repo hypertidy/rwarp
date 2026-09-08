@@ -114,3 +114,38 @@ fn nearest_warp_of_gradient_is_monotone_across_tile() {
     assert!(mid.windows(2).all(|p| p[1] >= p[0]), "centre row monotone: {:?}", &mid[..8]);
     assert!(mid[255] - mid[0] > 600, "spans most of the window: {} .. {}", mid[0], mid[255]);
 }
+
+/// Before/after for the interleaved kernel. `cargo test --release --features proj4rs --no-default-features -- --ignored --nocapture timing`
+#[test]
+#[ignore]
+fn timing_per_band_vs_interleaved() {
+    use rwarp::warp::warp_resample_u8;
+    let (src_gt, src_size) = webmerc_grid(8);
+    let approx = ApproxTransformer::new(
+        GenImgProjTransformer::new("EPSG:3857", src_gt, LAEA_TAS, laea_tile_gt(400_000.0)).unwrap(), 0.125);
+    let win = compute_source_window(&approx, [0, 0], [256, 256], src_size, 1).unwrap();
+    let (w, h) = (win.xsize as usize, win.ysize as usize);
+    let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i % 253) as u8).collect();
+    let (xo, yo) = (win.xoff as usize, win.yoff as usize);
+    for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            let mut band = vec![0i32; w * h];
+            for b in 0..4 {
+                for i in 0..w * h { band[i] = rgba[i * 4 + b] as i32; }
+                let _ = warp_resample(&approx, &band, w, h, xo, yo, 256, 256, -1, alg);
+            }
+            if alg != ResampleAlg::NearestNeighbour {
+                let probe = vec![255i32; w * h];
+                let _ = warp_resample(&approx, &probe, w, h, xo, yo, 256, 256, -1, alg);
+            }
+        }
+        let per_band = t.elapsed().as_secs_f64() * 100.0;
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = warp_resample_u8(&approx, &rgba, w, h, 4, xo, yo, 256, 256, Some(3), alg);
+        }
+        let inter = t.elapsed().as_secs_f64() * 100.0;
+        eprintln!("{alg:?}: per-band {per_band:.2} ms  interleaved {inter:.2} ms  ({:.1}x)", per_band / inter);
+    }
+}

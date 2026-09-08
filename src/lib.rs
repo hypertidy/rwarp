@@ -57,7 +57,7 @@
 //! | [`gcp_transform`] | `GcpTransformer` (polynomial order 1–3) | `GDALGCPTransform` |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `ComputeSourceWindow`, `CollectChunkList` | `GDALWarpOperation` planning |
-//! | [`warp`] | Resampling kernels | `gdalwarpkernel.cpp` |
+//! | [`warp`] | Resampling kernels (per-band `i32`, and one-pass interleaved `u8`) | `gdalwarpkernel.cpp` |
 //!
 //! ## Validation status
 //!
