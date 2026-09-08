@@ -6,8 +6,10 @@
 // Message out: { id, image: ImageData | null, info: string }
 
 import init, { Warper } from "../pkg/rwarp_wasm.js";
+import { readCogWindowRgba } from "./cog.js";
 
 const MAX_SOURCE_TILES = 64;   // refuse tiles that would need more than this
+const MAX_COG_PIXELS = 4 << 20; // and COG windows larger than this
 const CACHE_MAX = 400;         // decoded source tiles kept in memory
 
 const ready = init();
@@ -44,13 +46,30 @@ async function warpTile(msg) {
   const lv = source.levels[level];
   const tw = lv.tileW || source.tileW, th = lv.tileH || source.tileH;
   const srcGt = [source.origin[0], lv.res, 0, source.origin[1], 0, -lv.res];
-  const srcW = lv.mw * tw, srcH = lv.mh * th;
+  const srcW = lv.width || lv.mw * tw, srcH = lv.height || lv.mh * th;
 
   const warper = new Warper(source.crs, Float64Array.from(srcGt), dstCrs, Float64Array.from(dstGt), 0.125);
   try {
     const win = warper.source_window(dstW, dstH, srcW, srcH, 1);
     if (!win) return { image: null, info: "no source window" };
     const [xoff, yoff, xsize, ysize] = win;
+
+    if (source.kind === "cog") {
+      // Read the window straight from the file at this overview level.
+      const x0 = Math.max(0, xoff), y0 = Math.max(0, yoff);
+      const x1 = Math.min(lv.width, xoff + xsize), y1 = Math.min(lv.height, yoff + ysize);
+      if (x1 <= x0 || y1 <= y0) return { image: null, info: "window outside source" };
+      if ((x1 - x0) * (y1 - y0) > MAX_COG_PIXELS) {
+        return { image: null, info: `window ${x1 - x0}x${y1 - y0} px too large, skipping` };
+      }
+      const t0 = performance.now();
+      const rgba = await readCogWindowRgba(source, lv, x0, y0, x1, y1);
+      const t1 = performance.now();
+      const out = warper.warp_rgba(rgba, x1 - x0, y1 - y0, x0, y0, dstW, dstH, alg);
+      const ms = (performance.now() - t1).toFixed(1);
+      const image = new ImageData(new Uint8ClampedArray(out.buffer, out.byteOffset, out.length), dstW, dstH);
+      return { image, info: `ovr${lv.id} ${x1 - x0}x${y1 - y0} px, read ${(t1 - t0).toFixed(0)} ms, warp ${ms} ms` };
+    }
 
     const tx0 = Math.max(0, Math.floor(xoff / tw));
     const ty0 = Math.max(0, Math.floor(yoff / th));

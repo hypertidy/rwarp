@@ -13,6 +13,8 @@
 // Web Mercator XYZ is one instance. WMTS and ArcGIS grids are read from the
 // service itself, so any WMTS (polar or otherwise) works without hard-coding.
 
+import { cogSource } from "./cog.js";
+
 const WEBMERC_HALF = 20037508.342789244;
 
 export function xyzWebMercator(template, maxZoom = 19, name = "XYZ") {
@@ -108,7 +110,7 @@ export async function wmtsSource(capabilitiesUrl, layerId, opts = {}) {
   return {
     name: `${layerId} (${tmsName}, ${crs})`, crs, origin,
     tileW: levels[0].tileW, tileH: levels[0].tileH, levels, template,
-    ground: code === "3857" ? "mercator" : "flat",
+    ground: code === "3857" ? "mercator" : geographic ? "geographic" : "flat",
   };
 }
 
@@ -141,7 +143,8 @@ export async function arcgisSource(serviceUrl) {
 
 /// Guess the source type from the URL shape: a WMTS capabilities document,
 /// an XYZ template (has {z}), or an ArcGIS MapServer (anything else).
-export function specFromUrl(url, arg = "") {
+export function specFromUrl(url, arg = "", cog = {}) {
+  if (/\.tiff?(\?|$)/i.test(url)) return { type: "cog", url, crs: cog.crs, style: cog.style };
   if (/WMTSCapabilities\.xml/i.test(url) || /SERVICE=WMTS/i.test(url)) return { type: "wmts", url, layer: arg };
   if (/\{z\}|\{TileMatrix\}/.test(url)) return { type: "xyz", url, maxZoom: Number(arg) || 19 };
   return { type: "arcgis", url: url.replace(/\/WMTS.*$/, "") };
@@ -165,6 +168,10 @@ export const PRESETS = {
   },
   esri_antarctic: { type: "arcgis", url: "https://services.arcgisonline.com/arcgis/rest/services/Polar/Antarctic_Imagery/MapServer" },
   esri_arctic: { type: "arcgis", url: "https://services.arcgisonline.com/arcgis/rest/services/Polar/Arctic_Imagery/MapServer" },
+  cop_dem_hobart: {
+    type: "cog", url: "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_S43_00_E147_00_DEM/Copernicus_DSM_COG_10_S43_00_E147_00_DEM.tif",
+    style: { colormap: "terrain", min: 0, max: 1300 },
+  },
 };
 
 export async function resolveSource(spec) {
@@ -172,6 +179,7 @@ export async function resolveSource(spec) {
     case "xyz": return xyzWebMercator(spec.url, spec.maxZoom, spec.url);
     case "wmts": return wmtsSource(spec.url, spec.layer, { dimensions: spec.dimensions });
     case "arcgis": return arcgisSource(spec.url);
+    case "cog": return cogSource(spec.url, { crs: spec.crs, style: spec.style });
     default: throw new Error(`unknown source type ${spec.type}`);
   }
 }

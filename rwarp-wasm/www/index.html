@@ -40,6 +40,7 @@
       <option value="gibs_3413_bluemarble">GIBS EPSG:3413 Blue Marble (WMTS)</option>
       <option value="esri_antarctic">Esri Antarctic Imagery (ArcGIS, EPSG:3031)</option>
       <option value="esri_arctic">Esri Arctic Imagery (ArcGIS)</option>
+      <option value="cop_dem_hobart">Copernicus DEM 30 m, Hobart tile (COG, float32)</option>
       <option value="custom">custom...</option>
     </select>
   </label>
@@ -50,6 +51,15 @@
     <label>WMTS layer id (blank: only layer) / XYZ max zoom
       <input type="text" id="srcarg" value="">
     </label>
+    <div style="color:#666;font-size:11px">A .tif URL is read as a COG (range requests; server must allow CORS).</div>
+  </div>
+  <div id="cogstyle">
+    <label>COG style: colormap
+      <select id="cmap"><option>viridis</option><option>magma</option><option>plasma</option><option>inferno</option><option>gray</option><option>rdbu</option><option>terrain</option></select>
+    </label>
+    <label>min, max (blank: auto 2-98%) <input type="text" id="range" value="" style="width:9em"></label>
+    <label>bands (0-based; one, or three for RGB) <input type="text" id="bands" value="" style="width:6em"></label>
+    <label>source CRS override <input type="text" id="srccrs" value="" placeholder="EPSG:3031" style="width:9em"></label>
   </div>
   <label>Resampling
     <select id="alg">
@@ -103,7 +113,8 @@ const MERC_MAX_LAT = 85.05112878;
 function pickLevel(dstPx, lat) {
   const phi = Math.min(MERC_MAX_LAT, Math.abs(lat)) * Math.PI / 180;
   const dstGround = isLatLong ? dstPx * 111319.49 * Math.cos(phi) : dstPx;
-  const k = source.ground === "mercator" ? Math.cos(phi) : 1;
+  const k = source.ground === "mercator" ? Math.cos(phi)
+          : source.ground === "geographic" ? 111319.49 * Math.cos(phi) : 1;
   let best = 0, bestErr = Infinity;
   source.levels.forEach((lv, i) => {
     const err = Math.abs(Math.log2((lv.res * k) / dstGround));
@@ -147,11 +158,35 @@ let layer, markers = L.layerGroup().addTo(map);
 
 function sourceSpec() {
   const key = document.getElementById("preset").value;
-  if (key !== "custom") return PRESETS[key];
+  if (key !== "custom") {
+    const p = PRESETS[key];
+    return p.type === "cog" ? { ...p, crs: cogCrs() || p.crs, style: { ...p.style, ...cogStyleOverrides() } } : p;
+  }
   const url = document.getElementById("srcurl").value.trim();
   const arg = document.getElementById("srcarg").value.trim();
-  return specFromUrl(url, arg);
+  return specFromUrl(url, arg, { crs: cogCrs(), style: cogStyle() });
 }
+
+function cogStyle() {
+  const [min, max] = document.getElementById("range").value.split(",").map(v => v.trim() === "" ? "auto" : Number(v));
+  const bandsText = document.getElementById("bands").value.trim();
+  return {
+    colormap: document.getElementById("cmap").value,
+    min: min === undefined ? "auto" : min, max: max === undefined ? "auto" : max,
+    bands: bandsText ? bandsText.split(",").map(Number) : null,
+  };
+}
+// Only the fields the user actually filled in, so a preset keeps its own
+// min/max/colormap unless overridden.
+function cogStyleOverrides() {
+  const st = cogStyle(), o = {};
+  if (document.getElementById("range").value.trim()) { o.min = st.min; o.max = st.max; }
+  if (st.bands) o.bands = st.bands;
+  if (document.getElementById("cmap").dataset.touched) o.colormap = st.colormap;
+  return o;
+}
+document.getElementById("cmap").onchange = (e) => { e.target.dataset.touched = "1"; };
+function cogCrs() { return document.getElementById("srccrs").value.trim() || undefined; }
 
 async function applySettings() {
   const status = document.getElementById("status");
@@ -181,7 +216,11 @@ async function applySettings() {
   if (p) {
     L.circleMarker([p[1], p[0]], { radius: 5, color: "#d00" }).bindTooltip(`${lon}, ${lat}`).addTo(markers);
   }
-  status.textContent = `source: ${source.name}, ${source.levels.length} levels\n` +
+  const styleLine = source.kind === "cog"
+    ? `\nstyle: bands ${source.style.bands.join(",")} ${source.style.bands.length >= 3 ? "rgb" : source.style.colormap} ` +
+      `[${Number(source.style.min).toPrecision(4)}, ${Number(source.style.max).toPrecision(4)}]` +
+      (source.nodata !== null ? ` nodata ${source.nodata}` : "") : "";
+  status.textContent = `source: ${source.name}, ${source.levels.length} levels${styleLine}\n` +
     dstCrs + (p ? "" : "\n(centre marker not placed: point rejected by the projection)");
 }
 
