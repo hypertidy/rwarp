@@ -13,6 +13,14 @@ const CACHE_MAX = 400;         // decoded source tiles kept in memory
 const ready = init();
 const cache = new Map();       // url -> Uint8ClampedArray (256*256*4)
 
+const SUBDOMAINS = ["a", "b", "c"];
+function tileUrl(template, z, x, y) {
+  return template
+    .replace("{s}", SUBDOMAINS[(x + y) % SUBDOMAINS.length])
+    .replace("{z}", z).replace("{x}", x).replace("{y}", y)
+    .replace("{-y}", Math.pow(2, z) - 1 - y);
+}
+
 function srcGeotransform(z) {
   const n = 256 * Math.pow(2, z);
   const px = (2 * WEBMERC_HALF) / n;
@@ -62,7 +70,7 @@ async function warpTile(msg) {
     const urls = [];
     for (let ty = ty0; ty <= ty1; ty++)
       for (let tx = tx0; tx <= tx1; tx++)
-        urls.push({ tx, ty, url: srcTemplate.replace("{z}", srcZoom).replace("{x}", tx).replace("{y}", ty) });
+        urls.push({ tx, ty, url: tileUrl(srcTemplate, srcZoom, tx, ty) });
     const tiles = await Promise.all(urls.map(u => fetchTileRgba(u.url).catch(() => null)));
 
     const W = nx * 256, H = ny * 256;

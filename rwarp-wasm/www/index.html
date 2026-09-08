@@ -29,7 +29,17 @@
   <label>Projection (proj string; {lon} {lat} substituted)
     <input type="text" id="proj" value="+proj=laea +lat_0={lat} +lon_0={lon} +datum=WGS84 +units=m +no_defs">
   </label>
-  <div style="color:#666;font-size:11px">proj4rs backend: laea, stere, aea, lcc, tmerc, merc, eqc, moll, geos, somerc, sterea (no ortho or aeqd yet)</div>
+  <div style="color:#666;font-size:11px">proj4rs backend: laea, stere, aea, lcc, tmerc, merc, eqc, moll, geos, somerc, sterea (no ortho or aeqd yet). geos needs +h=35785831; longlat works, units become degrees.</div>
+  <label>Source tiles (Web Mercator XYZ; {z} {x} {y}, optional {s})
+    <input type="text" id="src" value="https://tile.openstreetmap.org/{z}/{x}/{y}.png" list="srcpresets">
+    <datalist id="srcpresets">
+      <option value="https://tile.openstreetmap.org/{z}/{x}/{y}.png">OpenStreetMap</option>
+      <option value="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}">Esri World Imagery</option>
+      <option value="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png">Carto light</option>
+      <option value="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png">Carto dark</option>
+    </datalist>
+  </label>
+  <label>Max source zoom <input type="number" id="srcmax" value="19" min="0" max="22" style="width:4em"></label>
   <label>Resampling
     <select id="alg">
       <option>nearest</option><option selected>bilinear</option><option>cubic</option><option>lanczos</option>
@@ -48,7 +58,10 @@ await init();
 // Zoom 0 is one 256 px tile covering T0 metres square, centred on the origin
 // of the target projection. Tile (i, j, z) is exactly T0/2^z metres on a side
 // with its top-left at (i*T, -j*T), so every tile's geotransform is trivial.
-const T0 = Math.pow(2, 24); // ~16,777 km: covers a hemisphere at z0
+// T0 is the world size at zoom 0 in target-CRS units: 2^24 (~16,777 km)
+// for projected metres, 360 for a geographic target whose units are degrees.
+let T0 = Math.pow(2, 24);
+let isLatLong = false;
 const MetreCRS = L.extend({}, L.CRS.Simple, {
   transformation: new L.Transformation(1, 0, -1, 0),
   scale: z => (256 * Math.pow(2, z)) / T0,
@@ -57,7 +70,6 @@ const MetreCRS = L.extend({}, L.CRS.Simple, {
   distance: (a, b) => Math.hypot(a.lng - b.lng, a.lat - b.lat),
 });
 
-const SRC_TEMPLATE = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const SRC_CRS = "EPSG:3857";
 
 let dstCrs;
@@ -77,8 +89,11 @@ worker.onmessage = (e) => {
 const MERC_MAX_LAT = 85.05112878;
 function pickSourceZoom(dstPx, lat) {
   const phi = Math.min(MERC_MAX_LAT, Math.abs(lat)) * Math.PI / 180;
-  const z = Math.log2((156543.03392804097 * Math.cos(phi)) / dstPx);
-  return Math.min(19, Math.max(0, Math.round(z)));
+  // A geographic target's pixel is dstPx degrees: ~111320*cos(phi) m on the ground.
+  const groundPx = isLatLong ? dstPx * 111319.49 * Math.cos(phi) : dstPx;
+  const z = Math.log2((156543.03392804097 * Math.cos(phi)) / groundPx);
+  const zmax = Number(document.getElementById("srcmax").value) || 19;
+  return Math.min(zmax, Math.max(0, Math.round(z)));
 }
 
 const WarpedLayer = L.GridLayer.extend({
@@ -104,7 +119,7 @@ const WarpedLayer = L.GridLayer.extend({
       done(null, tile);
     });
     worker.postMessage({
-      id, srcTemplate: SRC_TEMPLATE, srcCrs: SRC_CRS, dstCrs, dstGt,
+      id, srcTemplate: document.getElementById("src").value.trim(), srcCrs: SRC_CRS, dstCrs, dstGt,
       dstW: 256, dstH: 256, alg: document.getElementById("alg").value,
       srcZoom: pickSourceZoom(px, ll[1]),
     });
@@ -118,14 +133,24 @@ let layer, markers = L.layerGroup().addTo(map);
 function applySettings() {
   const [lon, lat] = document.getElementById("centre").value.split(",").map(Number);
   dstCrs = document.getElementById("proj").value.replace("{lon}", lon).replace("{lat}", lat);
+  isLatLong = /\+proj=(longlat|latlong)\b/.test(dstCrs) || /^EPSG:4326$/i.test(dstCrs);
+  T0 = isLatLong ? 360 : Math.pow(2, 24);
   if (layer) map.removeLayer(layer);
   layer = new WarpedLayer({ tileSize: 256, updateWhenZooming: false, keepBuffer: 1 }).addTo(map);
   markers.clearLayers();
-  const p = lonlat_to_crs(dstCrs, lon, lat);
-  if (!p) { document.getElementById("status").textContent = "cannot build transform for: " + dstCrs; return; }
-  L.circleMarker([p[1], p[0]], { radius: 5, color: "#d00" }).bindTooltip(`${lon}, ${lat}`).addTo(markers);
-  map.setView([0, 0], map.getZoom());
-  document.getElementById("status").textContent = dstCrs;
+  // Centre marker. proj4rs refuses the exact pole in the forward direction,
+  // so nudge a whisker off it; the marker lands within a metre of the origin.
+  const latM = Math.abs(lat) >= 90 ? Math.sign(lat) * 89.99999 : lat;
+  const p = lonlat_to_crs(dstCrs, lon, latM);
+  if (p) {
+    L.circleMarker([p[1], p[0]], { radius: 5, color: "#d00" }).bindTooltip(`${lon}, ${lat}`).addTo(markers);
+  }
+  // Zoom 0 spans T0 units either way, so the zoom level keeps its meaning
+  // (fraction of the world) across the metre/degree switch. reset:true makes
+  // Leaflet recompute its pixel origin against the changed scale().
+  map.setView([0, 0], map.getZoom(), { reset: true });
+  document.getElementById("status").textContent =
+    dstCrs + (p ? "" : "\n(centre marker not placed: point rejected by the projection)");
 }
 
 map.on("mousemove", (e) => {
