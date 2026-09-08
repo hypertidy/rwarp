@@ -40,7 +40,8 @@
       <option value="gibs_3413_bluemarble">GIBS EPSG:3413 Blue Marble (WMTS)</option>
       <option value="esri_antarctic">Esri Antarctic Imagery (ArcGIS, EPSG:3031)</option>
       <option value="esri_arctic">Esri Arctic Imagery (ArcGIS)</option>
-      <option value="cop_dem_hobart">Copernicus DEM 30 m, Hobart tile (COG, float32)</option>
+      <option value="s2_hobart_tci">Sentinel-2 Hobart 2024-12-04 true colour (COG, u8 RGB, EPSG:32755)</option>
+      <option value="s2_hobart_b04">Sentinel-2 Hobart 2024-12-04 band 4 (COG, uint16, colormap)</option>
       <option value="custom">custom...</option>
     </select>
   </label>
@@ -51,7 +52,7 @@
     <label>WMTS layer id (blank: only layer) / XYZ max zoom
       <input type="text" id="srcarg" value="">
     </label>
-    <div style="color:#666;font-size:11px">A .tif URL is read as a COG (range requests; server must allow CORS).</div>
+    <div style="color:#666;font-size:11px">A .tif URL is read as a COG. The host must send CORS headers (sentinel-cogs, OpenAerialMap and most STAC-published buckets do; the Copernicus DEM bucket does not).</div>
   </div>
   <div id="cogstyle">
     <label>COG style: colormap

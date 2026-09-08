@@ -168,9 +168,12 @@ export const PRESETS = {
   },
   esri_antarctic: { type: "arcgis", url: "https://services.arcgisonline.com/arcgis/rest/services/Polar/Antarctic_Imagery/MapServer" },
   esri_arctic: { type: "arcgis", url: "https://services.arcgisonline.com/arcgis/rest/services/Polar/Arctic_Imagery/MapServer" },
-  cop_dem_hobart: {
-    type: "cog", url: "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_S43_00_E147_00_DEM/Copernicus_DSM_COG_10_S43_00_E147_00_DEM.tif",
-    style: { colormap: "terrain", min: 0, max: 1300 },
+  s2_hobart_tci: {
+    type: "cog", url: "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/55/G/EN/2024/12/S2A_55GEN_20241204_0_L2A/TCI.tif",
+  },
+  s2_hobart_b04: {
+    type: "cog", url: "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/55/G/EN/2024/12/S2A_55GEN_20241204_0_L2A/B04.tif",
+    style: { colormap: "magma", min: 0, max: 3000, bands: [0] },
   },
 };
 
