@@ -139,9 +139,17 @@ export async function arcgisSource(serviceUrl) {
 
 // --- Presets ---------------------------------------------------------------
 
+/// Guess the source type from the URL shape: a WMTS capabilities document,
+/// an XYZ template (has {z}), or an ArcGIS MapServer (anything else).
+export function specFromUrl(url, arg = "") {
+  if (/WMTSCapabilities\.xml/i.test(url) || /SERVICE=WMTS/i.test(url)) return { type: "wmts", url, layer: arg };
+  if (/\{z\}|\{TileMatrix\}/.test(url)) return { type: "xyz", url, maxZoom: Number(arg) || 19 };
+  return { type: "arcgis", url: url.replace(/\/WMTS.*$/, "") };
+}
+
 export const PRESETS = {
+  esri_imagery_wmts: { type: "wmts", url: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml", layer: "" },
   osm: { type: "xyz", url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png", maxZoom: 19 },
-  esri_imagery: { type: "xyz", url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", maxZoom: 19 },
   carto_light: { type: "xyz", url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png", maxZoom: 19 },
   gibs_3031_bluemarble: {
     type: "wmts", url: "https://gibs.earthdata.nasa.gov/wmts/epsg3031/best/1.0.0/WMTSCapabilities.xml",

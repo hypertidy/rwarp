@@ -32,8 +32,8 @@
   <div style="color:#666;font-size:11px">proj4rs backend: laea, stere, aea, lcc, tmerc, merc, eqc, moll, geos, somerc, sterea (no ortho or aeqd yet). geos needs +h=35785831; longlat works, units become degrees.</div>
   <label>Source
     <select id="preset">
-      <option value="osm">OpenStreetMap (Web Mercator XYZ)</option>
-      <option value="esri_imagery">Esri World Imagery (XYZ)</option>
+      <option value="esri_imagery_wmts" selected>Esri World Imagery (WMTS)</option>
+      <option value="osm">OpenStreetMap (XYZ)</option>
       <option value="carto_light">Carto light (XYZ)</option>
       <option value="gibs_3031_bluemarble">GIBS EPSG:3031 Blue Marble (WMTS)</option>
       <option value="gibs_3031_modis">GIBS EPSG:3031 MODIS true colour, latest (WMTS)</option>
@@ -44,11 +44,8 @@
     </select>
   </label>
   <div id="custom" hidden>
-    <label>Type
-      <select id="srctype"><option value="xyz">XYZ Web Mercator</option><option value="wmts">WMTS capabilities</option><option value="arcgis">ArcGIS MapServer</option></select>
-    </label>
-    <label>URL (template, capabilities XML, or service)
-      <input type="text" id="srcurl" value="">
+    <label>URL: WMTS GetCapabilities, ArcGIS MapServer, or XYZ template (type is detected)
+      <input type="text" id="srcurl" value="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/WMTS/1.0.0/WMTSCapabilities.xml">
     </label>
     <label>WMTS layer id (blank: only layer) / XYZ max zoom
       <input type="text" id="srcarg" value="">
@@ -66,17 +63,20 @@
 
 <script type="module">
 import init, { lonlat_to_crs, crs_to_lonlat } from "../pkg/rwarp_wasm.js";
-import { PRESETS, resolveSource } from "./sources.js";
+import { PRESETS, resolveSource, specFromUrl } from "./sources.js";
 await init();
 
-// --- Custom Leaflet CRS: "latlng" is (northing, easting) in target-CRS metres.
-// Zoom 0 is one 256 px tile covering T0 metres square, centred on the origin
-// of the target projection. Tile (i, j, z) is exactly T0/2^z metres on a side
-// with its top-left at (i*T, -j*T), so every tile's geotransform is trivial.
-// T0 is the world size at zoom 0 in target-CRS units: 2^24 (~16,777 km)
-// for projected metres, 360 for a geographic target whose units are degrees.
+// --- Custom Leaflet CRS: "latlng" is (northing, easting) in target-CRS units.
+// The tile scheme is fully described by (CRS, anchor, T0): zoom 0 is one
+// 256 px tile of T0 units on a side whose top-left corner is the anchor
+// point; tile (i, j, z) is T0/2^z on a side with top-left at
+// (ax + i*T, ay - j*T). The anchor is the projected centre point, so the
+// grid is pinned to the place of interest rather than to the CRS origin,
+// and the same scheme works for a templated local projection or a fixed
+// EPSG code. T0 is 2^24 (~16,777 km) for projected metres, 360 for degrees.
 let T0 = Math.pow(2, 24);
 let isLatLong = false;
+let anchor = [0, 0];
 const MetreCRS = L.extend({}, L.CRS.Simple, {
   transformation: new L.Transformation(1, 0, -1, 0),
   scale: z => (256 * Math.pow(2, z)) / T0,
@@ -118,10 +118,10 @@ const WarpedLayer = L.GridLayer.extend({
     tile.width = tile.height = 256;
     const T = T0 / Math.pow(2, coords.z);
     const px = T / 256;
-    const dstGt = [coords.x * T, px, 0, -coords.y * T, 0, -px];
-    // Tile centre back to lon/lat: picks the source zoom, and tells us the
+    const dstGt = [anchor[0] + coords.x * T, px, 0, anchor[1] - coords.y * T, 0, -px];
+    // Tile centre back to lon/lat: picks the source level, and tells us the
     // tile is outside the projection domain (leave it transparent).
-    const ll = crs_to_lonlat(dstCrs, (coords.x + 0.5) * T, -(coords.y + 0.5) * T);
+    const ll = crs_to_lonlat(dstCrs, dstGt[0] + T / 2, dstGt[3] - T / 2);
     if (!ll) { setTimeout(() => done(null, tile), 0); return tile; }
     const id = nextId++;
     pending.set(id, ({ image, info }) => {
@@ -148,12 +148,9 @@ let layer, markers = L.layerGroup().addTo(map);
 function sourceSpec() {
   const key = document.getElementById("preset").value;
   if (key !== "custom") return PRESETS[key];
-  const type = document.getElementById("srctype").value;
   const url = document.getElementById("srcurl").value.trim();
   const arg = document.getElementById("srcarg").value.trim();
-  return type === "xyz" ? { type, url, maxZoom: Number(arg) || 19 }
-       : type === "wmts" ? { type, url, layer: arg }
-       : { type, url };
+  return specFromUrl(url, arg);
 }
 
 async function applySettings() {
@@ -169,20 +166,21 @@ async function applySettings() {
   dstCrs = document.getElementById("proj").value.replace("{lon}", lon).replace("{lat}", lat);
   isLatLong = /\+proj=(longlat|latlong)\b/.test(dstCrs) || /^EPSG:4326$/i.test(dstCrs);
   T0 = isLatLong ? 360 : Math.pow(2, 24);
-  if (layer) map.removeLayer(layer);
-  layer = new WarpedLayer({ tileSize: 256, updateWhenZooming: false, keepBuffer: 1 }).addTo(map);
-  markers.clearLayers();
-  // Centre marker. proj4rs refuses the exact pole in the forward direction,
-  // so nudge a whisker off it; the marker lands within a metre of the origin.
+  // Anchor: the projected centre point. proj4rs refuses the exact pole in
+  // the forward direction, so nudge a whisker off it (sub-metre error).
   const latM = Math.abs(lat) >= 90 ? Math.sign(lat) * 89.99999 : lat;
   const p = lonlat_to_crs(dstCrs, lon, latM);
+  anchor = p ? [p[0], p[1]] : [0, 0];
+  // Pin the tile grid's pixel origin to the anchor: px = scale*(x - ax),
+  // py = scale*(ay - y). Leaflet reads this on the reset below.
+  MetreCRS.transformation = new L.Transformation(1, -anchor[0], -1, anchor[1]);
+  if (layer) map.removeLayer(layer);
+  map.setView([anchor[1], anchor[0]], map.getZoom(), { reset: true });
+  layer = new WarpedLayer({ tileSize: 256, updateWhenZooming: false, keepBuffer: 1 }).addTo(map);
+  markers.clearLayers();
   if (p) {
     L.circleMarker([p[1], p[0]], { radius: 5, color: "#d00" }).bindTooltip(`${lon}, ${lat}`).addTo(markers);
   }
-  // Zoom 0 spans T0 units either way, so the zoom level keeps its meaning
-  // (fraction of the world) across the metre/degree switch. reset:true makes
-  // Leaflet recompute its pixel origin against the changed scale().
-  map.setView([0, 0], map.getZoom(), { reset: true });
   status.textContent = `source: ${source.name}, ${source.levels.length} levels\n` +
     dstCrs + (p ? "" : "\n(centre marker not placed: point rejected by the projection)");
 }
