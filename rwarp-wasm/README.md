@@ -33,3 +33,11 @@ http, not file://) after building:
 
 Geotransforms are GDAL order `[x0, dx, rx, y0, ry, dy]`. CRS strings are
 proj strings (`+proj=laea +lat_0=-42 +lon_0=147 ...`) or `EPSG:NNNN`.
+
+## Projection support
+
+The `proj4rs` backend implements: latlong, laea, stere (and ups), sterea,
+aea, lcc, tmerc/etmerc/utm, merc/webmerc, eqc, moll, geos, somerc, geocent.
+Not yet available: `ortho` (absent upstream), `aeqd` (upstream feature
+depends on a C geodesic library, so it is off for wasm). Both are candidates
+for pure-Rust contributions to proj4rs.

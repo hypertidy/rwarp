@@ -29,6 +29,7 @@
   <label>Projection (proj string; {lon} {lat} substituted)
     <input type="text" id="proj" value="+proj=laea +lat_0={lat} +lon_0={lon} +datum=WGS84 +units=m +no_defs">
   </label>
+  <div style="color:#666;font-size:11px">proj4rs backend: laea, stere, aea, lcc, tmerc, merc, eqc, moll, geos, somerc, sterea (no ortho or aeqd yet)</div>
   <label>Resampling
     <select id="alg">
       <option>nearest</option><option selected>bilinear</option><option>cubic</option><option>lanczos</option>
@@ -59,7 +60,7 @@ const MetreCRS = L.extend({}, L.CRS.Simple, {
 const SRC_TEMPLATE = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const SRC_CRS = "EPSG:3857";
 
-let dstCrs, lat0;
+let dstCrs;
 const worker = new Worker("./worker.js", { type: "module" });
 const pending = new Map();
 let nextId = 1;
@@ -68,11 +69,15 @@ worker.onmessage = (e) => {
   if (cb) { pending.delete(e.data.id); cb(e.data); }
 };
 
-// Pick the Web Mercator zoom whose ground resolution at lat0 best matches
-// the destination pixel size. Mercator metres/px at latitude phi is
-// 156543.03 * cos(phi) / 2^z.
-function pickSourceZoom(dstPx) {
-  const z = Math.log2((156543.03392804097 * Math.cos(lat0 * Math.PI / 180)) / dstPx);
+// Pick the Web Mercator zoom whose ground resolution at latitude `lat`
+// best matches the destination pixel size. Mercator metres/px at latitude
+// phi is 156543.03 * cos(phi) / 2^z. Evaluated per tile at the tile's own
+// centre; clamped to Mercator's latitude limit so a tile at the pole asks
+// for the finest useful level rather than log2(0).
+const MERC_MAX_LAT = 85.05112878;
+function pickSourceZoom(dstPx, lat) {
+  const phi = Math.min(MERC_MAX_LAT, Math.abs(lat)) * Math.PI / 180;
+  const z = Math.log2((156543.03392804097 * Math.cos(phi)) / dstPx);
   return Math.min(19, Math.max(0, Math.round(z)));
 }
 
@@ -83,6 +88,10 @@ const WarpedLayer = L.GridLayer.extend({
     const T = T0 / Math.pow(2, coords.z);
     const px = T / 256;
     const dstGt = [coords.x * T, px, 0, -coords.y * T, 0, -px];
+    // Tile centre back to lon/lat: picks the source zoom, and tells us the
+    // tile is outside the projection domain (leave it transparent).
+    const ll = crs_to_lonlat(dstCrs, (coords.x + 0.5) * T, -(coords.y + 0.5) * T);
+    if (!ll) { setTimeout(() => done(null, tile), 0); return tile; }
     const id = nextId++;
     pending.set(id, ({ image, info }) => {
       if (image) tile.getContext("2d").putImageData(image, 0, 0);
@@ -97,7 +106,7 @@ const WarpedLayer = L.GridLayer.extend({
     worker.postMessage({
       id, srcTemplate: SRC_TEMPLATE, srcCrs: SRC_CRS, dstCrs, dstGt,
       dstW: 256, dstH: 256, alg: document.getElementById("alg").value,
-      srcZoom: pickSourceZoom(px),
+      srcZoom: pickSourceZoom(px, ll[1]),
     });
     return tile;
   },
@@ -108,13 +117,13 @@ let layer, markers = L.layerGroup().addTo(map);
 
 function applySettings() {
   const [lon, lat] = document.getElementById("centre").value.split(",").map(Number);
-  lat0 = lat;
   dstCrs = document.getElementById("proj").value.replace("{lon}", lon).replace("{lat}", lat);
   if (layer) map.removeLayer(layer);
   layer = new WarpedLayer({ tileSize: 256, updateWhenZooming: false, keepBuffer: 1 }).addTo(map);
   markers.clearLayers();
   const p = lonlat_to_crs(dstCrs, lon, lat);
-  if (p) L.circleMarker([p[1], p[0]], { radius: 5, color: "#d00" }).bindTooltip(`${lon}, ${lat}`).addTo(markers);
+  if (!p) { document.getElementById("status").textContent = "cannot build transform for: " + dstCrs; return; }
+  L.circleMarker([p[1], p[0]], { radius: 5, color: "#d00" }).bindTooltip(`${lon}, ${lat}`).addTo(markers);
   map.setView([0, 0], map.getZoom());
   document.getElementById("status").textContent = dstCrs;
 }
