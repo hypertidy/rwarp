@@ -34,6 +34,20 @@ http, not file://) after building:
 Geotransforms are GDAL order `[x0, dx, rx, y0, ry, dy]`. CRS strings are
 proj strings (`+proj=laea +lat_0=-42 +lon_0=147 ...`) or `EPSG:NNNN`.
 
+## Sources
+
+`www/sources.js` resolves a source into one grid description (CRS, origin,
+tile size, per-level resolution and matrix size, URL template). Three kinds:
+
+- XYZ Web Mercator templates (`{z}/{x}/{y}`, `{s}`, `{-y}`)
+- WMTS: reads GetCapabilities in the browser, picks the layer's
+  TileMatrixSet, resolves `{Time}` and other dimensions to their defaults.
+  Any CRS the `proj4rs` backend knows, e.g. NASA GIBS in EPSG:3031/3413.
+- ArcGIS cached MapServer: reads `?f=json` for `tileInfo`/`lods`.
+
+The worker never sees a service type, only the grid. The source must send
+CORS headers, since tiles are decoded through a canvas.
+
 ## Projection support
 
 The `proj4rs` backend implements: latlong, laea, stere (and ups), sterea,

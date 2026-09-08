@@ -22,7 +22,7 @@
 <body>
 <div id="map"></div>
 <div id="panel">
-  <b>rwarp-wasm</b> - tiles warped client-side from Web Mercator
+  <b>rwarp-wasm</b> - tiles warped client-side from any tile grid
   <label>Centre (lon, lat)
     <input type="text" id="centre" value="147, -42">
   </label>
@@ -30,16 +30,30 @@
     <input type="text" id="proj" value="+proj=laea +lat_0={lat} +lon_0={lon} +datum=WGS84 +units=m +no_defs">
   </label>
   <div style="color:#666;font-size:11px">proj4rs backend: laea, stere, aea, lcc, tmerc, merc, eqc, moll, geos, somerc, sterea (no ortho or aeqd yet). geos needs +h=35785831; longlat works, units become degrees.</div>
-  <label>Source tiles (Web Mercator XYZ; {z} {x} {y}, optional {s})
-    <input type="text" id="src" value="https://tile.openstreetmap.org/{z}/{x}/{y}.png" list="srcpresets">
-    <datalist id="srcpresets">
-      <option value="https://tile.openstreetmap.org/{z}/{x}/{y}.png">OpenStreetMap</option>
-      <option value="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}">Esri World Imagery</option>
-      <option value="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png">Carto light</option>
-      <option value="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png">Carto dark</option>
-    </datalist>
+  <label>Source
+    <select id="preset">
+      <option value="osm">OpenStreetMap (Web Mercator XYZ)</option>
+      <option value="esri_imagery">Esri World Imagery (XYZ)</option>
+      <option value="carto_light">Carto light (XYZ)</option>
+      <option value="gibs_3031_bluemarble">GIBS EPSG:3031 Blue Marble (WMTS)</option>
+      <option value="gibs_3031_modis">GIBS EPSG:3031 MODIS true colour, latest (WMTS)</option>
+      <option value="gibs_3413_bluemarble">GIBS EPSG:3413 Blue Marble (WMTS)</option>
+      <option value="esri_antarctic">Esri Antarctic Imagery (ArcGIS, EPSG:3031)</option>
+      <option value="esri_arctic">Esri Arctic Imagery (ArcGIS)</option>
+      <option value="custom">custom...</option>
+    </select>
   </label>
-  <label>Max source zoom <input type="number" id="srcmax" value="19" min="0" max="22" style="width:4em"></label>
+  <div id="custom" hidden>
+    <label>Type
+      <select id="srctype"><option value="xyz">XYZ Web Mercator</option><option value="wmts">WMTS capabilities</option><option value="arcgis">ArcGIS MapServer</option></select>
+    </label>
+    <label>URL (template, capabilities XML, or service)
+      <input type="text" id="srcurl" value="">
+    </label>
+    <label>WMTS layer id / XYZ max zoom
+      <input type="text" id="srcarg" value="">
+    </label>
+  </div>
   <label>Resampling
     <select id="alg">
       <option>nearest</option><option selected>bilinear</option><option>cubic</option><option>lanczos</option>
@@ -52,6 +66,7 @@
 
 <script type="module">
 import init, { lonlat_to_crs, crs_to_lonlat } from "../pkg/rwarp_wasm.js";
+import { PRESETS, resolveSource } from "./sources.js";
 await init();
 
 // --- Custom Leaflet CRS: "latlng" is (northing, easting) in target-CRS metres.
@@ -70,9 +85,8 @@ const MetreCRS = L.extend({}, L.CRS.Simple, {
   distance: (a, b) => Math.hypot(a.lng - b.lng, a.lat - b.lat),
 });
 
-const SRC_CRS = "EPSG:3857";
-
 let dstCrs;
+let source = null; // resolved grid object from sources.js
 const worker = new Worker("./worker.js", { type: "module" });
 const pending = new Map();
 let nextId = 1;
@@ -81,19 +95,21 @@ worker.onmessage = (e) => {
   if (cb) { pending.delete(e.data.id); cb(e.data); }
 };
 
-// Pick the Web Mercator zoom whose ground resolution at latitude `lat`
-// best matches the destination pixel size. Mercator metres/px at latitude
-// phi is 156543.03 * cos(phi) / 2^z. Evaluated per tile at the tile's own
-// centre; clamped to Mercator's latitude limit so a tile at the pole asks
-// for the finest useful level rather than log2(0).
+// Pick the source level whose ground resolution best matches this tile's
+// pixel size, evaluated at the tile centre. Mercator resolution is in
+// "equator metres" and scales by cos(lat) on the ground; polar stereographic
+// and other local grids are near 1:1 with the ground (within a few percent).
 const MERC_MAX_LAT = 85.05112878;
-function pickSourceZoom(dstPx, lat) {
+function pickLevel(dstPx, lat) {
   const phi = Math.min(MERC_MAX_LAT, Math.abs(lat)) * Math.PI / 180;
-  // A geographic target's pixel is dstPx degrees: ~111320*cos(phi) m on the ground.
-  const groundPx = isLatLong ? dstPx * 111319.49 * Math.cos(phi) : dstPx;
-  const z = Math.log2((156543.03392804097 * Math.cos(phi)) / groundPx);
-  const zmax = Number(document.getElementById("srcmax").value) || 19;
-  return Math.min(zmax, Math.max(0, Math.round(z)));
+  const dstGround = isLatLong ? dstPx * 111319.49 * Math.cos(phi) : dstPx;
+  const k = source.ground === "mercator" ? Math.cos(phi) : 1;
+  let best = 0, bestErr = Infinity;
+  source.levels.forEach((lv, i) => {
+    const err = Math.abs(Math.log2((lv.res * k) / dstGround));
+    if (err < bestErr) { bestErr = err; best = i; }
+  });
+  return best;
 }
 
 const WarpedLayer = L.GridLayer.extend({
@@ -119,9 +135,8 @@ const WarpedLayer = L.GridLayer.extend({
       done(null, tile);
     });
     worker.postMessage({
-      id, srcTemplate: document.getElementById("src").value.trim(), srcCrs: SRC_CRS, dstCrs, dstGt,
+      id, source, level: pickLevel(px, ll[1]), dstCrs, dstGt,
       dstW: 256, dstH: 256, alg: document.getElementById("alg").value,
-      srcZoom: pickSourceZoom(px, ll[1]),
     });
     return tile;
   },
@@ -130,7 +145,26 @@ const WarpedLayer = L.GridLayer.extend({
 const map = L.map("map", { crs: MetreCRS, center: [0, 0], zoom: 6, minZoom: 2, maxZoom: 16 });
 let layer, markers = L.layerGroup().addTo(map);
 
-function applySettings() {
+function sourceSpec() {
+  const key = document.getElementById("preset").value;
+  if (key !== "custom") return PRESETS[key];
+  const type = document.getElementById("srctype").value;
+  const url = document.getElementById("srcurl").value.trim();
+  const arg = document.getElementById("srcarg").value.trim();
+  return type === "xyz" ? { type, url, maxZoom: Number(arg) || 19 }
+       : type === "wmts" ? { type, url, layer: arg }
+       : { type, url };
+}
+
+async function applySettings() {
+  const status = document.getElementById("status");
+  status.textContent = "resolving source...";
+  try {
+    source = await resolveSource(sourceSpec());
+  } catch (err) {
+    status.textContent = "source failed: " + err;
+    return;
+  }
   const [lon, lat] = document.getElementById("centre").value.split(",").map(Number);
   dstCrs = document.getElementById("proj").value.replace("{lon}", lon).replace("{lat}", lat);
   isLatLong = /\+proj=(longlat|latlong)\b/.test(dstCrs) || /^EPSG:4326$/i.test(dstCrs);
@@ -149,19 +183,22 @@ function applySettings() {
   // (fraction of the world) across the metre/degree switch. reset:true makes
   // Leaflet recompute its pixel origin against the changed scale().
   map.setView([0, 0], map.getZoom(), { reset: true });
-  document.getElementById("status").textContent =
+  status.textContent = `source: ${source.name}, ${source.levels.length} levels\n` +
     dstCrs + (p ? "" : "\n(centre marker not placed: point rejected by the projection)");
 }
 
 map.on("mousemove", (e) => {
   const ll = crs_to_lonlat(dstCrs, e.latlng.lng, e.latlng.lat);
   document.getElementById("status").textContent =
-    dstCrs + "\n" +
+    (source ? `source: ${source.name}\n` : "") + dstCrs + "\n" +
     `x ${e.latlng.lng.toFixed(0)}  y ${e.latlng.lat.toFixed(0)} m` +
     (ll ? `\nlon ${ll[0].toFixed(4)}  lat ${ll[1].toFixed(4)}` : "\n(outside projection domain)");
 });
 
 document.getElementById("apply").onclick = applySettings;
+document.getElementById("preset").onchange = (e) => {
+  document.getElementById("custom").hidden = e.target.value !== "custom";
+};
 applySettings();
 </script>
 </body>
