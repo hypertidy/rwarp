@@ -13,6 +13,7 @@
 
 use rwarp::approx::ApproxTransformer;
 use rwarp::CrsTransform;
+use wasm_bindgen::JsCast;
 use rwarp::source_window::{compute_source_window, SourceWindow};
 use rwarp::transform::GenImgProjTransformer;
 use rwarp::warp::{warp_resample_t, warp_resample_u8, ResampleAlg};
@@ -26,6 +27,17 @@ pub struct WarperCore {
     approx: ApproxTransformer<GenImgProjTransformer>,
 }
 
+/// A [`CrsTransform`] over any closure. This is what an outside projection
+/// library plugs into: the wasm layer wraps a JavaScript function in one of
+/// these, and native tests use a plain Rust closure.
+pub struct FnTransform<F: Fn(f64, f64) -> Option<(f64, f64)>>(pub F);
+
+impl<F: Fn(f64, f64) -> Option<(f64, f64)>> CrsTransform for FnTransform<F> {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        (self.0)(x, y)
+    }
+}
+
 impl WarperCore {
     pub fn new(
         src_crs: &str,
@@ -35,6 +47,21 @@ impl WarperCore {
         max_error: f64,
     ) -> Result<Self, String> {
         let exact = GenImgProjTransformer::new(src_crs, src_gt, dst_crs, dst_gt)?;
+        Ok(Self { approx: ApproxTransformer::new(exact, max_error) })
+    }
+
+    /// Build with caller-supplied CRS transforms instead of the compiled-in
+    /// backend: `dst_to_src` maps destination geo coordinates to source geo
+    /// coordinates and `src_to_dst` is its inverse. The projection library
+    /// can then be anything - proj4js, PROJ in another wasm module, a table.
+    pub fn with_transforms(
+        src_gt: [f64; 6],
+        dst_gt: [f64; 6],
+        dst_to_src: Box<dyn CrsTransform>,
+        src_to_dst: Box<dyn CrsTransform>,
+        max_error: f64,
+    ) -> Result<Self, String> {
+        let exact = GenImgProjTransformer::with_backend(src_gt, dst_gt, dst_to_src, src_to_dst)?;
         Ok(Self { approx: ApproxTransformer::new(exact, max_error) })
     }
 
@@ -119,6 +146,43 @@ fn gt6(v: &[f64], what: &str) -> Result<[f64; 6], String> {
 // wasm-bindgen surface
 // ---------------------------------------------------------------------------
 
+/// A [`CrsTransform`] that calls a JavaScript function for every point.
+///
+/// The function is `(x, y, out) => boolean`: it writes the transformed
+/// coordinate into `out`, a `Float64Array` of length 2 owned by this
+/// transform, and returns `true`, or returns `false` (or throws) for a
+/// point it cannot transform. Writing into a shared buffer rather than
+/// returning an array keeps the per-point cost to one call and two reads.
+struct JsTransform {
+    f: js_sys::Function,
+    out: js_sys::Float64Array,
+}
+
+impl JsTransform {
+    fn new(f: js_sys::Function) -> Self {
+        Self { f, out: js_sys::Float64Array::new_with_length(2) }
+    }
+}
+
+impl CrsTransform for JsTransform {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let ok = self
+            .f
+            .call3(&JsValue::UNDEFINED, &JsValue::from_f64(x), &JsValue::from_f64(y), &self.out)
+            .ok()?;
+        if !ok.is_truthy() {
+            return None;
+        }
+        let rx = self.out.get_index(0);
+        let ry = self.out.get_index(1);
+        if rx.is_finite() && ry.is_finite() {
+            Some((rx, ry))
+        } else {
+            None
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct Warper {
     core: WarperCore,
@@ -140,6 +204,41 @@ impl Warper {
         let core = WarperCore::new(
             src_crs, gt6(src_gt, "source").map_err(js)?,
             dst_crs, gt6(dst_gt, "destination").map_err(js)?, max_error,
+        )
+        .map_err(js)?;
+        Ok(Warper { core })
+    }
+
+    /// Build a warper whose CRS transforms are JavaScript functions rather
+    /// than proj4rs: `dst_to_src(x, y, out)` and `src_to_dst(x, y, out)`
+    /// each write `[x, y]` into `out` (a `Float64Array` of length 2) and
+    /// return `true`, or return `false` for a point they cannot transform.
+    /// Everything downstream - the approximate transformer, the source
+    /// window, the kernels - is the same as for `new`; only who does the
+    /// projecting changes. This is how a page with proj4js or a PROJ build
+    /// lends rwarp a projection proj4rs does not have.
+    #[wasm_bindgen(js_name = withTransforms)]
+    pub fn with_transforms(
+        src_gt: &[f64],
+        dst_gt: &[f64],
+        dst_to_src: &JsValue,
+        src_to_dst: &JsValue,
+        max_error: f64,
+    ) -> Result<Warper, JsError> {
+        let js = |e: String| JsError::new(&e);
+        let as_fn = |v: &JsValue, what: &str| -> Result<js_sys::Function, JsError> {
+            v.dyn_ref::<js_sys::Function>()
+                .cloned()
+                .ok_or_else(|| JsError::new(&format!("{what} must be a function (x, y, out) => boolean")))
+        };
+        let d2s = JsTransform::new(as_fn(dst_to_src, "dst_to_src")?);
+        let s2d = JsTransform::new(as_fn(src_to_dst, "src_to_dst")?);
+        let core = WarperCore::with_transforms(
+            gt6(src_gt, "source").map_err(js)?,
+            gt6(dst_gt, "destination").map_err(js)?,
+            Box::new(d2s),
+            Box::new(s2d),
+            max_error,
         )
         .map_err(js)?;
         Ok(Warper { core })
@@ -339,6 +438,41 @@ mod tests {
         let ll = crs_to_lonlat(LAEA_TAS, p[0], p[1]).unwrap();
         assert!((ll[0] - 147.3257).abs() < 1e-6 && (ll[1] - -42.8826).abs() < 1e-6);
         assert!(lonlat_to_crs("+proj=nonsense", 0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn closure_transforms_match_the_builtin_backend() {
+        // The same warp through proj4rs directly, and through closures that
+        // call proj4rs: with_transforms must be a pure plumbing change.
+        let (src_gt, src_size) = webmerc(8);
+        let builtin = WarperCore::new("EPSG:3857", src_gt, LAEA_TAS, tile_gt(400_000.0), 0.125).unwrap();
+        let d2s = rwarp::crs::Proj4rsBackend::new(LAEA_TAS, "EPSG:3857").unwrap();
+        let s2d = rwarp::crs::Proj4rsBackend::new("EPSG:3857", LAEA_TAS).unwrap();
+        let via_fn = WarperCore::with_transforms(
+            src_gt, tile_gt(400_000.0),
+            Box::new(FnTransform(move |x, y| d2s.convert(x, y))),
+            Box::new(FnTransform(move |x, y| s2d.convert(x, y))),
+            0.125,
+        ).unwrap();
+        let win = builtin.source_window([256, 256], src_size, 1).unwrap();
+        let (w, h) = (win.xsize as usize, win.ysize as usize);
+        let src = synthetic(w, h);
+        let a = builtin.warp_rgba(&src, w, h, win.xoff as usize, win.yoff as usize, 256, 256, ResampleAlg::Bilinear).unwrap();
+        let b = via_fn.warp_rgba(&src, w, h, win.xoff as usize, win.yoff as usize, 256, 256, ResampleAlg::Bilinear).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn closure_that_refuses_gives_transparent_output() {
+        let (src_gt, _) = webmerc(8);
+        let core = WarperCore::with_transforms(
+            src_gt, tile_gt(400_000.0),
+            Box::new(FnTransform(|_x, _y| None)),
+            Box::new(FnTransform(|_x, _y| None)),
+            0.125,
+        ).unwrap();
+        let out = core.warp_rgba(&synthetic(8, 8), 8, 8, 0, 0, 16, 16, ResampleAlg::NearestNeighbour).unwrap();
+        assert!(out.chunks(4).all(|p| p[3] == 0));
     }
 
     #[test]
