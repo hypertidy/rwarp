@@ -186,6 +186,22 @@ mod tests {
     }
 
     #[test]
+    fn ortho_matches_proj_and_roundtrips() {
+        // Reference: PROJ 9.8.1 via pyproj, same definition.
+        let ortho = "+proj=ortho +lat_0=-42 +lon_0=147 +datum=WGS84 +units=m +no_defs";
+        let fwd = Proj4rsBackend::new("EPSG:4326", ortho).unwrap();
+        let inv = Proj4rsBackend::new(ortho, "EPSG:4326").unwrap();
+        let (x, y) = fwd.convert(HOBART.0, HOBART.1).unwrap();
+        assert!((x - 26608.2567).abs() < 1e-3, "ortho x = {x}");
+        assert!((y - -98087.5790).abs() < 1e-3, "ortho y = {y}");
+        let (lon, lat) = inv.convert(x, y).unwrap();
+        assert!((lon - HOBART.0).abs() < 1e-9 && (lat - HOBART.1).abs() < 1e-9);
+        // The far side of the globe is not visible.
+        let far = fwd.convert(-33.0, 42.0);
+        assert!(far.is_none(), "far side = {far:?}");
+    }
+
+    #[test]
     fn failure_is_none_not_panic() {
         let t = Proj4rsBackend::new("EPSG:4326", "EPSG:3857").unwrap();
         // Mercator is undefined at the pole.

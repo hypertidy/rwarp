@@ -85,7 +85,7 @@ CORS headers, since tiles are decoded through a canvas.
 ## Projection support
 
 The `proj4rs` backend implements: latlong, laea, stere (and ups), sterea,
-aea, lcc, tmerc/etmerc/utm, merc/webmerc, eqc, moll, geos, somerc, geocent.
-Not yet available: `ortho` (absent upstream), `aeqd` (upstream feature
-depends on a C geodesic library, so it is off for wasm). Both are candidates
-for pure-Rust contributions to proj4rs.
+aea, lcc, tmerc/etmerc/utm, merc/webmerc, eqc, moll, geos, somerc, geocent,
+ortho. Not yet available: `aeqd` (upstream feature depends on a C geodesic
+library, so it is off for wasm), a candidate for a pure-Rust contribution to
+proj4rs.
