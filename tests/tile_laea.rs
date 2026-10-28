@@ -119,7 +119,7 @@ fn nearest_warp_of_gradient_is_monotone_across_tile() {
 #[test]
 #[ignore]
 fn timing_per_band_vs_interleaved() {
-    use rwarp::warp::warp_resample_u8;
+    use rwarp::warp::{warp, KernelScaling, SourceBuffer, WarpOptions};
     let (src_gt, src_size) = webmerc_grid(8);
     let approx = ApproxTransformer::new(
         GenImgProjTransformer::new("EPSG:3857", src_gt, LAEA_TAS, laea_tile_gt(400_000.0)).unwrap(), 0.125);
@@ -143,7 +143,9 @@ fn timing_per_band_vs_interleaved() {
         let per_band = t.elapsed().as_secs_f64() * 100.0;
         let t = std::time::Instant::now();
         for _ in 0..10 {
-            let _ = warp_resample_u8(&approx, &rgba, w, h, 4, xo, yo, 256, 256, Some(3), alg);
+            let buf = SourceBuffer { data: &rgba[..], ncol: w, nrow: h, nbands: 4, col_off: xo, row_off: yo };
+            let opts = WarpOptions { alg, scaling: KernelScaling::Point, mask_band: Some(3), ..Default::default() };
+            let _ = warp(&approx, &buf, 256, 256, &opts);
         }
         let inter = t.elapsed().as_secs_f64() * 100.0;
         eprintln!("{alg:?}: per-band {per_band:.2} ms  interleaved {inter:.2} ms  ({:.1}x)", per_band / inter);

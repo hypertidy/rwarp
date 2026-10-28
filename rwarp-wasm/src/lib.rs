@@ -16,7 +16,7 @@ use rwarp::CrsTransform;
 use wasm_bindgen::JsCast;
 use rwarp::source_window::{compute_source_window, SourceWindow};
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::warp::{warp_resample_t, warp_resample_u8, ResampleAlg};
+use rwarp::warp::{warp, KernelScaling, ResampleAlg, SourceBuffer, WarpOptions};
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -95,9 +95,9 @@ impl WarperCore {
                 src.len(), src_w, src_h, src_w * src_h * 4
             ));
         }
-        Ok(warp_resample_u8(
-            &self.approx, src, src_w, src_h, 4, src_xoff, src_yoff, dst_w, dst_h, Some(3), alg,
-        ))
+        let buf = SourceBuffer { data: src, ncol: src_w, nrow: src_h, nbands: 4, col_off: src_xoff, row_off: src_yoff };
+        let opts = WarpOptions { alg, scaling: KernelScaling::Point, mask_band: Some(3), ..Default::default() };
+        Ok(warp(&self.approx, &buf, dst_w, dst_h, &opts))
     }
 }
 
@@ -121,10 +121,11 @@ impl WarperCore {
         if src.len() != src_w * src_h {
             return Err(format!("source buffer is {} values, expected {}x{}", src.len(), src_w, src_h));
         }
-        Ok(warp_resample_t(
-            &self.approx, src, src_w, src_h, 1, src_xoff, src_yoff, dst_w, dst_h,
-            Some(nodata.unwrap_or(f32::NAN)), None, alg,
-        ))
+        let buf = SourceBuffer { data: src, ncol: src_w, nrow: src_h, nbands: 1, col_off: src_xoff, row_off: src_yoff };
+        let opts = WarpOptions {
+            alg, scaling: KernelScaling::Point, nodata: Some(nodata.unwrap_or(f32::NAN)), ..Default::default()
+        };
+        Ok(warp(&self.approx, &buf, dst_w, dst_h, &opts))
     }
 }
 
