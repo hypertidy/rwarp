@@ -45,6 +45,16 @@ This release changes the API: options types are `#[non_exhaustive]`.
 - Parity fixtures for whole rasters warped in many chunks
   (`tests/chunks.rs`, `tests/fixtures/chunks/`): seven gdalwarp cases,
   chunk lists and output identical. (2026-10-28)
+- Cutlines (gdalwarp `-cutline`): `WarpOptions::cutline` /
+  `with_cutline`, and the `cutline` module with `Cutline` (polygons in
+  source pixel/line), `CutlineRule::Centre` (GDAL's default, with its tie
+  rules), `CutlineRule::AllTouched` (`CUTLINE_ALL_TOUCHED`), blend distance
+  (`-cblend`), and `CutlineRule::Exact`, which weights each source pixel by
+  the fraction of it the cutline covers (not a GDAL mode).
+  `Cutline::from_geotransform` and `Cutline::from_transformer` (densified
+  as gdalwarp does) map world geometry to source pixels;
+  `Cutline::density` is the per-pixel density the warp uses. The cutline
+  is rasterized over the source buffer only, with `controlledburn`.
 
 ### Removed
 

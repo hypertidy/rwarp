@@ -61,6 +61,7 @@
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `compute_source_window` (one window, quick) | `ComputeSourceWindow` |
 //! | [`plan`] | `plan_chunks`, `ChunkPlanner`, `warp_chunks`: gdalwarp's chunk list, source windows and per-chunk kernel scale as values | `GDALWarpOperation::CollectChunkList`, `ComputeSourceWindow` |
+//! | [`cutline`] | `Cutline`: polygon limiting the source pixels used, as a per-pixel density | `GDALWarpCutlineMaskerEx`, `TransformCutlineToSource` |
 //! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, area-weighted average and mode, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
 //!
 //! ## Validation status
@@ -87,6 +88,7 @@
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
 //! | Chunk planning, whole-raster chunked warp (`plan_chunks`, `warp_chunks`) | lon/lat sources to Mercator, polar stereographic and LAEA under `-wm 100000`, MEM and tiled targets, near/bilinear/cubic/lanczos (`tests/chunks.rs`) | chunk lists and every output pixel identical to `gdalwarp` (GDAL 3.14.0dev-739fcf03bf), 7 cases of 6 to 13 chunks |
 //! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
+//! | Cutline (`-cutline`, `CUTLINE_ALL_TOUCHED`, `-cblend`) | synthetic Float32, ties through pixel centres, holes, multipolygons, nodata, every method, rotated and LAEA to lon/lat (`tests/cutline.rs`) | within 1e-6 relative of `gdalwarp` (67 cases); differs only at centre ties on a diagonal (rounding, 5 pixels) and where GDAL's all-touched line walker burns corner-touched pixels or uses tolerances (3 cases) |
 //!
 //! **Downsampled interpolated warps:** when the output is coarser than the
 //! source, GDAL widens the bilinear, cubic and lanczos kernels to cover the
@@ -148,6 +150,7 @@
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
 //! | `plan.rs` | `gdalwarpoperation.cpp` | ~L977-1670, ~L2640-3390 (at `739fcf03bf`) |
+//! | `cutline.rs` | `alg/gdalcutline.cpp`, `alg/llrasterize.cpp`, `apps/gdalwarp_lib.cpp` | `GDALWarpCutlineMaskerEx`, `BlendMaskGenerator`, `GDALdllImageFilledPolygon`, `TransformCutlineToSource` (at `739fcf03bf`) |
 //! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840; average ~L6845-7030, ~L7577, ~L7960; mode ~L7147-7235, ~L8115-8170; rounding/nodata/bounds ~L1587, ~L1613, ~L1856, ~L5251 (at `739fcf03bf`, 3.14.0dev) |
 
 pub mod crs;
@@ -157,6 +160,7 @@ pub mod geoloc_transform;
 pub mod approx;
 pub mod source_window;
 pub mod plan;
+pub mod cutline;
 pub mod warp;
 
 // Re-export the Transformer trait at the crate root so modules can

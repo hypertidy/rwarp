@@ -160,7 +160,44 @@
 //! **Average, mode**: invalid pixels add neither value nor weight to that
 //! band; with [`AverageThresholds`] in use, average treats the bands
 //! together.
+//!
+//! ## Cutline
+//!
+//! [`WarpOptions::cutline`] (gdalwarp `-cutline`) gives every pixel of the
+//! source buffer a density in `[0, 1]` ([`Cutline::density`]; GDAL's
+//! `pafUnifiedSrcDensity` from `GDALWarpCutlineMaskerEx`,
+//! alg/gdalcutline.cpp), computed over the buffer only. A buffer wholly
+//! inside the cutline is warped as if there were none; one wholly outside
+//! gives no values. Otherwise, following gdalwarpkernel.cpp
+//! (`GWKRealCaseThread`, `GWKNearestThread`, `GWKBilinearResample4Sample`,
+//! `GWKCubicResample4Sample`, `GWKResample`, `GWKAverageOrModeThread`):
+//!
+//! **Point methods**: a destination pixel whose sample point lands on a
+//! source pixel of density below 1e-9 gets no value. Taps of density below
+//! 1e-9 are invalid, like nodata (so cubic falls back to bilinear near the
+//! cutline). Kernel weights are not scaled by density, but the density is
+//! interpolated with the same weights, and a result of density `d` below
+//! 0.9999 is blended with the destination as GDAL blends into a new
+//! destination: no value below 0.0001; with a destination nodata the value
+//! is unchanged (the destination there is nodata, which carries no
+//! weight); without one it is scaled by `d` (blended with the zero fill).
+//! Nearest copies the source value when `d >= 0.9999`. With no blend
+//! distance densities are 0 or 1, so this is a plain mask.
+//!
+//! **Area methods**: a source pixel is used, at its full weight, when its
+//! density is above 1e-10. Blend distance therefore widens the cutline by
+//! the blend distance for them rather than feathering it, as in GDAL.
+//!
+//! [`CutlineRule::Exact`], not a GDAL mode, makes densities coverage
+//! fractions and uses them as weights: area methods weight a source pixel
+//! by its footprint weight times its coverage (for [`AverageThresholds`]
+//! the uncovered part counts as invalid; min, max and the quantiles take
+//! any pixel with some coverage); point kernels multiply each tap's weight
+//! by its coverage and renormalise, and a destination pixel gets a value
+//! only when its sample point lands on a source pixel at least half
+//! covered (nearest likewise). There is no blending with the destination.
 
+use crate::cutline::{Cutline, CutlineRule, BAND_DENSITY_THRESHOLD, SRC_DENSITY_THRESHOLD};
 use crate::transform::{transform_scanline, Transformer};
 
 /// Resampling algorithm.
@@ -438,6 +475,10 @@ pub struct WarpOptions {
     /// from, so a tile of a larger destination can be warped on its own.
     pub dst_col_off: usize,
     pub dst_row_off: usize,
+    /// Polygon limiting the source pixels used, in source pixel/line
+    /// coordinates (gdalwarp `-cutline`); see [`Cutline`] and the module
+    /// documentation.
+    pub cutline: Option<Cutline>,
 }
 
 impl Default for WarpOptions {
@@ -454,6 +495,7 @@ impl Default for WarpOptions {
             mask_band: None,
             dst_col_off: 0,
             dst_row_off: 0,
+            cutline: None,
         }
     }
 }
@@ -515,6 +557,12 @@ impl WarpOptions {
     pub fn with_dst_offset(mut self, col_off: usize, row_off: usize) -> Self {
         self.dst_col_off = col_off;
         self.dst_row_off = row_off;
+        self
+    }
+
+    /// A cutline; see [`WarpOptions::cutline`].
+    pub fn with_cutline(mut self, cutline: Cutline) -> Self {
+        self.cutline = Some(cutline);
         self
     }
 }
@@ -1611,9 +1659,26 @@ pub fn warp_to<S: Sample, D: Sample>(
     assert!(opts.mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
 
     let out_spec = Output::<D>::new(S::DATA_TYPE, nbands, opts);
+
+    // The cutline's density over the source buffer (GDAL's
+    // pafUnifiedSrcDensity). A buffer entirely inside needs none, as in
+    // GDAL; one entirely outside gives no values.
+    let mut density = Vec::new();
+    let mut cut = None;
+    if let Some(c) = &opts.cutline {
+        c.density_into(src.col_off, src.row_off, src.ncol, src.nrow, &mut density);
+        if density.iter().all(|&d| d == 0.0) {
+            return out_spec.filled(dst_ncol * dst_nrow);
+        }
+        if !density.iter().all(|&d| d >= 1.0) {
+            cut = Some(Cut { density: &density[..], exact: c.rule == CutlineRule::Exact });
+        }
+    }
+
     let img = Interleaved {
         src: src.data, ncol: src.ncol, nrow: src.nrow, nb: nbands,
         mask: opts.mask_band, nodata: out_spec.src_nodata::<S>(), rule: opts.band_nodata,
+        cut,
     };
     let alg = opts.alg;
     let (sx, sy) = match opts.scaling {
@@ -1627,6 +1692,9 @@ pub fn warp_to<S: Sample, D: Sample>(
         return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy), &out_spec);
     }
     let widened = Widened::new(alg, sx, sy);
+    // GDAL blends a partial-density result with the destination
+    // (GWKSetPixelValueRealT); see the module documentation.
+    let blend = cut.is_some_and(|c| !c.exact);
 
     let mut out = out_spec.filled(dst_ncol * dst_nrow);
     let mut sc = Scratch::new(nbands);
@@ -1652,10 +1720,17 @@ pub fn warp_to<S: Sample, D: Sample>(
                 let bc = (buf_x + 1.0e-10) as i64;
                 let br = (buf_y + 1.0e-10) as i64;
                 if bc < 0 || bc >= src.ncol as i64 || br < 0 || br >= src.nrow as i64 { continue; }
-                let pix = img.px(br as usize * src.ncol + bc as usize);
-                if !img.pixel_ok(pix) { continue; }
+                let p = br as usize * src.ncol + bc as usize;
+                let pix = img.px(p);
+                if !img.pixel_ok(pix) || !img.centre_ok(p) { continue; }
+                let d = img.density(p);
                 for b in 0..nbands {
-                    if img.band_ok(pix, b) { out[o + b] = out_spec.copied(pix[b], b); }
+                    if !img.band_ok(pix, b) { continue; }
+                    if blend && d < 0.9999 {
+                        if let Some(v) = out_spec.blended(pix[b].to_f64(), d, b) { out[o + b] = v; }
+                    } else {
+                        out[o + b] = out_spec.copied(pix[b], b);
+                    }
                 }
                 continue;
             }
@@ -1667,11 +1742,12 @@ pub fn warp_to<S: Sample, D: Sample>(
             // GDAL skips a destination pixel whose centre lands on an
             // invalid source pixel before any kernel runs
             // (GWKRealCaseThread, gdalwarpkernel.cpp ~L5680).
-            if !img.valid(cy * src.ncol + cx) { continue; }
+            let p = cy * src.ncol + cx;
+            if !img.valid(p) || !img.centre_ok(p) { continue; }
 
             let any = match (widened, alg) {
                 (Some(w), _) => img.widened(buf_x, buf_y, &w, &mut sc),
-                (None, ResampleAlg::Bilinear) => img.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit),
+                (None, ResampleAlg::Bilinear) => img.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit, &mut sc.dens),
                 (None, ResampleAlg::Cubic) => img.cubic(buf_x, buf_y, &mut sc),
                 (None, ResampleAlg::Lanczos) => img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut sc),
                 (None, ResampleAlg::CubicSpline) => img.widened(buf_x, buf_y, &CUBICSPLINE_POINT, &mut sc),
@@ -1679,7 +1755,13 @@ pub fn warp_to<S: Sample, D: Sample>(
             };
             if any {
                 for b in 0..nbands {
-                    if sc.hit[b] { out[o + b] = out_spec.computed(sc.acc[b], b); }
+                    if !sc.hit[b] { continue; }
+                    let d = sc.dens[b];
+                    if blend && d < 0.9999 {
+                        if let Some(v) = out_spec.blended(sc.acc[b], d, b) { out[o + b] = v; }
+                    } else {
+                        out[o + b] = out_spec.computed(sc.acc[b], b);
+                    }
                 }
             }
         }
@@ -1753,6 +1835,22 @@ impl<D: Sample> Output<D> {
         self.put(self.working.copy(to_wv(v)), b)
     }
 
+    /// A point-kernel result `r` of cutline density `d` below 0.9999,
+    /// blended with the destination as GDAL does into a fresh destination
+    /// (`GWKSetPixelValueRealT`, gdalwarpkernel.cpp ~L1790): no value below
+    /// a density of 0.0001; otherwise `(r d + dst (1 - d) dd) / (d + (1 -
+    /// d) dd)`, where the destination holds its fill and has density `dd`,
+    /// 0 when there is a destination nodata (the fill is nodata, so the
+    /// result is `r`) and 1 when there is none (the fill is 0, so the
+    /// result is `r d`).
+    #[inline]
+    fn blended(&self, r: f64, d: f64, b: usize) -> Option<D> {
+        if d < 0.0001 { return None; }
+        let (dst, dd) = if self.dst_nd.iter().any(Option::is_some) { (0.0, 0.0) } else { (0.0, 1.0) };
+        let infl = (1.0 - d) * dd;
+        Some(self.computed((r * d + dst * infl) / (d + infl), b))
+    }
+
     /// A reducer's result for band `b`, if any.
     #[inline]
     fn result<S: Sample>(&self, r: Res<S>, b: usize) -> Option<D> {
@@ -1822,6 +1920,16 @@ struct Interleaved<'a, T: Sample> {
     /// Source nodata per band, where representable in `T`.
     nodata: Vec<Option<T>>,
     rule: BandNodata,
+    /// The cutline's density per buffer pixel, if one is in use.
+    cut: Option<Cut<'a>>,
+}
+
+/// A cutline's density over the source buffer and how the kernels use it.
+#[derive(Clone, Copy)]
+struct Cut<'a> {
+    density: &'a [f32],
+    /// [`CutlineRule::Exact`]: densities are coverage weights.
+    exact: bool,
 }
 
 /// Per-call scratch for the interpolating kernels: a value and a weight per
@@ -1835,6 +1943,11 @@ struct Scratch {
     wx: Vec<f64>,
     fallback: Vec<f64>,
     fallback_hit: Vec<bool>,
+    /// Cutline density of the result per band (1 without a cutline).
+    dens: Vec<f64>,
+    fallback_dens: Vec<f64>,
+    dsum: Vec<f64>,
+    row_d: Vec<f64>,
 }
 
 impl Scratch {
@@ -1842,12 +1955,14 @@ impl Scratch {
         Scratch {
             acc: vec![0.0; nb], wsum: vec![0.0; nb], row_acc: vec![0.0; nb], row_w: vec![0.0; nb],
             hit: vec![false; nb], wx: Vec::new(), fallback: vec![0.0; nb], fallback_hit: vec![false; nb],
+            dens: vec![1.0; nb], fallback_dens: vec![1.0; nb], dsum: vec![0.0; nb], row_d: vec![0.0; nb],
         }
     }
 
     fn clear(&mut self) {
         self.acc.fill(0.0);
         self.wsum.fill(0.0);
+        self.dsum.fill(0.0);
         self.hit.fill(false);
     }
 }
@@ -1916,12 +2031,70 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         self.pixel_ok(self.px(p))
     }
 
+    /// Cutline density of buffer pixel `p` (1 without a cutline).
+    #[inline]
+    fn density(&self, p: usize) -> f64 {
+        self.cut.map_or(1.0, |c| c.density[p] as f64)
+    }
+
+    /// Whether a destination pixel whose sample point lands on buffer pixel
+    /// `p` gets a value at all, by the cutline: GDAL skips it when the
+    /// density is below `SRC_DENSITY_THRESHOLD`; the exact rule asks for at
+    /// least half the pixel covered.
+    #[inline]
+    fn centre_ok(&self, p: usize) -> bool {
+        match self.cut {
+            None => true,
+            Some(c) if c.exact => c.density[p] >= 0.5,
+            Some(c) => c.density[p] as f64 >= SRC_DENSITY_THRESHOLD,
+        }
+    }
+
+    /// A kernel tap at buffer pixel `p`: `None` if the cutline excludes
+    /// it, otherwise the factor on its kernel weight (the coverage under
+    /// the exact rule, else 1) and its density.
+    #[inline]
+    fn tap(&self, p: usize) -> Option<(f64, f64)> {
+        match self.cut {
+            None => Some((1.0, 1.0)),
+            Some(c) => {
+                let d = c.density[p] as f64;
+                if c.exact {
+                    (d > 0.0).then_some((d, 1.0))
+                } else {
+                    (d >= SRC_DENSITY_THRESHOLD).then_some((1.0, d))
+                }
+            }
+        }
+    }
+
     /// Hand source pixel `p` with weight `w` to an area reducer, with its
     /// validity.
     #[inline]
+    ///
+    /// With a cutline, GDAL's area methods use a pixel whose density is
+    /// above `BAND_DENSITY_THRESHOLD`, at its full weight. Under the exact
+    /// rule the pixel's covered part counts with weight `w c` and the rest,
+    /// `w (1 - c)`, as invalid (which only the average thresholds see).
     fn reduce<R: AreaReducer<T>>(&self, red: &mut R, p: usize, w: f64, band_ok: &mut [bool]) {
         let pix = self.px(p);
-        let pixel_ok = self.pixel_ok(pix);
+        let mut pixel_ok = self.pixel_ok(pix);
+        if let Some(c) = self.cut {
+            let d = c.density[p] as f64;
+            if c.exact {
+                if d < 1.0 {
+                    if pixel_ok && d > 0.0 {
+                        for (b, ok) in band_ok.iter_mut().enumerate() { *ok = self.band_ok(pix, b); }
+                        red.add(pix, true, band_ok, w * d);
+                    }
+                    band_ok.fill(false);
+                    red.add(pix, false, band_ok, if pixel_ok && d > 0.0 { w * (1.0 - d) } else { w });
+                    return;
+                }
+            } else {
+                pixel_ok &= d > BAND_DENSITY_THRESHOLD;
+            }
+        }
         for (b, ok) in band_ok.iter_mut().enumerate() { *ok = pixel_ok && self.band_ok(pix, b); }
         red.add(pix, pixel_ok, band_ok, w);
     }
@@ -1950,8 +2123,10 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     /// gdalwarpkernel.cpp ~L3090, and `GWKBilinearResampleNoMasks4SampleT`).
     /// Per band, invalid and out-of-buffer neighbours are dropped and the
     /// rest renormalised; a band whose neighbours weigh less than 1e-5 gets
-    /// no value. Fills `out` / `hit` per band.
-    fn bilinear(&self, buf_x: f64, buf_y: f64, out: &mut [f64], hit: &mut [bool]) -> bool {
+    /// no value. Fills `out` / `hit` per band, and `dens` with the
+    /// weighted mean cutline density of the taps used (GDAL's
+    /// `dfAccumulatorDensity`).
+    fn bilinear(&self, buf_x: f64, buf_y: f64, out: &mut [f64], hit: &mut [bool], dens: &mut [f64]) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
         let rx = 1.5 - (buf_x - ix as f64);
@@ -1960,7 +2135,8 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 
         // GDAL's factored formula only for its fast-path types with no
         // validity masks; otherwise the general accumulation below.
-        let fast = T::GDAL_FAST_BILINEAR && self.nodata.iter().all(Option::is_none) && self.mask.is_none();
+        let fast = T::GDAL_FAST_BILINEAR && self.nodata.iter().all(Option::is_none) && self.mask.is_none()
+            && self.cut.is_none();
         if fast && ix >= 0 && ix + 1 < ncol && iy >= 0 && iy + 1 < nrow {
             let p00 = iy as usize * self.ncol + ix as usize;
             let (a, b, c, d) = (self.px(p00), self.px(p00 + 1), self.px(p00 + self.ncol), self.px(p00 + self.ncol + 1));
@@ -1970,13 +2146,14 @@ impl<'a, T: Sample> Interleaved<'a, T> {
                         + (c.to_f64() * rx + d.to_f64() * (1.0 - rx)) * (1.0 - ry);
                 }
                 hit.fill(true);
+                dens.fill(1.0);
                 return true;
             }
         }
 
         let mut any = false;
         for band in 0..self.nb {
-            let (mut acc, mut div) = (0.0, 0.0);
+            let (mut acc, mut div, mut dacc) = (0.0, 0.0, 0.0);
             for &(cx, cy, w) in &[
                 (ix,     iy,     rx * ry),
                 (ix + 1, iy,     (1.0 - rx) * ry),
@@ -1984,16 +2161,19 @@ impl<'a, T: Sample> Interleaved<'a, T> {
                 (ix + 1, iy + 1, (1.0 - rx) * (1.0 - ry)),
             ] {
                 if cx >= 0 && cx < ncol && cy >= 0 && cy < nrow {
-                    let pix = self.px(cy as usize * self.ncol + cx as usize);
-                    if self.band_ok(pix, band) {
-                        acc += pix[band].to_f64() * w;
-                        div += w;
-                    }
+                    let p = cy as usize * self.ncol + cx as usize;
+                    let pix = self.px(p);
+                    if !self.band_ok(pix, band) { continue; }
+                    let Some((f, d)) = self.tap(p) else { continue };
+                    let w = w * f;
+                    acc += pix[band].to_f64() * w;
+                    div += w;
+                    dacc += d * w;
                 }
             }
             hit[band] = div >= 1e-5;
             if hit[band] {
-                out[band] = if div == 1.0 { acc } else { acc / div };
+                (out[band], dens[band]) = if div == 1.0 { (acc, dacc) } else { (acc / div, dacc / div) };
                 any = true;
             }
         }
@@ -2002,7 +2182,10 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 
     /// Cubic at a sample point (GDAL's `GWKCubicResample4Sample`, ~L3420).
     /// Near the buffer edge, or for a band with any invalid pixel in the
-    /// 4×4 window, falls back to [`Self::bilinear`] for that band.
+    /// 4×4 window, falls back to [`Self::bilinear`] for that band. A tap
+    /// the cutline excludes is invalid; the cutline density is convolved
+    /// with the same weights (GDAL's `adfValueDens`), and under the exact
+    /// rule the weights are scaled by coverage and renormalised.
     fn cubic(&self, buf_x: f64, buf_y: f64, sc: &mut Scratch) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
@@ -2010,7 +2193,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         let dy = buf_y - 0.5 - iy as f64;
 
         if ix - 1 < 0 || ix + 2 >= self.ncol as i64 || iy - 1 < 0 || iy + 2 >= self.nrow as i64 {
-            return self.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit);
+            return self.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit, &mut sc.dens);
         }
         let wx = [cubic_weight(dx + 1.0), cubic_weight(dx), cubic_weight(dx - 1.0), cubic_weight(dx - 2.0)];
         let wy = [cubic_weight(dy + 1.0), cubic_weight(dy), cubic_weight(dy - 1.0), cubic_weight(dy - 2.0)];
@@ -2019,28 +2202,48 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         let nb = self.nb;
         sc.acc.fill(0.0);
         sc.hit.fill(true);
+        let (mut dsum, mut wsum) = (0.0, 0.0);
         for (jj, &wyj) in wy.iter().enumerate() {
             sc.row_acc.fill(0.0);
-            let start = (((iy - 1) as usize + jj) * self.ncol + (ix - 1) as usize) * nb;
-            for (pix, &wxi) in self.src[start..start + 4 * nb].chunks_exact(nb).zip(&wx) {
+            let p0 = ((iy - 1) as usize + jj) * self.ncol + (ix - 1) as usize;
+            let start = p0 * nb;
+            let (mut row_d, mut row_w) = (0.0, 0.0);
+            for (i, (pix, &wxi)) in self.src[start..start + 4 * nb].chunks_exact(nb).zip(&wx).enumerate() {
+                let (f, d) = match self.tap(p0 + i) {
+                    Some(t) => t,
+                    None => { sc.hit.fill(false); continue; }
+                };
+                let w = wxi * f;
+                row_d += wxi * d;
+                row_w += w;
                 if self.all_ok(pix) {
-                    for (r, &v) in sc.row_acc.iter_mut().zip(pix) { *r += v.to_f64() * wxi; }
+                    for (r, &v) in sc.row_acc.iter_mut().zip(pix) { *r += v.to_f64() * w; }
                 } else {
                     for b in 0..nb {
-                        if self.band_ok(pix, b) { sc.row_acc[b] += pix[b].to_f64() * wxi; } else { sc.hit[b] = false; }
+                        if self.band_ok(pix, b) { sc.row_acc[b] += pix[b].to_f64() * w; } else { sc.hit[b] = false; }
                     }
                 }
             }
             for (o, &r) in sc.acc.iter_mut().zip(sc.row_acc.iter()) { *o += r * wyj; }
+            dsum += row_d * wyj;
+            wsum += row_w * wyj;
+        }
+        if let Some(c) = self.cut {
+            for b in 0..nb {
+                if !sc.hit[b] { continue; }
+                sc.dens[b] = dsum;
+                if c.exact { sc.acc[b] /= wsum; }
+            }
         }
         if sc.hit.iter().all(|&h| h) { return true; }
         // Any band with an invalid pixel in the window: bilinear for it.
-        self.bilinear(buf_x, buf_y, &mut sc.fallback, &mut sc.fallback_hit);
+        self.bilinear(buf_x, buf_y, &mut sc.fallback, &mut sc.fallback_hit, &mut sc.fallback_dens);
         let mut any = false;
         for b in 0..nb {
             if !sc.hit[b] {
                 sc.hit[b] = sc.fallback_hit[b];
                 sc.acc[b] = sc.fallback[b];
+                sc.dens[b] = sc.fallback_dens[b];
             }
             any |= sc.hit[b];
         }
@@ -2055,7 +2258,11 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     /// sample point, clipped to the buffer; weights are the kernel at
     /// `(i - delta) * scale`. Per band, invalid pixels are skipped and the
     /// result is normalised by the weight of the pixels used; a band whose
-    /// weight is below 1e-6 gets no value.
+    /// weight is below 1e-6 gets no value. With a cutline, taps it excludes
+    /// are skipped too, the density is accumulated with the same weights
+    /// and normalised the same way, and a band whose unnormalised density
+    /// is below 1e-6 gets no value (as GDAL); under the exact rule the
+    /// weights are scaled by coverage.
     fn widened(&self, buf_x: f64, buf_y: f64, w: &Widened, sc: &mut Scratch) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
@@ -2065,7 +2272,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         // a support wider than the buffer, and uses the 4-sample bilinear
         // formula instead (GWKResampleNoMasksT).
         if w.alg != ResampleAlg::Lanczos && (ix >= ncol || iy >= nrow || w.rx > ncol || w.ry > nrow) {
-            return self.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit);
+            return self.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit, &mut sc.dens);
         }
         let dx = buf_x - 0.5 - ix as f64;
         let dy = buf_y - 0.5 - iy as f64;
@@ -2082,22 +2289,42 @@ impl<'a, T: Sample> Interleaved<'a, T> {
             sc.row_acc.fill(0.0);
             sc.row_w.fill(0.0);
             let mut row_shared = 0.0;
-            let start = (((iy + j) * ncol + ix + i0) as usize) * nb;
+            let p0 = ((iy + j) * ncol + ix + i0) as usize;
+            let start = p0 * nb;
             let run = &self.src[start..start + sc.wx.len() * nb];
-            for (pix, &wxi) in run.chunks_exact(nb).zip(sc.wx.iter()) {
-                self.accumulate(pix, wxi, &mut sc.row_acc, &mut row_shared, &mut sc.row_w);
+            if self.cut.is_none() {
+                for (pix, &wxi) in run.chunks_exact(nb).zip(sc.wx.iter()) {
+                    self.accumulate(pix, wxi, &mut sc.row_acc, &mut row_shared, &mut sc.row_w);
+                }
+            } else {
+                sc.row_d.fill(0.0);
+                for (i, (pix, &wxi)) in run.chunks_exact(nb).zip(sc.wx.iter()).enumerate() {
+                    let Some((f, d)) = self.tap(p0 + i) else { continue };
+                    let wf = wxi * f;
+                    for b in 0..nb {
+                        if self.band_ok(pix, b) {
+                            sc.row_acc[b] += pix[b].to_f64() * wf;
+                            sc.row_w[b] += wf;
+                            sc.row_d[b] += d * wxi;
+                        }
+                    }
+                }
+                for b in 0..nb { sc.dsum[b] += sc.row_d[b] * wy; }
             }
             for b in 0..nb {
                 sc.acc[b] += sc.row_acc[b] * wy;
                 sc.wsum[b] += (row_shared + sc.row_w[b]) * wy;
             }
         }
+        let cut = self.cut;
         let mut any = false;
         for b in 0..nb {
             let ws = sc.wsum[b];
-            sc.hit[b] = ws >= 1e-6;
+            sc.hit[b] = ws >= 1e-6 && cut.map_or(true, |c| c.exact || sc.dsum[b] >= 1e-6);
             if sc.hit[b] {
-                if !(0.99999..=1.00001).contains(&ws) { sc.acc[b] /= ws; }
+                let unit = (0.99999..=1.00001).contains(&ws);
+                if !unit { sc.acc[b] /= ws; }
+                if cut.is_some() { sc.dens[b] = if unit { sc.dsum[b] } else { sc.dsum[b] / ws }; }
                 any = true;
             }
         }
