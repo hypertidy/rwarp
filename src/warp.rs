@@ -1,4 +1,5 @@
-//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos, average, mode.
+//! Warp kernels: nearest-neighbour, bilinear, cubic, cubic spline, lanczos,
+//! and the area methods average, mode, min, max, median, quartiles and RMS.
 //!
 //! Maps GDAL's gdalwarpkernel.cpp (~line 5510 onwards) and
 //! gdalresamplingkernels.h.
@@ -86,6 +87,24 @@
 //! value's first occurrence, so its `Min` / `Max` depend on the data type.
 //! rwarp gives the 8/16-bit answer for every type.
 //!
+//! ## Min, max, median, quartiles, RMS
+//!
+//! [`ResampleAlg::Min`], [`Max`](ResampleAlg::Max), [`Med`](ResampleAlg::Med),
+//! [`Q1`](ResampleAlg::Q1) and [`Q3`](ResampleAlg::Q3) take every valid
+//! source pixel the footprint touches, unweighted, as GDAL does; the
+//! quantiles are element `ceil(q n - 1)` of the sorted values
+//! (gdalwarpkernel.cpp ~L8174-8340). They return source values unchanged.
+//! [`ResampleAlg::Rms`] is `sqrt(sum(w v^2) / sum(w))` with
+//! [`ResampleAlg::Average`]'s weights (~L8025).
+//!
+//! ## Cubic spline
+//!
+//! [`ResampleAlg::CubicSpline`] is the cubic B-spline (4×4) through the
+//! general kernel at every scale, widening below scale 1 like lanczos; GDAL
+//! has no 4-sample formula for it. GDAL's weight omits the term that would
+//! make it zero beyond |x| = 2, so widened windows that reach there carry
+//! small negative weights; rwarp matches that.
+//!
 //! ## Output values: rounding, clamping, nodata, source bounds
 //!
 //! Every resampling method computes in `f64`. Integer outputs clamp to the
@@ -151,6 +170,35 @@ pub enum ResampleAlg {
     /// destination pixel covers, per band; see [`Footprint`] and
     /// [`ModeTies`].
     Mode,
+    /// Cubic B-spline (4×4, radius 2; B = 1, C = 0). Smooths rather than
+    /// interpolates: the output at a source pixel centre is not that
+    /// pixel's value.
+    CubicSpline,
+    /// Smallest valid source value under the footprint, per band.
+    Min,
+    /// Largest valid source value under the footprint, per band.
+    Max,
+    /// Median of the valid source values under the footprint, per band.
+    Med,
+    /// First quartile of the valid source values under the footprint.
+    Q1,
+    /// Third quartile of the valid source values under the footprint.
+    Q3,
+    /// Root mean square, weighted by coverage like [`ResampleAlg::Average`].
+    Rms,
+}
+
+impl ResampleAlg {
+    /// Whether the method reduces the source pixels under each destination
+    /// pixel's footprint (see [`Footprint`]) rather than sampling at its
+    /// centre.
+    pub fn is_area(self) -> bool {
+        matches!(
+            self,
+            ResampleAlg::Average | ResampleAlg::Mode | ResampleAlg::Min | ResampleAlg::Max
+                | ResampleAlg::Med | ResampleAlg::Q1 | ResampleAlg::Q3 | ResampleAlg::Rms
+        )
+    }
 }
 
 impl ResampleAlg {
@@ -161,7 +209,8 @@ impl ResampleAlg {
             ResampleAlg::Bilinear => 1,
             ResampleAlg::Cubic => 2,
             ResampleAlg::Lanczos => 3,
-            ResampleAlg::Average | ResampleAlg::Mode => 0,
+            ResampleAlg::CubicSpline => 2,
+            _ => 0,
         }
     }
 
@@ -169,13 +218,14 @@ impl ResampleAlg {
     /// nearest, which has no kernel.
     fn weight(self, x: f64) -> f64 {
         match self {
-            ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode => 0.0,
             ResampleAlg::Bilinear => {
                 let ax = x.abs();
                 if ax <= 1.0 { 1.0 - ax } else { 0.0 }
             }
             ResampleAlg::Cubic => cubic_weight(x),
             ResampleAlg::Lanczos => lanczos_weight(x),
+            ResampleAlg::CubicSpline => bspline_weight(x),
+            _ => 0.0,
         }
     }
 }
@@ -494,13 +544,18 @@ struct Widened {
 /// gdalwarpkernel.cpp ~L4188).
 const LANCZOS_POINT: Widened = Widened { alg: ResampleAlg::Lanczos, sx: 1.0, sy: 1.0, rx: 3, ry: 3 };
 
+/// Cubic B-spline at its native support. GDAL has no 4-sample formula for
+/// it and runs it through the general kernel at every scale (`GWKResample`,
+/// `GWKResampleNoMasksT`).
+const CUBICSPLINE_POINT: Widened = Widened { alg: ResampleAlg::CubicSpline, sx: 1.0, sy: 1.0, rx: 2, ry: 2 };
+
 impl Widened {
     /// `None` when GDAL would use the point kernel at this scale.
     fn new(alg: ResampleAlg, sx: f64, sy: f64) -> Option<Self> {
         let widen = match alg {
-            ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode => false,
             ResampleAlg::Bilinear | ResampleAlg::Cubic => !(sx > 0.5 && sy > 0.5),
-            ResampleAlg::Lanczos => sx < 1.0 || sy < 1.0,
+            ResampleAlg::Lanczos | ResampleAlg::CubicSpline => sx < 1.0 || sy < 1.0,
+            _ => false,
         };
         if !widen {
             return None;
@@ -557,8 +612,9 @@ pub fn warp_resample(
             src_col_off, src_row_off, dst_ncol, dst_nrow, nodata,
             lanczos_sample,
         ),
-        // Area methods have one implementation, the generic one.
-        ResampleAlg::Average | ResampleAlg::Mode => {
+        // Area methods and cubic spline have one implementation, the
+        // generic one.
+        _ => {
             let src = SourceBuffer {
                 data: src_pixels, ncol: src_ncol, nrow: src_nrow, nbands: 1,
                 col_off: src_col_off, row_off: src_row_off,
@@ -706,22 +762,10 @@ fn bilinear_sample(
     let rx = 1.5 - (buf_x - ix as f64);
     let ry = 1.5 - (buf_y - iy as f64);
 
-    // Fast path: all 4 pixels in bounds and no nodata
-    if ix >= 0 && ix + 1 < ncol as i64 && iy >= 0 && iy + 1 < nrow as i64 {
-        let off = iy as usize * ncol + ix as usize;
-
-        if src[off] != nodata && src[off + 1] != nodata
-            && src[off + ncol] != nodata && src[off + ncol + 1] != nodata
-        {
-            let val = (src[off] as f64 * rx + src[off + 1] as f64 * (1.0 - rx)) * ry
-                + (src[off + ncol] as f64 * rx + src[off + ncol + 1] as f64 * (1.0 - rx))
-                    * (1.0 - ry);
-            return Some(val);
-        }
-    }
-
-    // Nodata or edge: weight only valid in-bounds pixels and renormalise
-    // (GWKBilinearResample4Sample).
+    // A nodata value is always given here, which GDAL treats as a mask: it
+    // uses the general accumulation (GWKBilinearResample4Sample) even when
+    // all four neighbours are valid, and so does this.
+    // Weight valid in-bounds pixels and renormalise.
     let mut acc = 0.0;
     let mut wsum = 0.0;
 
@@ -856,6 +900,30 @@ fn lanczos_weight(x: f64) -> f64 {
     product / pi_x2_over_3
 }
 
+/// Cubic B-spline weight (B = 1, C = 0), GDAL's `GWKBSpline`
+/// (gdalwarpkernel.cpp ~L3817), unnormalised (the 1/6 is dropped; the
+/// kernels normalise by the weight sum). Like GDAL's it omits the
+/// `(x - 2)^3` term, so it is not zero beyond |x| = 2 on the positive side;
+/// a widened window can reach there, and GDAL's output includes it.
+#[inline]
+fn bspline_weight(x: f64) -> f64 {
+    let (xp2, xp1, xm1) = (x + 2.0, x + 1.0, x - 1.0);
+    if xp2 <= 0.0 {
+        return 0.0;
+    }
+    // Summed innermost first, as GDAL's nested expression does.
+    let mut t = 0.0;
+    if xp1 > 0.0 {
+        let mut u = 0.0;
+        if x > 0.0 {
+            let w = if xm1 > 0.0 { -4.0 * xm1 * xm1 * xm1 } else { 0.0 };
+            u = w + 6.0 * x * x * x;
+        }
+        t = u + -4.0 * xp1 * xp1 * xp1;
+    }
+    t + xp2 * xp2 * xp2
+}
+
 /// Lanczos interpolation at (buf_x, buf_y).
 ///
 /// GDAL equivalent: GWKResampleOptimizedLanczos (gdalwarpkernel.cpp
@@ -902,7 +970,12 @@ fn lanczos_sample(
 
 /// A pixel sample type the generic kernel can resample.
 ///
-/// The kernels compute in `f64` and convert back with [`Sample::from_f64`].
+/// Implemented for `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`,
+/// `f32`, `f64`, and `half::f16` with feature `f16`. Nearest and the
+/// selecting area methods (mode, min, max, quantiles) copy values exactly;
+/// the others compute in `f64` and convert back with [`Sample::from_f64`],
+/// so 64-bit integers beyond 2^53 lose precision there, as in GDAL.
+///
 /// Integer types clamp to the type's range and then round half up,
 /// `floor(v + 0.5)`, which is what GDAL does when the warp's working type
 /// is an integer type (`ClampRoundAndAvoidNoData`, gdalwarpkernel.cpp
@@ -927,11 +1000,19 @@ pub trait Sample: Copy + PartialOrd + 'static {
     fn zero() -> Self;
     #[inline]
     fn is_nan(self) -> bool { false }
+    /// Whether GDAL has a typed fast path for this type's unmasked bilinear
+    /// (`GWKBilinearResampleNoMasks4SampleT`: Byte, Int16, UInt16, Float32,
+    /// Float64), which sums in a different order from the general one.
+    /// Only affects the last bit, which can flip integer rounding at large
+    /// magnitudes.
+    #[doc(hidden)]
+    const GDAL_FAST_BILINEAR: bool = false;
 }
 
 macro_rules! int_sample {
-    ($($t:ty),*) => {$(
+    ($($t:ty => $fast:expr),*) => {$(
         impl Sample for $t {
+            const GDAL_FAST_BILINEAR: bool = $fast;
             #[inline] fn to_f64(self) -> f64 { self as f64 }
             #[inline] fn from_f64(v: f64) -> Self {
                 // Clamping after the floor gives the same result as GDAL's
@@ -945,9 +1026,10 @@ macro_rules! int_sample {
         }
     )*};
 }
-int_sample!(u8, i8, u16, i16, u32, i32);
+int_sample!(u8 => true, i8 => false, u16 => true, i16 => true, u32 => false, i32 => false, u64 => false, i64 => false);
 
 impl Sample for f32 {
+    const GDAL_FAST_BILINEAR: bool = true;
     #[inline] fn to_f64(self) -> f64 { self as f64 }
     #[inline] fn from_f64(v: f64) -> Self { v as f32 }
     #[inline] fn step_off(self) -> Self { if self == f32::MAX { self.next_down() } else { self.next_up() } }
@@ -955,10 +1037,37 @@ impl Sample for f32 {
     #[inline] fn is_nan(self) -> bool { self.is_nan() }
 }
 impl Sample for f64 {
+    const GDAL_FAST_BILINEAR: bool = true;
     #[inline] fn to_f64(self) -> f64 { self }
     #[inline] fn from_f64(v: f64) -> Self { v }
     #[inline] fn step_off(self) -> Self { if self == f64::MAX { self.next_down() } else { self.next_up() } }
     #[inline] fn zero() -> Self { 0.0 }
+    #[inline] fn is_nan(self) -> bool { self.is_nan() }
+}
+
+/// GDAL's Float16 (feature `f16`). Resampled values are computed in `f64`
+/// and rounded to the nearest half-precision value.
+#[cfg(feature = "f16")]
+impl Sample for half::f16 {
+    #[inline] fn to_f64(self) -> f64 { self.to_f64() }
+    #[inline] fn from_f64(v: f64) -> Self { half::f16::from_f64(v) }
+    #[inline] fn step_off(self) -> Self {
+        // The next value up (down at the maximum), stepping the bits: up is
+        // one more for positive values, one less for negative, and the
+        // smallest subnormal from zero.
+        let bits = self.to_bits();
+        let up = if self == half::f16::MAX {
+            bits - 1
+        } else if bits & 0x7fff == 0 {
+            1
+        } else if bits & 0x8000 == 0 {
+            bits + 1
+        } else {
+            bits - 1
+        };
+        half::f16::from_bits(up)
+    }
+    #[inline] fn zero() -> Self { half::f16::ZERO }
     #[inline] fn is_nan(self) -> bool { self.is_nan() }
 }
 
@@ -1030,7 +1139,7 @@ pub fn warp<T: Sample>(
         }
         KernelScaling::Fixed { x, y } => (x, y),
     };
-    if matches!(alg, ResampleAlg::Average | ResampleAlg::Mode) {
+    if alg.is_area() {
         return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy));
     }
     let widened = Widened::new(alg, sx, sy);
@@ -1078,7 +1187,8 @@ pub fn warp<T: Sample>(
                 (None, ResampleAlg::Bilinear) => img.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit),
                 (None, ResampleAlg::Cubic) => img.cubic(buf_x, buf_y, &mut sc),
                 (None, ResampleAlg::Lanczos) => img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut sc),
-                (None, ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode) => unreachable!(),
+                (None, ResampleAlg::CubicSpline) => img.widened(buf_x, buf_y, &CUBICSPLINE_POINT, &mut sc),
+                (None, _) => unreachable!("nearest and area methods are handled above"),
             };
             if any {
                 for b in 0..nbands {
@@ -1272,7 +1382,10 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         let ry = 1.5 - (buf_y - iy as f64);
         let (ncol, nrow) = (self.ncol as i64, self.nrow as i64);
 
-        if ix >= 0 && ix + 1 < ncol && iy >= 0 && iy + 1 < nrow {
+        // GDAL's factored formula only for its fast-path types with no
+        // validity masks; otherwise the general accumulation below.
+        let fast = T::GDAL_FAST_BILINEAR && self.nodata.is_none() && self.mask.is_none();
+        if fast && ix >= 0 && ix + 1 < ncol && iy >= 0 && iy + 1 < nrow {
             let p00 = iy as usize * self.ncol + ix as usize;
             let (a, b, c, d) = (self.px(p00), self.px(p00 + 1), self.px(p00 + self.ncol), self.px(p00 + self.ncol + 1));
             if self.all_ok(a) && self.all_ok(b) && self.all_ok(c) && self.all_ok(d) {
@@ -1528,6 +1641,110 @@ impl<T: Sample> AreaReducer<T> for AreaMeanThresholds<'_> {
     }
 }
 
+/// Smallest or largest valid value per band. Coverage weights are ignored:
+/// every source pixel the footprint touches counts, as in GDAL
+/// (gdalwarpkernel.cpp ~L8174-8295).
+struct AreaExtreme<T> {
+    max: bool,
+    best: Vec<Option<T>>,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaExtreme<T> {
+    fn reset(&mut self) {
+        self.best.fill(None);
+    }
+
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], _w: f64) {
+        if !pixel_ok { return; }
+        for ((best, &v), &ok) in self.best.iter_mut().zip(pix).zip(band_ok) {
+            if !ok { continue; }
+            match best {
+                Some(b) if (self.max && v > *b) || (!self.max && v < *b) => *b = v,
+                None => *best = Some(v),
+                _ => {}
+            }
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        let mut any = false;
+        for (o, b) in out.iter_mut().zip(&self.best) {
+            if let Some(b) = b { *o = *b; any = true; }
+        }
+        any
+    }
+}
+
+/// Median or quartile of the valid values per band, unweighted: GDAL sorts
+/// the values the footprint touches and takes element
+/// `ceil(q * n - 1)`, computed in `f32` (~L8297-8340).
+struct AreaQuantile<T> {
+    q: f32,
+    vals: Vec<Vec<T>>,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaQuantile<T> {
+    fn reset(&mut self) {
+        for v in &mut self.vals { v.clear(); }
+    }
+
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], _w: f64) {
+        if !pixel_ok { return; }
+        for ((vals, &v), &ok) in self.vals.iter_mut().zip(pix).zip(band_ok) {
+            if ok { vals.push(v); }
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        let mut any = false;
+        for (o, vals) in out.iter_mut().zip(&self.vals) {
+            if vals.is_empty() { continue; }
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let i = (self.q * sorted.len() as f32 - 1.0).ceil() as usize;
+            *o = sorted[i.min(sorted.len() - 1)];
+            any = true;
+        }
+        any
+    }
+}
+
+/// Root mean square per band, `sqrt(sum(w v^2) / sum(w))` over valid
+/// pixels (~L8025-8075).
+struct AreaRms {
+    sumsq: Vec<f64>,
+    total: Vec<f64>,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaRms {
+    fn reset(&mut self) {
+        self.sumsq.fill(0.0);
+        self.total.fill(0.0);
+    }
+
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], w: f64) {
+        if !pixel_ok { return; }
+        for b in 0..pix.len() {
+            if band_ok[b] {
+                let v = pix[b].to_f64();
+                self.total[b] += w;
+                self.sumsq[b] += v * v * w;
+            }
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        let mut any = false;
+        for b in 0..out.len() {
+            if self.total[b] > 0.0 {
+                out[b] = T::from_f64((self.sumsq[b] / self.total[b]).sqrt());
+                any = true;
+            }
+        }
+        any
+    }
+}
+
 /// Weighted mode per band. Weights accumulate in `f32` like GDAL's
 /// `pafCounts`, so ties fall where GDAL's do. The mode is re-decided every
 /// time a value's count grows, including its first occurrence, which is
@@ -1628,6 +1845,19 @@ fn warp_area<T: Sample>(
 ) -> Vec<T> {
     let nb = img.nb;
     match opts.alg {
+        ResampleAlg::Min | ResampleAlg::Max => {
+            let red = AreaExtreme { max: opts.alg == ResampleAlg::Max, best: vec![None; nb] };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
+        ResampleAlg::Med | ResampleAlg::Q1 | ResampleAlg::Q3 => {
+            let q = match opts.alg { ResampleAlg::Q1 => 0.25, ResampleAlg::Q3 => 0.75, _ => 0.5 };
+            let red = AreaQuantile { q, vals: vec![Vec::new(); nb] };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
+        ResampleAlg::Rms => {
+            let red = AreaRms { sumsq: vec![0.0; nb], total: vec![0.0; nb] };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
         ResampleAlg::Mode => {
             let red = AreaMode { ties: opts.mode_ties, bins: vec![Vec::new(); nb], mode: vec![None; nb] };
             warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)

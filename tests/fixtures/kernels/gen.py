@@ -155,6 +155,7 @@ def main():
     main_mode()
     main_round()
     main_nodata()
+    main_methods()
 
 
 # ---- mode -----------------------------------------------------------------
@@ -164,7 +165,9 @@ def main():
 # list-of-values path for wider ones, which break ties differently.
 
 MODE_TYPES = {"Byte": gdal.GDT_Byte, "Int16": gdal.GDT_Int16,
-              "Int32": gdal.GDT_Int32, "Float32": gdal.GDT_Float32}
+              "Int32": gdal.GDT_Int32, "Float32": gdal.GDT_Float32,
+              "Int64": gdal.GDT_Int64, "UInt64": gdal.GDT_UInt64,
+              "Float16": gdal.GDT_Float16}
 
 
 def categorical(holes):
@@ -438,6 +441,83 @@ def main_nodata():
                      "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
                     w, w, res)
     print(len(cases), "nodata cases")
+
+
+
+# ---- more methods and types ------------------------------------------------
+
+def big_ints(signed):
+    """Values near 2**40 (exact in float64), signed or not."""
+    base = 2 ** 40
+    vals = []
+    for r in range(N):
+        for c in range(N):
+            v = base + ((r * 37 + c * 11) % 97) * 1000 + (c % 3)
+            vals.append(-v if signed and (r + c) % 5 == 0 else v)
+    return vals
+
+
+def main_methods():
+    import array
+
+    gdal.SetConfigOption("CPL_DEBUG", None)
+    write_grid(os.path.join(HERE, "src_big_signed.txt"), [f"gdal {gdal.__version__}"], N, N, big_ints(True))
+    write_grid(os.path.join(HERE, "src_big_unsigned.txt"), [f"gdal {gdal.__version__}"], N, N, big_ints(False))
+    srcs = {"src": lambda: [source(False)], "src_nodata": lambda: [source(True)],
+            "src_round": lambda: [[pattern_round(r, c) for r in range(N) for c in range(N)]],
+            "src_mb": multiband, "src_cat": lambda: [categorical(False)],
+            "src_big_signed": lambda: [big_ints(True)], "src_big_unsigned": lambda: [big_ints(False)]}
+    point = {"XSCALE": "1", "YSCALE": "1"}
+    # name, src, type, alg, width, nodata, warp options, destination
+    cases = [
+        ("cs_point_1p49x", "src", "Float32", "cubicspline", 43, NODATA, point, None),
+        ("cs_1p49x", "src", "Float32", "cubicspline", 43, NODATA, {}, None),
+        ("cs_4x", "src", "Float32", "cubicspline", 16, NODATA, {}, None),
+        ("cs_2p78x", "src", "Float32", "cubicspline", 23, NODATA, {}, None),
+        ("cs_4x_nodata", "src_nodata", "Float32", "cubicspline", 16, NODATA, {}, None),
+        ("cs_point_nodata", "src_nodata", "Float32", "cubicspline", 43, NODATA, point, None),
+        ("cs_int16_4x", "src_round", "Int16", "cubicspline", 16, None, {}, None),
+        ("cs_rot30", "src", "Float32", "cubicspline", 8, NODATA, {}, "rot30"),
+    ]
+    for alg in ("min", "max", "med", "q1", "q3", "rms"):
+        cases += [
+            (f"stat_{alg}_4x", "src", "Float32", alg, 16, NODATA, {}, None),
+            (f"stat_{alg}_2p78x", "src", "Float32", alg, 23, NODATA, {}, None),
+            (f"stat_{alg}_4x_nodata", "src_nodata", "Float32", alg, 16, NODATA, {}, None),
+            (f"stat_{alg}_rot30", "src", "Float32", alg, 8, NODATA, {}, "rot30"),
+        ]
+    cases += [
+        ("stat_max_mb_4x", "src_mb", "Float32", "max", 16, NODATA, {}, None),
+        ("stat_med_mb_4x", "src_mb", "Float32", "med", 16, NODATA, {}, None),
+        ("stat_med_int16_2p78x", "src_round", "Int16", "med", 23, None, {}, None),
+    ]
+    for tname, sname in (("Int64", "src_big_signed"), ("UInt64", "src_big_unsigned")):
+        for alg, w in (("near", 43), ("bilinear", 43), ("average", 16), ("mode", 16), ("max", 16)):
+            cases.append((f"type_{tname.lower()}_{alg}", sname, tname, alg, w, None, {}, None))
+    for alg, w in (("near", 43), ("bilinear", 43), ("cubic", 43), ("average", 16), ("mode", 16)):
+        cases.append((f"type_float16_{alg}", "src", "Float16", alg, w, None, {}, None))
+
+    for name, sname, tname, alg, w, nodata, wo, dst in cases:
+        src = mem_bands(srcs[sname](), MODE_TYPES[tname], nodata)
+        if dst == "rot30":
+            out = gdal.GetDriverByName("MEM").Create("", w, w, src.RasterCount, MODE_TYPES[tname])
+            out.SetGeoTransform(rot30_gt())
+            for b in range(src.RasterCount):
+                out.GetRasterBand(b + 1).SetNoDataValue(nodata)
+                out.GetRasterBand(b + 1).Fill(nodata)
+            gdal.Warp(out, src, resampleAlg=alg, errorThreshold=0, warpOptions=wo)
+        else:
+            out = gdal.Warp("", src, format="MEM", outputBounds=[0, 0, N, N], width=w, height=w,
+                            resampleAlg=alg, errorThreshold=0, warpOptions=wo, dstNodata=nodata)
+        res = [array.array("d", out.GetRasterBand(b + 1).ReadRaster(buf_type=gdal.GDT_Float64))
+               for b in range(out.RasterCount)]
+        opts = " ".join(f"{k}={v}" for k, v in wo.items()) or "-"
+        write_bands(os.path.join(HERE, f"{name}.txt"),
+                    [f"gdal {gdal.__version__}", f"alg {alg}", f"src {sname}", f"src_type {tname}",
+                     f"nodata {'-' if nodata is None else nodata}", f"wo {opts}",
+                     "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
+                    w, w, res)
+    print(len(cases), "method/type cases")
 
 
 if __name__ == "__main__":

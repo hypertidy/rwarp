@@ -109,6 +109,13 @@ fn alg_of(name: &str) -> ResampleAlg {
         "average" => ResampleAlg::Average,
         "mode" => ResampleAlg::Mode,
         "near" => ResampleAlg::NearestNeighbour,
+        "cubicspline" => ResampleAlg::CubicSpline,
+        "min" => ResampleAlg::Min,
+        "max" => ResampleAlg::Max,
+        "med" => ResampleAlg::Med,
+        "q1" => ResampleAlg::Q1,
+        "q3" => ResampleAlg::Q3,
+        "rms" => ResampleAlg::Rms,
         _ => panic!("unknown alg {name}"),
     }
 }
@@ -338,6 +345,10 @@ fn mode_case(g: &Grid, ty: &str, footprint: Footprint, ties: ModeTies) -> Vec<f6
         "Int16" => mode_as::<i16>(g, footprint, ties),
         "Int32" => mode_as::<i32>(g, footprint, ties),
         "Float32" => mode_as::<f32>(g, footprint, ties),
+        "Int64" => mode_as::<i64>(g, footprint, ties),
+        "UInt64" => mode_as::<u64>(g, footprint, ties),
+        #[cfg(feature = "f16")]
+        "Float16" => mode_as::<half::f16>(g, footprint, ties),
         _ => panic!("unknown type {ty}"),
     }
 }
@@ -359,13 +370,16 @@ fn mode_fixtures(prefix: &str) -> Vec<String> {
     names
 }
 
-/// Every categorical case, all four types and all three tie rules, 4:1 and
-/// 2.78:1 (fractional weights), nodata and a rotated destination: identical
-/// to gdalwarp -r mode.
+/// Every categorical case, all seven types (Float16 with feature `f16`) and
+/// all three tie rules, 4:1 and 2.78:1 (fractional weights), nodata and a
+/// rotated destination: identical to gdalwarp -r mode.
 #[test]
 fn mode_matches_gdal() {
-    let names: Vec<String> = mode_fixtures("mode_").into_iter().filter(|n| !n.contains("distinct")).collect();
-    assert_eq!(names.len(), 26);
+    let names: Vec<String> = mode_fixtures("mode_").into_iter()
+        .filter(|n| !n.contains("distinct"))
+        .filter(|n| cfg!(feature = "f16") || !n.contains("float16"))
+        .collect();
+    assert_eq!(names.len(), if cfg!(feature = "f16") { 44 } else { 38 });
     for name in names {
         let g = read_grid(&name);
         let got = mode_case(&g, g.header("src_type"), Footprint::GdalBox, ties_of(g.header("ties")));
@@ -607,4 +621,70 @@ fn point_bilinear_fixture_has_renormalised_pixels() {
         }
     }
     assert!(renormalised > 0);
+}
+
+// ---- more methods and types -------------------------------------------------
+
+/// Warp a fixture case with its source loaded as `T` (any band count),
+/// returning the output interleaved, as f64.
+fn run_bands<T: Sample>(g: &Grid) -> Vec<f64> {
+    let src = read_grid(g.header("src"));
+    let nb = src.nbands();
+    // Exact (not via f32): 64-bit sources hold values beyond f32.
+    let data: Vec<T> = exact_values(g.header("src"), &src).iter().map(|&v| T::from_f64(v)).collect();
+    let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: nb, col_off: 0, row_off: 0 };
+    let o = options_from_wo(g, nb);
+    let opts = WarpOptions {
+        alg: o.alg, scaling: o.scaling, band_nodata: o.band_nodata,
+        nodata: o.nodata.map(|v| T::from_f64(v as f64)),
+        ..Default::default()
+    };
+    warp(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
+}
+
+/// Cubic spline (point, widened, nodata, Int16, rotated); min, max, med,
+/// q1, q3 and rms (4:1, 2.78:1, nodata, rotated, three bands, Int16); and
+/// near, bilinear, average, mode and max on Int64 and UInt64 values near
+/// 2^40, and near, bilinear, cubic, average and mode on Float16 (feature
+/// `f16`): all match gdalwarp. Integers exactly, Float32 within 1e-6
+/// relative, Float16 within one half-precision step.
+#[test]
+fn methods_and_types_match_gdal() {
+    let names: Vec<String> = ["cs_", "stat_", "type_"].iter().flat_map(|p| mode_fixtures(p))
+        .filter(|n| cfg!(feature = "f16") || !n.contains("float16"))
+        .collect();
+    assert_eq!(names.len(), if cfg!(feature = "f16") { 50 } else { 45 });
+    let mut failures = Vec::new();
+    for name in &names {
+        let g = read_grid(name);
+        let ty = g.header("src_type");
+        let (got, tol): (Vec<f64>, f64) = match ty {
+            "Float32" => (run_bands::<f32>(&g), 1e-6),
+            "Int16" => (run_bands::<i16>(&g), 0.0),
+            "Int64" => (run_bands::<i64>(&g), 0.0),
+            "UInt64" => (run_bands::<u64>(&g), 0.0),
+            #[cfg(feature = "f16")]
+            "Float16" => (run_bands::<half::f16>(&g), 1.0 / 1024.0),
+            other => panic!("unknown type {other}"),
+        };
+        let expect: Vec<f64> = g.interleaved().iter().map(|&v| v as f64).collect();
+        // Int64/UInt64 values exceed f32; compare against the f64 text.
+        let expect = if ty.ends_with("64") { exact_values(name, &g) } else { expect };
+        let bad = expect.iter().zip(&got).enumerate()
+            .filter(|(_, (e, v))| (**e - **v).abs() > tol * e.abs().max(1.0))
+            .map(|(i, (e, v))| format!("{name}: value {i} gdal {e} rwarp {v}"))
+            .next();
+        if let Some(b) = bad { failures.push(b); }
+    }
+    assert!(failures.is_empty(), "{} of {} cases differ:\n{}", failures.len(), names.len(), failures.join("\n"));
+}
+
+/// A fixture's values parsed as f64 (not via f32), interleaved.
+fn exact_values(name: &str, g: &Grid) -> Vec<f64> {
+    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "kernels", &format!("{name}.txt")].iter().collect();
+    let text = std::fs::read_to_string(path).unwrap();
+    let vals: Vec<f64> = text.lines().filter(|l| !l.starts_with('#')).skip(1)
+        .flat_map(|l| l.split_whitespace()).map(|v| v.parse().unwrap()).collect();
+    let (n, nb) = (g.ncol * g.nrow, g.nbands());
+    (0..n * nb).map(|i| vals[(i % nb) * n + i / nb]).collect()
 }
