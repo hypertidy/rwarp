@@ -14,13 +14,17 @@
 //!   the source pixel (col + 1000 * row) matches `gdalwarp -geoloc -r near
 //!   -et 0`, pixel for pixel.
 //!
+//! Each with both inverse methods, [`GeolocInverse::QuadIndex`] and
+//! [`GeolocInverse::Backmap`]; with the backmap, success agrees with GDAL's
+//! outside the raster too. `tests/geoloc_backmap.rs` has more cases.
+//!
 //! Runs with either CRS backend.
 
 #[path = "fixtures/geoloc_swath.rs"]
 mod fx;
 
 use rwarp::geoloc_transform::{
-    GenImgGeolocTransformer, GeolocArrays, GeolocConvention, GeolocOptions, PixelGeo,
+    GenImgGeolocTransformer, GeolocArrays, GeolocConvention, GeolocInverse, GeolocOptions, PixelGeo,
 };
 use rwarp::warp::{warp, KernelScaling, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::Transformer;
@@ -40,9 +44,12 @@ fn well_inside(px: f64, py: f64, ncol: usize, nrow: usize) -> bool {
     px > TOL && px < ncol as f64 - TOL && py > TOL && py < nrow as f64 - TOL
 }
 
-fn transformer(convention: GeolocConvention) -> GenImgGeolocTransformer {
+fn transformer(convention: GeolocConvention, inverse: GeolocInverse) -> GenImgGeolocTransformer {
     // GDAL sets this for a geographic SRS with longitudes in [-180, 180].
-    let opts = GeolocOptions::default().with_convention(convention).with_lon_wrap(true);
+    let opts = GeolocOptions::default()
+        .with_convention(convention)
+        .with_lon_wrap(true)
+        .with_inverse(inverse);
     let g = GeolocArrays::new(fx::LON.to_vec(), fx::LAT.to_vec(), fx::NCOL, fx::NROW, opts)
         .expect("geolocation arrays");
     GenImgGeolocTransformer::new(
@@ -54,8 +61,8 @@ fn transformer(convention: GeolocConvention) -> GenImgGeolocTransformer {
     .expect("transformer")
 }
 
-fn check_coordinates(convention: GeolocConvention, gdal_x: &[f64], gdal_y: &[f64]) {
-    let t = transformer(convention);
+fn check_coordinates(convention: GeolocConvention, inverse: GeolocInverse, gdal_x: &[f64], gdal_y: &[f64]) {
+    let t = transformer(convention, inverse);
     let mut x: Vec<f64> = Vec::new();
     let mut y: Vec<f64> = Vec::new();
     for r in 0..fx::DST_NROW {
@@ -66,10 +73,12 @@ fn check_coordinates(convention: GeolocConvention, gdal_x: &[f64], gdal_y: &[f64
     }
     let ok = t.transform(true, &mut x, &mut y);
 
-    // Outside the raster, GDAL's domain depends on its backmap's bounding
-    // box, so either side may succeed there with a coordinate no kernel
-    // uses. Well inside the raster, success must agree exactly.
-    let inside = |px: f64, py: f64| well_inside(px, py, fx::NCOL, fx::NROW);
+    // Outside the raster, GDAL's domain depends on its backmap, so with the
+    // quad index either side may succeed there with a coordinate no kernel
+    // uses. Well inside the raster, success must agree exactly; with the
+    // backmap, everywhere.
+    let backmap = inverse == GeolocInverse::Backmap;
+    let inside = |px: f64, py: f64| backmap || well_inside(px, py, fx::NCOL, fx::NROW);
     let mut max_err: f64 = 0.0;
     let mut both = 0;
     let mut mismatched = Vec::new();
@@ -97,8 +106,8 @@ fn check_coordinates(convention: GeolocConvention, gdal_x: &[f64], gdal_y: &[f64
     assert!(max_err < TOL, "{convention:?}: max coordinate difference {max_err} pixels");
 }
 
-fn check_nearest(convention: GeolocConvention, gdal_near: &[i32]) {
-    let t = transformer(convention);
+fn check_nearest(convention: GeolocConvention, inverse: GeolocInverse, gdal_near: &[i32]) {
+    let t = transformer(convention, inverse);
     let src: Vec<i32> = (0..fx::NROW)
         .flat_map(|r| (0..fx::NCOL).map(move |c| (c + 1000 * r) as i32))
         .collect();
@@ -123,24 +132,34 @@ fn check_nearest(convention: GeolocConvention, gdal_near: &[i32]) {
     );
 }
 
+const INVERSES: [GeolocInverse; 2] = [GeolocInverse::QuadIndex, GeolocInverse::Backmap];
+
 #[test]
 fn pixel_center_coordinates_match_gdal() {
-    check_coordinates(GeolocConvention::PixelCenter, &fx::PC_SRC_X, &fx::PC_SRC_Y);
+    for inverse in INVERSES {
+        check_coordinates(GeolocConvention::PixelCenter, inverse, &fx::PC_SRC_X, &fx::PC_SRC_Y);
+    }
 }
 
 #[test]
 fn top_left_corner_coordinates_match_gdal() {
-    check_coordinates(GeolocConvention::TopLeftCorner, &fx::TLC_SRC_X, &fx::TLC_SRC_Y);
+    for inverse in INVERSES {
+        check_coordinates(GeolocConvention::TopLeftCorner, inverse, &fx::TLC_SRC_X, &fx::TLC_SRC_Y);
+    }
 }
 
 #[test]
 fn pixel_center_nearest_matches_gdalwarp() {
-    check_nearest(GeolocConvention::PixelCenter, &fx::PC_NEAR);
+    for inverse in INVERSES {
+        check_nearest(GeolocConvention::PixelCenter, inverse, &fx::PC_NEAR);
+    }
 }
 
 #[test]
 fn top_left_corner_nearest_matches_gdalwarp() {
-    check_nearest(GeolocConvention::TopLeftCorner, &fx::TLC_NEAR);
+    for inverse in INVERSES {
+        check_nearest(GeolocConvention::TopLeftCorner, inverse, &fx::TLC_NEAR);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,10 +167,11 @@ fn top_left_corner_nearest_matches_gdalwarp() {
 // (GDAL's DST_METHOD=GEOLOC_ARRAY), PIXEL_CENTER.
 // ---------------------------------------------------------------------------
 
-fn dst_geoloc_transformer() -> GenImgGeolocTransformer {
+fn dst_geoloc_transformer(inverse: GeolocInverse) -> GenImgGeolocTransformer {
     let opts = GeolocOptions::default()
         .with_convention(GeolocConvention::PixelCenter)
-        .with_lon_wrap(true);
+        .with_lon_wrap(true)
+        .with_inverse(inverse);
     let g = GeolocArrays::new(fx::LON.to_vec(), fx::LAT.to_vec(), fx::NCOL, fx::NROW, opts)
         .expect("geolocation arrays");
     GenImgGeolocTransformer::new(
@@ -178,7 +198,7 @@ fn centres(ncol: usize, nrow: usize) -> (Vec<f64>, Vec<f64>) {
 #[test]
 fn curvilinear_target_forward_matches_gdal() {
     // Target (swath) pixel centres to the affine source: forward geolocation.
-    let t = dst_geoloc_transformer();
+    let t = dst_geoloc_transformer(GeolocInverse::QuadIndex);
     let (mut x, mut y) = centres(fx::NCOL, fx::NROW);
     let ok = t.transform(true, &mut x, &mut y);
     for k in 0..x.len() {
@@ -190,11 +210,19 @@ fn curvilinear_target_forward_matches_gdal() {
 
 #[test]
 fn curvilinear_target_inverse_matches_gdal() {
+    for inverse in INVERSES {
+        curvilinear_target_inverse(inverse);
+    }
+}
+
+fn curvilinear_target_inverse(inverse: GeolocInverse) {
     // Source pixel centres to the swath: inverse geolocation.
-    let t = dst_geoloc_transformer();
+    let t = dst_geoloc_transformer(inverse);
     let (mut x, mut y) = centres(fx::DST_NCOL, fx::DST_NROW);
     let ok = t.transform(false, &mut x, &mut y);
-    let inside = |px: f64, py: f64| well_inside(px, py, fx::NCOL, fx::NROW);
+    // With the backmap, success agrees everywhere (see check_coordinates).
+    let backmap = inverse == GeolocInverse::Backmap;
+    let inside = |px: f64, py: f64| backmap || well_inside(px, py, fx::NCOL, fx::NROW);
     let mut both = 0;
     for k in 0..x.len() {
         let gdal_ok = !fx::DSTGEO_S2D_X[k].is_nan();
@@ -217,7 +245,13 @@ fn curvilinear_target_inverse_matches_gdal() {
 
 #[test]
 fn curvilinear_target_nearest_matches_gdalwarp() {
-    let t = dst_geoloc_transformer();
+    for inverse in INVERSES {
+        curvilinear_target_nearest(inverse);
+    }
+}
+
+fn curvilinear_target_nearest(inverse: GeolocInverse) {
+    let t = dst_geoloc_transformer(inverse);
     let src: Vec<i32> = (0..fx::DST_NROW)
         .flat_map(|r| (0..fx::DST_NCOL).map(move |c| (c + 1000 * r) as i32))
         .collect();
