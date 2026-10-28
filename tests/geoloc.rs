@@ -22,7 +22,7 @@ mod fx;
 use rwarp::geoloc_transform::{
     GenImgGeolocTransformer, GeolocArrays, GeolocConvention, GeolocOptions, PixelGeo,
 };
-use rwarp::warp::{warp_resample_t, ResampleAlg};
+use rwarp::warp::{warp, KernelScaling, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::Transformer;
 
 const SRC_CRS: &str = "+proj=longlat +datum=WGS84 +no_defs";
@@ -106,20 +106,14 @@ fn check_nearest(convention: GeolocConvention, gdal_near: &[i32]) {
     let src: Vec<i32> = (0..fx::NROW)
         .flat_map(|r| (0..fx::NCOL).map(move |c| (c + 1000 * r) as i32))
         .collect();
-    let out = warp_resample_t(
-        &t,
-        &src,
-        fx::NCOL,
-        fx::NROW,
-        1,
-        0,
-        0,
-        fx::DST_NCOL,
-        fx::DST_NROW,
-        Some(fx::NODATA),
-        None,
-        ResampleAlg::NearestNeighbour,
-    );
+    let buf = SourceBuffer { data: &src[..], ncol: fx::NCOL, nrow: fx::NROW, nbands: 1, col_off: 0, row_off: 0 };
+    let opts = WarpOptions {
+        alg: ResampleAlg::NearestNeighbour,
+        scaling: KernelScaling::Point,
+        src_nodata: Nodata::Value(fx::NODATA as f64),
+        ..Default::default()
+    };
+    let out = warp(&t, &buf, fx::DST_NCOL, fx::DST_NROW, &opts);
     let diffs: Vec<(usize, i32, i32)> = out
         .iter()
         .zip(gdal_near)
@@ -236,20 +230,14 @@ fn curvilinear_target_nearest_matches_gdalwarp() {
     let src: Vec<i32> = (0..fx::DST_NROW)
         .flat_map(|r| (0..fx::DST_NCOL).map(move |c| (c + 1000 * r) as i32))
         .collect();
-    let out = warp_resample_t(
-        &t,
-        &src,
-        fx::DST_NCOL,
-        fx::DST_NROW,
-        1,
-        0,
-        0,
-        fx::NCOL,
-        fx::NROW,
-        Some(fx::NODATA),
-        None,
-        ResampleAlg::NearestNeighbour,
-    );
+    let buf = SourceBuffer { data: &src[..], ncol: fx::DST_NCOL, nrow: fx::DST_NROW, nbands: 1, col_off: 0, row_off: 0 };
+    let opts = WarpOptions {
+        alg: ResampleAlg::NearestNeighbour,
+        scaling: KernelScaling::Point,
+        src_nodata: Nodata::Value(fx::NODATA as f64),
+        ..Default::default()
+    };
+    let out = warp(&t, &buf, fx::NCOL, fx::NROW, &opts);
     let diffs: Vec<(usize, i32, i32)> = out
         .iter()
         .zip(fx::DSTGEO_NEAR.iter())
