@@ -3,7 +3,9 @@
 Rust implementation of the GDAL warp pipeline: coordinate transforms,
 approximate transforms, source window planning, and resampling kernels.
 
-See the [crate documentation](https://docs.rs/rwarp) for full details.
+Documentation, a guide, the changelog and a browser demo:
+**<https://hypertidy.github.io/rwarp/>**. API reference for releases:
+[docs.rs/rwarp](https://docs.rs/rwarp).
 
 ## CRS backends
 

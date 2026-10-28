@@ -1,0 +1,12 @@
+[book]
+title = "rwarp"
+description = "GDAL's warp pipeline in Rust: coordinate transforms, source window planning and resampling kernels"
+authors = ["Michael Sumner"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/hypertidy/rwarp"
+edit-url-template = "https://github.com/hypertidy/rwarp/edit/main/book/{path}"
+site-url = "/rwarp/"
+no-section-label = true
