@@ -1,7 +1,11 @@
 [package]
 name = "rwarp"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
+# rwarp itself (f32::next_up in Sample::step_off) and the default `proj`
+# backend. The optional `proj4rs` backend needs whatever proj4rs needs,
+# which it does not declare: 1.89 for proj4rs 0.3.0.
+rust-version = "1.86"
 authors = ["Michael Sumner <mdsumner@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "GDAL warp pipeline in Rust: coordinate transforms, approximate transforms, source window computation, and resampling kernels."
@@ -21,9 +25,8 @@ proj4rs = ["dep:proj4rs"]
 
 [dependencies]
 proj = { version = "0.31.0", features = ["pkg_config"], optional = true }
-# Git pin until a proj4rs release includes ortho (3liz/proj4rs#52); then
-# replace with the released version.
-proj4rs = { git = "https://github.com/3liz/proj4rs", rev = "764671bd352a15dfbc68ccc8ca5bc2c699935520", default-features = false, features = ["crs-definitions"], optional = true }
+# 0.3.0 is the first release with ortho (3liz/proj4rs#52).
+proj4rs = { version = "0.3.0", default-features = false, features = ["crs-definitions"], optional = true }
 vaster = { version = "0.2.0" }
 # Exact coverage fractions for the exact-overlap area footprint. Pure Rust,
 # no dependencies, builds for wasm.
