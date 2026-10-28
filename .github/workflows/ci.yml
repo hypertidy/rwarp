@@ -48,8 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --no-default-features --features proj4rs
 
-  # The rust-version in Cargo.toml. Cargo.lock is not committed, so resolve
-  # dependency versions that support it.
+  # The rust-version in Cargo.toml, which covers the default features (the
+  # optional proj4rs backend needs what proj4rs needs; see Cargo.toml).
+  # Cargo.lock is not committed, so resolve dependency versions that
+  # support it.
   msrv:
     name: test (MSRV)
     runs-on: ubuntu-latest
@@ -57,9 +59,11 @@ jobs:
       CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
     steps:
       - uses: actions/checkout@v4
+      - name: Install libproj
+        run: sudo apt-get update && sudo apt-get install -y libproj-dev pkg-config
       - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-default-features --features proj4rs
+      - run: cargo test
 
   # rwarp-wasm's native tests, and both crates building for the browser
   # target (no wasm-pack, no deploy: that is pages.yml).
