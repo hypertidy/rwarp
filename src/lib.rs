@@ -74,7 +74,7 @@
 //! | Nearest-neighbour kernel | Sentinel-2, IBCSO Mawson | 65536/65536 identical to `gdalwarp -r near` |
 //! | Bilinear/cubic/lanczos | GEBCO at ~1:1 ratio | 65536/65536 identical to GDAL |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
-//! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-9 px of GDAL 3.8.4's transformer; nearest warp identical to `gdalwarp -et 0` |
+//! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
 //!
 //! **Known limitation — downsampled interpolated warps:** when the
 //! source/destination pixel ratio is significantly greater than 1 (coarser
