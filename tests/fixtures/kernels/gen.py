@@ -152,6 +152,99 @@ def main():
                    w, h, vals)
         print(name, sx, sy)
 
+    main_mode()
+
+
+# ---- mode -----------------------------------------------------------------
+#
+# A categorical source (classes 1..7, many ties at 4:1) in four types:
+# GDAL's mode has a histogram path for 8/16-bit working types and a
+# list-of-values path for wider ones, which break ties differently.
+
+MODE_TYPES = {"Byte": gdal.GDT_Byte, "Int16": gdal.GDT_Int16,
+              "Int32": gdal.GDT_Int32, "Float32": gdal.GDT_Float32}
+
+
+def categorical(holes):
+    vals = []
+    for r in range(N):
+        for c in range(N):
+            v = ((r // 2) * 3 + (c // 3) * 5 + (r * c) % 3) % 7 + 1
+            if holes and (r * 5 + c * 2) % 13 == 0:
+                v = 0
+            vals.append(v)
+    return vals
+
+
+def distinct_blocks():
+    """Every 2x2 block holds four distinct values, the smallest and largest
+    at varying positions, so 2:1 mode is a tie at count 1 everywhere."""
+    order = [40, 10, 30, 20]
+    vals = []
+    for r in range(N):
+        for c in range(N):
+            b = ((r // 2) * 7 + (c // 2) * 3) % 4
+            vals.append(order[((r % 2) * 2 + c % 2 + b) % 4] + (r // 2 + c // 2) % 5)
+    return vals
+
+
+def mem_categorical(dtype, holes, vals=None):
+    import array
+
+    ds = gdal.GetDriverByName("MEM").Create("", N, N, 1, dtype)
+    ds.SetGeoTransform([0, 1, 0, N, 0, -1])
+    band = ds.GetRasterBand(1)
+    vals = categorical(holes) if vals is None else vals
+    band.WriteRaster(0, 0, N, N, array.array("d", vals).tobytes(),
+                     buf_type=gdal.GDT_Float64)
+    if holes:
+        band.SetNoDataValue(0)
+    return ds
+
+
+def main_mode():
+    import array
+
+    gdal.SetConfigOption("CPL_DEBUG", None)
+
+    write_grid(os.path.join(HERE, "src_cat.txt"),
+               [f"gdal {gdal.__version__}", "categorical, classes 1..7"], N, N, categorical(False))
+    write_grid(os.path.join(HERE, "src_cat_nodata.txt"),
+               [f"gdal {gdal.__version__}", "categorical, nodata 0"], N, N, categorical(True))
+    cases = []
+    for tname in MODE_TYPES:
+        for ties in ("FIRST", "MIN", "MAX"):
+            for size, w in (("4x", 16), ("2p78x", 23)):
+                cases.append((f"mode_{tname.lower()}_{ties.lower()}_{size}", tname, ties, w, False, False))
+    cases.append(("mode_byte_min_4x_nodata", "Byte", "MIN", 16, True, False))
+    cases.append(("mode_byte_first_rot30", "Byte", "FIRST", 8, False, True))
+    # Ties at a value's first occurrence, where GDAL's types disagree.
+    write_grid(os.path.join(HERE, "src_distinct.txt"),
+               [f"gdal {gdal.__version__}", "distinct values in every 2x2 block"], N, N, distinct_blocks())
+    for tname in ("Byte", "Int32", "Float32"):
+        for ties in ("FIRST", "MIN", "MAX"):
+            cases.append((f"mode_distinct_{tname.lower()}_{ties.lower()}", tname, ties, 32, False, False))
+    for name, tname, ties, w, holes, rotated in cases:
+        dtype = MODE_TYPES[tname]
+        src = mem_categorical(dtype, holes, distinct_blocks() if "distinct" in name else None)
+        wo = {"MODE_TIES": ties}
+        if rotated:
+            out = gdal.GetDriverByName("MEM").Create("", w, w, 1, dtype)
+            out.SetGeoTransform(rot30_gt())
+            gdal.Warp(out, src, resampleAlg="mode", errorThreshold=0, warpOptions=wo)
+        else:
+            out = gdal.Warp("", src, format="MEM", outputBounds=[0, 0, N, N], width=w, height=w,
+                            resampleAlg="mode", errorThreshold=0, warpOptions=wo,
+                            dstNodata=0 if holes else None)
+        vals = array.array("d", out.GetRasterBand(1).ReadRaster(buf_type=gdal.GDT_Float64))
+        write_grid(os.path.join(HERE, f"{name}.txt"),
+                   [f"gdal {gdal.__version__}", "alg mode", f"src_type {tname}", f"ties {ties}",
+                    "src " + ("src_distinct" if "distinct" in name else "src_cat_nodata" if holes else "src_cat"),
+                    f"nodata_src {holes}",
+                    "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
+                   w, w, vals)
+    print(len(cases), "mode cases")
+
 
 if __name__ == "__main__":
     main()

@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use rwarp::warp::{estimate_scale, warp, Footprint, KernelScaling, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{estimate_scale, warp, Footprint, KernelScaling, ModeTies, ResampleAlg, Sample, SourceBuffer, WarpOptions};
 use rwarp::Transformer;
 
 const N: usize = 64;
@@ -24,7 +24,7 @@ impl Grid {
     fn header(&self, key: &str) -> &str {
         self.header
             .iter()
-            .find_map(|l| l.strip_prefix(key).map(str::trim))
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ').map(str::trim))
             .unwrap_or_else(|| panic!("no '{key}' in fixture header"))
     }
 }
@@ -285,4 +285,125 @@ fn timing_average_footprints() {
         let _ = warp(&Rot, &buf, 256, 256, &opts);
         eprintln!("{footprint:?}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
     }
+}
+
+// ---- mode -----------------------------------------------------------------
+
+fn ties_of(s: &str) -> ModeTies {
+    match s {
+        "FIRST" => ModeTies::First,
+        "MIN" => ModeTies::Min,
+        "MAX" => ModeTies::Max,
+        _ => panic!("unknown ties {s}"),
+    }
+}
+
+/// Mode of the case's source, loaded as `T`, returned as f64.
+fn mode_as<T: Sample>(g: &Grid, footprint: Footprint, ties: ModeTies) -> Vec<f64> {
+    let holes = g.header("nodata_src") == "True";
+    let src = read_grid(g.header("src"));
+    let data: Vec<T> = src.vals.iter().map(|&v| T::from_f64(v as f64)).collect();
+    let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: 1, col_off: 0, row_off: 0 };
+    let opts = WarpOptions {
+        alg: ResampleAlg::Mode,
+        footprint,
+        mode_ties: ties,
+        nodata: if holes { Some(T::from_f64(0.0)) } else { None },
+        ..Default::default()
+    };
+    warp(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
+}
+
+fn mode_case(g: &Grid, ty: &str, footprint: Footprint, ties: ModeTies) -> Vec<f64> {
+    match ty {
+        "Byte" => mode_as::<u8>(g, footprint, ties),
+        "Int16" => mode_as::<i16>(g, footprint, ties),
+        "Int32" => mode_as::<i32>(g, footprint, ties),
+        "Float32" => mode_as::<f32>(g, footprint, ties),
+        _ => panic!("unknown type {ty}"),
+    }
+}
+
+fn assert_same(name: &str, expect: &[f32], got: &[f64]) {
+    let bad: Vec<usize> = (0..expect.len()).filter(|&i| expect[i] as f64 != got[i]).collect();
+    assert!(bad.is_empty(), "{name}: {} pixels differ, first {} (gdal {} rwarp {})",
+        bad.len(), bad[0], expect[bad[0]], got[bad[0]]);
+}
+
+fn mode_fixtures(prefix: &str) -> Vec<String> {
+    let dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "kernels"].iter().collect();
+    let mut names: Vec<String> = std::fs::read_dir(dir).unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with(prefix) && n.ends_with(".txt"))
+        .map(|n| n.trim_end_matches(".txt").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every categorical case, all four types and all three tie rules, 4:1 and
+/// 2.78:1 (fractional weights), nodata and a rotated destination: identical
+/// to gdalwarp -r mode.
+#[test]
+fn mode_matches_gdal() {
+    let names: Vec<String> = mode_fixtures("mode_").into_iter().filter(|n| !n.contains("distinct")).collect();
+    assert_eq!(names.len(), 26);
+    for name in names {
+        let g = read_grid(&name);
+        let got = mode_case(&g, g.header("src_type"), Footprint::GdalBox, ties_of(g.header("ties")));
+        assert_same(&name, &g.vals, &got);
+    }
+}
+
+/// Ties at a value's first occurrence: every 2x2 block holds four distinct
+/// values. GDAL applies MIN/MAX there for Byte but not for Int32/Float32 (its
+/// list-of-values path never compares a new entry against the mode).
+/// rwarp gives GDAL's Byte answer for every type.
+#[test]
+fn mode_first_occurrence_ties_follow_gdal_byte_for_every_type() {
+    for ties in ["first", "min", "max"] {
+        let byte = read_grid(&format!("mode_distinct_byte_{ties}"));
+        for ty in ["Byte", "Int32", "Float32"] {
+            let got = mode_case(&byte, ty, Footprint::GdalBox, ties_of(byte.header("ties")));
+            assert_same(&format!("distinct {ties} as {ty}"), &byte.vals, &got);
+        }
+        // The GDAL inconsistency this departs from.
+        let int32 = read_grid(&format!("mode_distinct_int32_{ties}"));
+        let differ = byte.vals.iter().zip(&int32.vals).filter(|(a, b)| a != b).count();
+        if ties == "first" {
+            assert_eq!(differ, 0);
+        } else {
+            assert!(differ > 0, "{ties}: expected GDAL's Int32 path to differ from Byte");
+        }
+    }
+}
+
+/// Where the destination pixel maps to an axis-aligned rectangle the exact
+/// footprint has the box's weights (as f32 fractions), so the mode agrees.
+#[test]
+fn mode_exact_equals_gdal_box_when_axis_aligned() {
+    for name in ["mode_byte_first_4x", "mode_byte_min_4x", "mode_int32_max_4x", "mode_byte_min_4x_nodata"] {
+        let g = read_grid(name);
+        let got = mode_case(&g, g.header("src_type"), Footprint::Exact { densify: 1 }, ties_of(g.header("ties")));
+        assert_same(name, &g.vals, &got);
+    }
+}
+
+#[test]
+fn mode_first_is_first_to_reach_the_count() {
+    // [[5, 3], [3, 5]] -> one pixel: 5 is seen first, 3 reaches 2 first.
+    let data: Vec<u8> = vec![5, 3, 3, 5];
+    let buf = SourceBuffer { data: &data[..], ncol: 2, nrow: 2, nbands: 1, col_off: 0, row_off: 0 };
+    struct Half;
+    impl Transformer for Half {
+        fn transform(&self, _: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+            for v in x.iter_mut().chain(y.iter_mut()) { *v *= 2.0; }
+            vec![true; x.len()]
+        }
+    }
+    let run = |ties| {
+        let opts = WarpOptions { alg: ResampleAlg::Mode, mode_ties: ties, ..Default::default() };
+        warp(&Half, &buf, 1, 1, &opts)[0]
+    };
+    assert_eq!((run(ModeTies::First), run(ModeTies::Min), run(ModeTies::Max)), (3, 3, 5));
 }

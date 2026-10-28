@@ -42,7 +42,7 @@
 //!       │
 //!       ▼
 //! [warp]  warp
-//!         → nearest / bilinear / cubic / lanczos / average kernel
+//!         → nearest / bilinear / cubic / lanczos / average / mode kernel
 //! ```
 //!
 //! Before touching any pixels you can inspect
@@ -57,7 +57,7 @@
 //! | [`gcp_transform`] | `GcpTransformer` (polynomial order 1–3) | `GDALGCPTransform` |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `ComputeSourceWindow`, `CollectChunkList` | `GDALWarpOperation` planning |
-//! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening and area-weighted average, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
+//! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, area-weighted average and mode, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
 //!
 //! ## Validation status
 //!
@@ -76,6 +76,7 @@
 //! | Point kernels at any ratio | same, against `gdalwarp -wo XSCALE=1 -wo YSCALE=1` | within 1e-6 relative |
 //! | Average (GDAL box) | same, plus upsampling, overhanging and 30°-rotated destinations | within 1e-6 relative of `gdalwarp -r average` |
 //! | Average (exact footprint) | axis-aligned cases vs the GDAL box; 45° diamond vs the analytic mean | within 1e-5 (f32 coverage fractions) |
+//! | Mode, all `MODE_TIES` | synthetic categorical, Byte/Int16/Int32/Float32, 4:1 and 2.78:1, nodata, rotated | identical to `gdalwarp -r mode` (26 cases); ties at first occurrence follow GDAL's Byte path for every type |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
 //!
 //! **Downsampled interpolated warps:** when the output is coarser than the
@@ -135,7 +136,7 @@
 //! | `gcp_transform.rs` | `alg/gdal_crs.c` | GCP polynomial fit |
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
-//! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840; average ~L6845-7030, ~L7577, ~L7960 (at `739fcf03bf`, 3.14.0dev) |
+//! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840; average ~L6845-7030, ~L7577, ~L7960; mode ~L7147-7235, ~L8115-8170 (at `739fcf03bf`, 3.14.0dev) |
 
 pub mod crs;
 pub mod transform;

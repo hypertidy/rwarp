@@ -1,4 +1,4 @@
-//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos, average.
+//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos, average, mode.
 //!
 //! Maps GDAL's gdalwarpkernel.cpp (~line 5510 onwards) and
 //! gdalresamplingkernels.h.
@@ -74,6 +74,18 @@
 //! agree. The exact footprint costs about 25x the box (4 µs a pixel at
 //! 4:1 in the timing test).
 //!
+//! ## Mode
+//!
+//! [`ResampleAlg::Mode`] uses the same footprints, with the covered area of
+//! each distinct value as its count (accumulated in `f32`, as GDAL does, so
+//! ties fall in the same places), per band over valid pixels.
+//! [`ModeTies`] breaks ties, as GDAL's `MODE_TIES`. The count comparison
+//! runs every time a value's count grows, in source scan order, which is
+//! GDAL's 8/16-bit histogram path (gdalwarpkernel.cpp ~L8115-8170); GDAL's
+//! path for wider types (`GWKModeRealType`, ~L7147-7235) skips it on a
+//! value's first occurrence, so its `Min` / `Max` depend on the data type.
+//! rwarp gives the 8/16-bit answer for every type.
+//!
 //! ## Nodata handling (point kernels)
 //!
 //! **Nearest-neighbour**: nodata pixels in source are skipped; destination
@@ -105,6 +117,10 @@ pub enum ResampleAlg {
     /// Area-weighted mean of the source pixels a destination pixel covers,
     /// over the valid ones; see [`Footprint`].
     Average,
+    /// Most common value (by covered area) among the valid source pixels a
+    /// destination pixel covers, per band; see [`Footprint`] and
+    /// [`ModeTies`].
+    Mode,
 }
 
 impl ResampleAlg {
@@ -115,7 +131,7 @@ impl ResampleAlg {
             ResampleAlg::Bilinear => 1,
             ResampleAlg::Cubic => 2,
             ResampleAlg::Lanczos => 3,
-            ResampleAlg::Average => 0,
+            ResampleAlg::Average | ResampleAlg::Mode => 0,
         }
     }
 
@@ -123,7 +139,7 @@ impl ResampleAlg {
     /// nearest, which has no kernel.
     fn weight(self, x: f64) -> f64 {
         match self {
-            ResampleAlg::NearestNeighbour | ResampleAlg::Average => 0.0,
+            ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode => 0.0,
             ResampleAlg::Bilinear => {
                 let ax = x.abs();
                 if ax <= 1.0 { 1.0 - ax } else { 0.0 }
@@ -150,8 +166,8 @@ pub enum KernelScaling {
     Fixed { x: f64, y: f64 },
 }
 
-/// How [`ResampleAlg::Average`] measures the overlap of a destination
-/// pixel with source pixels. Both measure area in source pixel space, which
+/// How [`ResampleAlg::Average`] and [`ResampleAlg::Mode`] measure the
+/// overlap of a destination pixel with source pixels. Both measure area in source pixel space, which
 /// is planar area in the source CRS for an affine source; neither is area
 /// in the target CRS or on the ellipsoid.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,14 +187,37 @@ pub enum Footprint {
     Exact { densify: usize },
 }
 
+/// How [`ResampleAlg::Mode`] breaks a tie between values with equal
+/// covered area (GDAL's `MODE_TIES` warp option, GDAL >= 3.11).
+///
+/// Counts are re-compared each time a value's count grows, in source scan
+/// order (row by row, then column), so `First` is the tied value that
+/// *reached* the winning count first, not the one seen first:
+/// `[[5, 3], [3, 5]]` gives 3. This is what GDAL does for 8- and 16-bit
+/// data. For wider types (32/64-bit, floating) GDAL skips the comparison on
+/// a value's first occurrence, so `Min` / `Max` are not applied to ties at
+/// a count reached that way (all-distinct `[[5, 3], [7, 1]]` with `Min`:
+/// GDAL gives 1 for Byte, 5 for Int32); rwarp gives the same answer for
+/// every type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeTies {
+    #[default]
+    First,
+    Min,
+    Max,
+}
+
 /// Options for [`warp`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WarpOptions<T> {
     pub alg: ResampleAlg,
     pub scaling: KernelScaling,
-    /// Footprint for [`ResampleAlg::Average`]; ignored by the other
-    /// methods.
+    /// Footprint for [`ResampleAlg::Average`] and [`ResampleAlg::Mode`];
+    /// ignored by the other methods.
     pub footprint: Footprint,
+    /// Tie-breaking for [`ResampleAlg::Mode`]; ignored by the other
+    /// methods.
+    pub mode_ties: ModeTies,
     /// Source pixels where any band equals this are nodata, and it is the
     /// fill for destination pixels with no value. `None` fills with
     /// [`Sample::zero`].
@@ -197,6 +236,7 @@ impl<T: Sample> Default for WarpOptions<T> {
             alg: ResampleAlg::NearestNeighbour,
             scaling: KernelScaling::WidenWhenDownsampling,
             footprint: Footprint::GdalBox,
+            mode_ties: ModeTies::First,
             nodata: None,
             mask_band: None,
             dst_col_off: 0,
@@ -362,7 +402,7 @@ impl Widened {
     /// `None` when GDAL would use the point kernel at this scale.
     fn new(alg: ResampleAlg, sx: f64, sy: f64) -> Option<Self> {
         let widen = match alg {
-            ResampleAlg::NearestNeighbour | ResampleAlg::Average => false,
+            ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode => false,
             ResampleAlg::Bilinear | ResampleAlg::Cubic => !(sx > 0.5 && sy > 0.5),
             ResampleAlg::Lanczos => sx < 1.0 || sy < 1.0,
         };
@@ -422,7 +462,7 @@ pub fn warp_resample(
             lanczos_sample,
         ),
         // Area methods have one implementation, the generic one.
-        ResampleAlg::Average => {
+        ResampleAlg::Average | ResampleAlg::Mode => {
             let src = SourceBuffer {
                 data: src_pixels, ncol: src_ncol, nrow: src_nrow, nbands: 1,
                 col_off: src_col_off, row_off: src_row_off,
@@ -778,7 +818,7 @@ fn lanczos_sample(
 /// Integer types round half away from zero (GDAL's `GWKRoundValueT`) and
 /// saturate at the type's range; floats pass through and treat NaN as
 /// nodata.
-pub trait Sample: Copy + PartialEq + 'static {
+pub trait Sample: Copy + PartialOrd + 'static {
     fn to_f64(self) -> f64;
     fn from_f64(v: f64) -> Self;
     /// The value written for unmapped / nodata destination pixels when no
@@ -859,7 +899,7 @@ pub fn warp<T: Sample>(
         }
         KernelScaling::Fixed { x, y } => (x, y),
     };
-    if alg == ResampleAlg::Average {
+    if matches!(alg, ResampleAlg::Average | ResampleAlg::Mode) {
         return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy));
     }
     let widened = Widened::new(alg, sx, sy);
@@ -914,7 +954,7 @@ pub fn warp<T: Sample>(
                 (None, ResampleAlg::Lanczos) => {
                     img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut acc, &mut row_acc, &mut wx)
                 }
-                (None, ResampleAlg::NearestNeighbour | ResampleAlg::Average) => unreachable!(),
+                (None, ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode) => unreachable!(),
             };
             if hit {
                 for b in 0..nbands {
@@ -1142,29 +1182,93 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 }
 
 // =========================================================================
-// Area methods (average)
+// Area methods (average, mode)
 // =========================================================================
 
-/// Running weighted mean over the bands of the source pixels a footprint
-/// covers (West's weighted incremental algorithm, as GDAL's average uses).
-struct AreaMean<'a> {
-    mean: &'a mut [f64],
+/// What an area method does with the valid source pixels under a
+/// destination pixel's footprint and their weights.
+trait AreaReducer<T: Sample> {
+    fn reset(&mut self);
+    fn add(&mut self, pix: &[T], w: f64);
+    /// Write the result for one destination pixel; false if there is none.
+    fn write(&self, out: &mut [T]) -> bool;
+}
+
+/// Running weighted mean per band (West's weighted incremental algorithm,
+/// as GDAL's average uses).
+struct AreaMean {
+    mean: Vec<f64>,
     total: f64,
 }
 
-impl<'a> AreaMean<'a> {
-    fn new(mean: &'a mut [f64]) -> Self {
-        for v in mean.iter_mut() { *v = 0.0; }
-        AreaMean { mean, total: 0.0 }
+impl<T: Sample> AreaReducer<T> for AreaMean {
+    fn reset(&mut self) {
+        self.mean.fill(0.0);
+        self.total = 0.0;
     }
 
     #[inline]
-    fn add<T: Sample>(&mut self, pix: &[T], w: f64) {
+    fn add(&mut self, pix: &[T], w: f64) {
         self.total += w;
         let f = w / self.total;
         for (m, &v) in self.mean.iter_mut().zip(pix) {
             *m += f * (v.to_f64() - *m);
         }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        if self.total <= 0.0 { return false; }
+        for (o, &v) in out.iter_mut().zip(&self.mean) { *o = T::from_f64(v); }
+        true
+    }
+}
+
+/// Weighted mode per band. Weights accumulate in `f32` like GDAL's
+/// `pafCounts`, so ties fall where GDAL's do. The mode is re-decided every
+/// time a value's count grows, including its first occurrence, which is
+/// GDAL's histogram path for 8- and 16-bit types (gdalwarpkernel.cpp
+/// ~L8115-8170); see [`ModeTies`] for how wider types differ in GDAL.
+struct AreaMode<T> {
+    ties: ModeTies,
+    /// Per band: distinct values and their counts, and the mode's index.
+    bins: Vec<Vec<(T, f32)>>,
+    mode: Vec<Option<usize>>,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaMode<T> {
+    fn reset(&mut self) {
+        for b in &mut self.bins { b.clear(); }
+        self.mode.fill(None);
+    }
+
+    fn add(&mut self, pix: &[T], w: f64) {
+        let w = w as f32;
+        for ((&v, bins), mode) in pix.iter().zip(&mut self.bins).zip(&mut self.mode) {
+            let i = match bins.iter().position(|b| b.0 == v) {
+                Some(i) => { bins[i].1 += w; i }
+                None => { bins.push((v, w)); bins.len() - 1 }
+            };
+            let better = match *mode {
+                None => true,
+                Some(m) => {
+                    let (c, cm) = (bins[i].1, bins[m].1);
+                    c > cm || (c == cm && match self.ties {
+                        ModeTies::First => false,
+                        ModeTies::Min => v < bins[m].0,
+                        ModeTies::Max => v > bins[m].0,
+                    })
+                }
+            };
+            if better { *mode = Some(i); }
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        if self.mode.iter().any(Option::is_none) { return false; }
+        for ((o, bins), m) in out.iter_mut().zip(&self.bins).zip(&self.mode) {
+            *o = bins[m.unwrap()].0;
+        }
+        true
     }
 }
 
@@ -1213,14 +1317,37 @@ fn warp_area<T: Sample>(
     scale: (f64, f64),
 ) -> Vec<T> {
     let nb = img.nb;
+    match opts.alg {
+        ResampleAlg::Mode => {
+            let red = AreaMode { ties: opts.mode_ties, bins: vec![Vec::new(); nb], mode: vec![None; nb] };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
+        _ => {
+            let red = AreaMean { mean: vec![0.0; nb], total: 0.0 };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warp_area_with<T: Sample, R: AreaReducer<T>>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    src_off: (f64, f64),
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions<T>,
+    scale: (f64, f64),
+    mut red: R,
+) -> Vec<T> {
+    let nb = img.nb;
     let fill = opts.nodata.unwrap_or_else(T::zero);
     let mut out = vec![fill; dst_ncol * dst_nrow * nb];
-    let mut mean = vec![0.0f64; nb];
     for dst_row in 0..dst_nrow {
         let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
         match opts.footprint {
-            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut mean, row_out),
-            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut mean, row_out),
+            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, row_out),
+            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut red, row_out),
         }
     }
     out
@@ -1230,7 +1357,7 @@ fn warp_area<T: Sample>(
 /// and `GWKAverageOrModeComputeLineCoords`, gdalwarpkernel.cpp ~L6873-7030,
 /// ~L7960 for the average itself).
 #[allow(clippy::too_many_arguments)]
-fn area_row_gdal_box<T: Sample>(
+fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
     transformer: &impl Transformer,
     img: &Interleaved<'_, T>,
     (col_off, row_off): (f64, f64),
@@ -1238,7 +1365,7 @@ fn area_row_gdal_box<T: Sample>(
     dst_ncol: usize,
     opts: &WarpOptions<T>,
     (sx, sy): (f64, f64),
-    mean: &mut [f64],
+    red: &mut R,
     row_out: &mut [T],
 ) {
     let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
@@ -1301,21 +1428,17 @@ fn area_row_gdal_box<T: Sample>(
         if iy0 == iy1 && iy1 < nrow { iy1 += 1; }
 
         let b = SrcBox { x0: bx0, x1: bx1, y0: by0, y1: by1, ix0, ix1, iy0, iy1, wrap };
-        let mut m = AreaMean::new(mean);
+        red.reset();
         for iy in b.iy0..b.iy1 {
             for ix in b.ix0..b.ix1 {
                 let col = if b.wrap { ix % ncol } else { ix };
                 let p = (iy * ncol + col) as usize;
                 if !img.valid(p) { continue; }
                 let w = b.weight(ix, iy);
-                if w > 0.0 { m.add(img.px(p), w); }
+                if w > 0.0 { red.add(img.px(p), w); }
             }
         }
-        if m.total > 0.0 {
-            for (o, &v) in row_out[c * img.nb..(c + 1) * img.nb].iter_mut().zip(m.mean.iter()) {
-                *o = T::from_f64(v);
-            }
-        }
+        red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
     }
 }
 
@@ -1323,7 +1446,7 @@ fn area_row_gdal_box<T: Sample>(
 /// densified and transformed, burned onto the source pixels it touches
 /// with exact coverage fractions.
 #[allow(clippy::too_many_arguments)]
-fn area_row_exact<T: Sample>(
+fn area_row_exact<T: Sample, R: AreaReducer<T>>(
     transformer: &impl Transformer,
     img: &Interleaved<'_, T>,
     (col_off, row_off): (f64, f64),
@@ -1331,7 +1454,7 @@ fn area_row_exact<T: Sample>(
     dst_ncol: usize,
     opts: &WarpOptions<T>,
     densify: usize,
-    mean: &mut [f64],
+    red: &mut R,
     row_out: &mut [T],
 ) {
     use controlledburn::{burn, BurnOptions, Coord, Geometry, GridSpec, Polygon};
@@ -1387,23 +1510,19 @@ fn area_row_exact<T: Sample>(
         let grid = GridSpec::new(c0 as f64, -(r1 as f64), c1 as f64, -(r0 as f64), (c1 - c0) as u32, (r1 - r0) as u32);
         let Ok(res) = burn(&[Geometry::Polygon(Polygon::new(vec![ring]))], &grid, BurnOptions::coverage()) else { continue };
 
-        let mut m = AreaMean::new(mean);
+        red.reset();
         let at = |row: i32, col: i64| ((r0 + row as i64) * ncol + c0 + col) as usize;
         for run in &res.runs {
             for col in run.col_start..run.col_end {
                 let p = at(run.row, col as i64);
-                if img.valid(p) { m.add(img.px(p), 1.0); }
+                if img.valid(p) { red.add(img.px(p), 1.0); }
             }
         }
         for e in &res.edges {
             let p = at(e.row, e.col as i64);
-            if img.valid(p) && e.fraction > 0.0 { m.add(img.px(p), e.fraction as f64); }
+            if img.valid(p) && e.fraction > 0.0 { red.add(img.px(p), e.fraction as f64); }
         }
-        if m.total > 0.0 {
-            for (o, &v) in row_out[c * img.nb..(c + 1) * img.nb].iter_mut().zip(m.mean.iter()) {
-                *o = T::from_f64(v);
-            }
-        }
+        red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
     }
 }
 
