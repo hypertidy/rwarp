@@ -27,7 +27,7 @@ build, and the tests compare rwarp's results to them.
 | Antimeridian split read | GEBCO, Fiji tile | 70 times fewer source pixels than a naive read |
 | Geolocation arrays | synthetic swath, both conventions, curvilinear source and target | coordinates within 1e-6 px; nearest warps identical to `gdalwarp -et 0` |
 | Cutline: centre rule, all touched, blend distance | synthetic Float32; edges and vertices through pixel centres, holes, multipolygons, source nodata, every method but mode, 1:1, 2.78:1 and upsampled, 30 degree rotated, LAEA to lon/lat with the cutline in either CRS | within 1e-6 relative of gdalwarp (67 cases; the reprojected ones identical with libproj and proj4rs) |
-| Cutline tie rules | GDAL's own rasterizer on centre-tie polygons | identical, except 5 centres on one diagonal edge where GDAL's intercept is a rounding error either side |
+| Cutline tie rules | GDAL's own rasterizer on centre-tie polygons | identical, including centres exactly on diagonal edges |
 
 The kernel, chunk and cutline fixtures use GDAL 3.14.0dev (`739fcf03bf`);
 the geolocation fixtures use GDAL 3.8.4.
@@ -65,7 +65,6 @@ and a compound CRS by its horizontal part; NTF (Paris), in grads, is not.
 | `MODE_TIES` for 32/64-bit and float data | `Min`/`Max` skipped for a value's first occurrence | the 8/16-bit behaviour for every type | the same data should not give different modes by type |
 | Geolocation inverse | backmap plus local search | index of all quadrilaterals | same answer on unfolded grids; see [Curvilinear grids](guide/curvilinear.md) |
 | Cutline all touched | centre rule plus each boundary line walked pixel to pixel, with tolerances | pixels with any covered area (above 1e-9) | GDAL also burns pixels touched only at a corner (below-right of it), skips edges within 1e-4 of a pixel wall, and burns one column for an edge within 0.01 px of vertical even where the polygon is in the column to its left |
-| Cutline centre ties on diagonals | intercept rounding | intercept rounding, computed differently | GDAL keeps 23 and drops 5 of the 28 centres on one 45 degree edge; neither is a rule |
 | `Cutline::from_transformer` densification | skipped when `-cblend` is given (unless `GDALWARP_DENSIFY_CUTLINE=YES`) | always | the helper does not know about blending; densifying only makes the transformed cutline more accurate |
 | Longitude wrapping of a geographic source | on whenever the source has a geotransform (the dataset gives its size) | on once `GenImgProjTransformer::with_source_size` is given | `GenImgProjTransformer::new` takes no source size; a transformer built as in 0.3.0 wraps nothing, as before |
 
@@ -101,6 +100,5 @@ origin. On the chunk fixtures this changes no chunk list.
 
 The cutline work found more, not yet in that write-up: all-touched burns
 pixels the boundary touches only at a corner, and a whole column along an
-edge within 0.01 pixels of vertical; centre ties on diagonal edges are
-rounding; blend distance dilates the cutline for the area methods instead
+edge within 0.01 pixels of vertical; blend distance dilates the cutline for the area methods instead
 of feathering it; and `-cblend` turns off cutline densification.

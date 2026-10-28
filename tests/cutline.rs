@@ -228,18 +228,16 @@ parity!(
 // Rotated destination.
 parity!(near_star_rot30, bilinear_star_rot30, cubic_star_rot30, average_star_rot30, bilinear_star_rot30_blend_nodst);
 
-/// Centre rule on a diamond whose edges run exactly through pixel centres:
-/// GDAL's intercept arithmetic puts some of those centres a rounding error
-/// inside and some outside (on the upper-left edge it keeps 23 of the 28
-/// centres and drops 5). controlledburn computes the intercept another
-/// way, so the tie goes the other way on those 5; every other pixel
-/// agrees.
+/// Centre rule on a diamond whose edges run exactly through pixel centres
+/// (28 per edge): GDAL leaves the centres on both left edges out and those
+/// on both right edges in, and so does rwarp. controlledburn 0.2.2 decided
+/// ties from rounded intercepts and kept 5 of the upper-left edge's
+/// centres; 0.2.3 decides them exactly.
 #[test]
-fn centre_ties_on_a_diagonal_are_rounding() {
+fn centre_ties_on_a_diagonal_follow_gdal() {
     let (expect, got) = run_affine("mask_diamond_tie");
     let bad = mismatches(&expect, &got, TOL);
-    // Centres (c + 0.5, r + 0.5) on the edge x + y = 37.
-    assert!(!bad.is_empty() && bad.len() <= 8 && bad.iter().all(|&(c, r, e, _)| e == NODATA && c + r == 36), "{bad:?}");
+    assert!(bad.is_empty(), "{bad:?}");
 }
 
 /// All touched, where GDAL's line walker differs from coverage:

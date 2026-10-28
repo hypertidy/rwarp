@@ -28,6 +28,11 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 - The chunk fixtures' special points are computed as GDAL computes them for
   a geographic source (not reprojected; see `ChunkOptions::special_points`).
   No chunk list changes.
+- controlledburn 0.2.3 (corner passes, near-coincident edges, exact centre
+  ties). The cutline centre rule now matches gdalwarp on centres exactly on
+  diagonal edges: 5 pixels of the `mask_diamond_tie` fixture that differed
+  now agree. They came from controlledburn 0.2.2's rounded intercepts; the
+  parity page had put them down to GDAL.
 
 ## 0.3.0 (2026-10-28)
 
