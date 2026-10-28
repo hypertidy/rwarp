@@ -208,7 +208,10 @@ impl<T: Transformer> ApproxTransformer<T> {
             if !mid_ok {
                 // Midpoint transforms failed: fall back to exact for interior,
                 // write SME values directly (line 4229-4248)
-                if left_len > 2 {
+                // The left half is [start, mid - 1]: its interior and its
+                // end, left_len - 1 points (GDAL: nMiddle - 1), even when
+                // that is the end alone.
+                if left_len > 1 {
                     let ok = self.inner.transform(
                         dst_to_src,
                         &mut x[start + 1..start + left_len],
@@ -245,7 +248,10 @@ impl<T: Transformer> ApproxTransformer<T> {
                 );
             } else {
                 // Small left half: exact transform of interior + write endpoints
-                if left_len > 2 {
+                // The left half is [start, mid - 1]: its interior and its
+                // end, left_len - 1 points (GDAL: nMiddle - 1), even when
+                // that is the end alone.
+                if left_len > 1 {
                     let ok = self.inner.transform(
                         dst_to_src,
                         &mut x[start + 1..start + left_len],
@@ -315,5 +321,58 @@ impl<T: Transformer> Transformer for ApproxTransformer<T> {
         let mut success = vec![false; n];
         self.approx_entry(dst_to_src, x, y, &mut success, 0, n);
         success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A strongly curved transform, so that a tight threshold subdivides
+    /// all the way down to the smallest halves.
+    struct Curved;
+
+    impl Transformer for Curved {
+        fn transform(&self, _dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+            for (x, y) in x.iter_mut().zip(y.iter_mut()) {
+                let (u, v) = (*x, *y);
+                *x = 0.37 * u * u + 10.0 * (u / 7.0).sin();
+                *y = v + (u / 3.0).cos() * u.sqrt();
+            }
+            vec![true; x.len()]
+        }
+    }
+
+    fn scanline(n: usize) -> (Vec<f64>, Vec<f64>) {
+        ((0..n).map(|k| 0.5 + k as f64 * 0.25).collect(), vec![10.0; n])
+    }
+
+    #[test]
+    fn a_tight_threshold_reproduces_the_exact_transform_at_every_length() {
+        let approx = ApproxTransformer::new(Curved, 1e-12);
+        for n in 2..600 {
+            let (mut ex, mut ey) = scanline(n);
+            Curved.transform(true, &mut ex, &mut ey);
+            let (mut ax, mut ay) = scanline(n);
+            let ok = approx.transform(true, &mut ax, &mut ay);
+            for k in 0..n {
+                assert!(ok[k], "n {n}: point {k} reported failed");
+                assert!((ax[k] - ex[k]).abs() < 1e-9 && (ay[k] - ey[k]).abs() < 1e-9,
+                    "n {n}: point {k} ({}, {}) vs exact ({}, {})", ax[k], ay[k], ex[k], ey[k]);
+            }
+        }
+    }
+
+    #[test]
+    fn no_point_fails_where_the_exact_transform_succeeds() {
+        for max_error in [1e-6, 0.01, 0.125, 1.0] {
+            let approx = ApproxTransformer::new(Curved, max_error);
+            for n in 2..600 {
+                let (mut x, mut y) = scanline(n);
+                let ok = approx.transform(true, &mut x, &mut y);
+                assert!(ok.iter().all(|&v| v), "max_error {max_error}, n {n}: {:?}",
+                    ok.iter().enumerate().filter(|(_, v)| !**v).map(|(k, _)| k).collect::<Vec<_>>());
+            }
+        }
     }
 }
