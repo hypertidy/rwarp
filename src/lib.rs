@@ -41,8 +41,8 @@
 //! [read]  (caller: fetch bytes from COG / Zarr / parquet byte-ref store)
 //!       │
 //!       ▼
-//! [warp]  warp_resample
-//!         → nearest / bilinear / cubic / lanczos kernel
+//! [warp]  warp
+//!         → nearest / bilinear / cubic / lanczos / average / mode kernel
 //! ```
 //!
 //! Before touching any pixels you can inspect
@@ -58,7 +58,7 @@
 //! | [`geoloc_transform`] | `GeolocArrays`, `GenImgGeolocTransformer` (curvilinear source and/or target) | `GDALGeoLocTransform`, `GDALGenImgProjTransform` with geolocation arrays |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `ComputeSourceWindow`, `CollectChunkList` | `GDALWarpOperation` planning |
-//! | [`warp`] | Resampling kernels (per-band `i32` reference, and a one-pass generic `Sample` kernel) | `gdalwarpkernel.cpp` |
+//! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, area-weighted average and mode, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
 //!
 //! ## Validation status
 //!
@@ -73,18 +73,24 @@
 //! | `ComputeSourceWindow` | GEBCO global, Fiji LCC | matches GDAL source windows |
 //! | Nearest-neighbour kernel | Sentinel-2, IBCSO Mawson | 65536/65536 identical to `gdalwarp -r near` |
 //! | Bilinear/cubic/lanczos | GEBCO at ~1:1 ratio | 65536/65536 identical to GDAL |
+//! | Kernel widening, scale estimate | synthetic 64×64 Float32, 1.5:1 to 4:1, anisotropic, with nodata (`tests/kernels.rs`) | within 1e-6 relative of `gdalwarp` (GDAL 3.14.0dev-739fcf03bf) |
+//! | Point kernels at any ratio | same, against `gdalwarp -wo XSCALE=1 -wo YSCALE=1` | within 1e-6 relative |
+//! | Average (GDAL box) | same, plus upsampling, overhanging and 30°-rotated destinations | within 1e-6 relative of `gdalwarp -r average` |
+//! | Average (exact footprint) | axis-aligned cases vs the GDAL box; 45° diamond vs the analytic mean | within 1e-5 (f32 coverage fractions) |
+//! | Mode, all `MODE_TIES` | synthetic categorical, Byte/Int16/Int32/Float32, 4:1 and 2.78:1, nodata, rotated | identical to `gdalwarp -r mode` (26 cases); ties at first occurrence follow GDAL's Byte path for every type |
+//! | Integer rounding/clamping, nodata avoidance, `[0, n)` source bounds | synthetic Byte/Int16/Int32/Float32 with .5 means, cubic overshoot, means equal to nodata, edge-straddling grids | identical to `gdalwarp` (12 cases) |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
 //! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
 //!
-//! **Known limitation — downsampled interpolated warps:** when the
-//! source/destination pixel ratio is significantly greater than 1 (coarser
-//! output than source), GDAL scales the resampling kernel to cover the
-//! appropriate source area (antialiasing). rwarp's kernels use the textbook
-//! fixed width. At ~1:1 ratio results are bit-identical; at 4.5:1 ratio
-//! bilinear outputs differ noticeably. The practical solution is overview
-//! pre-selection: the planning layer knows the source/destination ratio and
-//! can select the appropriate overview level before calling the kernel. See
-//! the [`warp`] module documentation for details.
+//! **Downsampled interpolated warps:** when the output is coarser than the
+//! source, GDAL widens the bilinear, cubic and lanczos kernels to cover the
+//! source area of each output pixel (antialiasing). rwarp does the same by
+//! default ([`warp::KernelScaling::WidenWhenDownsampling`]), estimating the
+//! scale per call as GDAL does per chunk; [`warp::KernelScaling::Point`]
+//! keeps fixed support, matching `gdalwarp -wo XSCALE=1 -wo YSCALE=1`.
+//! Overview pre-selection is still worthwhile for I/O: the planning layer
+//! knows the ratio and can read a coarser level. See the [`warp`] module
+//! documentation.
 //!
 //! ## Extensibility: n-D chunks and vector-quantity warps
 //!
@@ -121,7 +127,8 @@
 //! ## GDAL source lineage
 //!
 //! GDAL source commit used for analysis: `a3b7b01d3e` (GDAL 3.13.0dev,
-//! 2026-02-23). GDAL is MIT-licensed. This crate is an independent
+//! 2026-02-23); kernel widening and the lanczos and nodata rules in `warp.rs`
+//! were read at `739fcf03bf` (GDAL 3.14.0dev). GDAL is MIT-licensed. This crate is an independent
 //! implementation, not a port. We
 //! think it's also very useful as a way to investigate and carry forward the value
 //! of the existing GDAL C++ implementation which has years of battle-tested logic
@@ -134,7 +141,7 @@
 //! | `geoloc_transform.rs` | `alg/gdalgeoloc.cpp` | `PixelLineToXY`, `Transform`, `GDALInverseBilinearInterpolation` |
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
-//! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510 |
+//! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840; average ~L6845-7030, ~L7577, ~L7960; mode ~L7147-7235, ~L8115-8170; rounding/nodata/bounds ~L1587, ~L1613, ~L1856, ~L5251 (at `739fcf03bf`, 3.14.0dev) |
 
 pub mod crs;
 pub mod transform;

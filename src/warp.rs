@@ -1,4 +1,4 @@
-//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos.
+//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos, average, mode.
 //!
 //! Maps GDAL's gdalwarpkernel.cpp (~line 5510 onwards) and
 //! gdalresamplingkernels.h.
@@ -12,32 +12,101 @@
 //!
 //! The scanline loop is shared; only the per-pixel resampling differs.
 //!
-//! Two entry points: [`warp_resample`] for a single `i32` band with a
-//! nodata value, and [`warp_resample_u8`] for pixel-interleaved `u8` images
-//! (RGB, RGBA, any band count) in one pass with per-pixel validity from an
-//! optional alpha band. The two produce identical values band for band;
-//! the interleaved path is 3-5x faster for RGBA because it transforms and
-//! weights each output pixel once rather than once per band.
+//! Two entry points: [`warp`], generic over [`Sample`] types, for
+//! pixel-interleaved images of any band count in one pass, configured by
+//! [`WarpOptions`]; and [`warp_resample`], a single `i32` band with a nodata
+//! value and fixed (point) kernels, kept as the reference the generic kernel
+//! is tested against. The interleaved path is 3-5x faster for RGBA because
+//! it transforms and weights each output pixel once rather than once per
+//! band.
 //!
 //! ## Downsampling and kernel scaling
 //!
-//! These kernels use fixed filter support: 2×2 for bilinear, 4×4 for cubic,
-//! 6×6 for lanczos. At approximately 1:1 source/destination ratio (or when
-//! upsampling), results are bit-identical to GDAL.
+//! When downsampling, GDAL widens the bilinear, cubic and lanczos kernels so
+//! that they cover the source area of a destination pixel (antialiasing).
+//! [`KernelScaling`] selects the behaviour:
 //!
-//! When downsampling significantly (source/destination ratio > ~1.3:1),
-//! GDAL scales the filter support to cover the appropriate source area
-//! (antialiasing). rwarp does not implement this — at 4.5:1 ratio bilinear
-//! outputs differ from GDAL by up to ~1600 intensity units on steep gradients.
+//! - [`KernelScaling::WidenWhenDownsampling`] (default) estimates the
+//!   destination/source scale per call, as GDAL does per warp chunk
+//!   (`GDALWarpKernel::PerformWarp`, gdalwarpkernel.cpp ~L1092-1295), see
+//!   [`estimate_scale`].
+//! - [`KernelScaling::Fixed`] supplies the scale, like GDAL's `XSCALE` and
+//!   `YSCALE` warp options. Useful when one call covers a region whose scale
+//!   varies, or to make output independent of how the destination is tiled.
+//! - [`KernelScaling::Point`] keeps the fixed 2×2 / 4×4 / 6×6 support at
+//!   every ratio. This is what gdalwarp does with
+//!   `-wo XSCALE=1 -wo YSCALE=1`.
 //!
-//! **The practical solution is overview pre-selection.** The planning layer
-//! (`collect_chunk_list`) knows the source/destination ratio from the source
-//! window size vs destination size. Select the overview level whose
-//! resolution is closest to the destination resolution before calling
-//! `warp_resample`. This keeps the effective ratio near 1:1 and matches
-//! GDAL's `-ovr AUTO` path.
+//! Following GDAL, widening applies per axis to scales below 1 (upsampling
+//! never narrows the kernel): the support becomes `ceil(radius / scale)`
+//! and the kernel is evaluated at `(i - delta) * scale`
+//! (gdalwarpkernel.cpp ~L1319, `GWKResampleNoMasksT` ~L4840,
+//! `GWKResample` ~L4027). Bilinear and cubic only widen once a scale drops
+//! to 0.5 or below; between 1:1 and 2:1 GDAL keeps the 4-sample point
+//! formula (`CanUse4SamplesFormula`, ~L1041). Lanczos widens at any scale
+//! below 1.
 //!
-//! ## Nodata handling
+//! The widened kernel clips its window at the buffer edge and renormalises
+//! by the weights of the valid pixels it covers, skipping nodata (GDAL's
+//! `GWKResample`). The point kernels keep their edge and nodata fallbacks
+//! described below.
+//!
+//! ## Average
+//!
+//! [`ResampleAlg::Average`] is the weighted mean of the source pixels a
+//! destination pixel's footprint covers, over the valid ones only (nodata
+//! pixels add neither value nor weight, so the mean is renormalised).
+//! [`Footprint`] chooses how coverage is measured, in source pixel space:
+//!
+//! - [`Footprint::GdalBox`] (default) is GDAL's: transform the destination
+//!   pixel's top-left and bottom-right corners, take the axis-aligned box
+//!   between them, weight each source pixel by the fraction of it inside
+//!   the box per axis (`GWKAverageOrModeThread`, gdalwarpkernel.cpp
+//!   ~L6845-7030, ~L7960). It follows GDAL's quirks: only two corners are
+//!   used, so a rotated pixel can collapse to a thin box; a box overhanging
+//!   the buffer edge weights the edge pixel above 1; a target pixel on the
+//!   antimeridian wraps past the right edge.
+//! - [`Footprint::Exact`] intersects the transformed outline exactly with
+//!   the source pixels, which with renormalisation is first-order
+//!   conservative remapping with areas in source pixel space.
+//!
+//! For a destination pixel that maps to an axis-aligned rectangle the two
+//! agree. The exact footprint costs about 25x the box (4 µs a pixel at
+//! 4:1 in the timing test).
+//!
+//! ## Mode
+//!
+//! [`ResampleAlg::Mode`] uses the same footprints, with the covered area of
+//! each distinct value as its count (accumulated in `f32`, as GDAL does, so
+//! ties fall in the same places), per band over valid pixels.
+//! [`ModeTies`] breaks ties, as GDAL's `MODE_TIES`. The count comparison
+//! runs every time a value's count grows, in source scan order, which is
+//! GDAL's 8/16-bit histogram path (gdalwarpkernel.cpp ~L8115-8170); GDAL's
+//! path for wider types (`GWKModeRealType`, ~L7147-7235) skips it on a
+//! value's first occurrence, so its `Min` / `Max` depend on the data type.
+//! rwarp gives the 8/16-bit answer for every type.
+//!
+//! ## Output values: rounding, clamping, nodata, source bounds
+//!
+//! Every resampling method computes in `f64`. Integer outputs clamp to the
+//! type and round half up, `floor(v + 0.5)` ([`Sample::from_f64`]), as GDAL
+//! does with an integer working type for bilinear, cubic, lanczos and
+//! average alike (`ClampRoundAndAvoidNoData` / `GWKClampValueT`,
+//! gdalwarpkernel.cpp ~L1587, ~L1856). Nearest and mode copy a source value
+//! and never round.
+//!
+//! A resampled value equal to the nodata value is moved off it by one step
+//! ([`Sample::step_off`]: one less for integers, the next float up), so a
+//! valid output pixel does not read back as missing (GDAL's `AvoidNoData`,
+//! ~L1613; GDAL also warns once).
+//!
+//! Sample points outside `[0, n)` of the source buffer are off the source
+//! for every method but the area ones, which use footprints
+//! (`GWKCheckAndComputeSrcOffsets`, ~L5251). GDAL retries such points with
+//! the exact transformer when an approximate one is in use; rwarp uses the
+//! transformer it is given.
+//!
+//! ## Nodata handling (point kernels)
 //!
 //! **Nearest-neighbour**: nodata pixels in source are skipped; destination
 //! retains its fill value.
@@ -49,8 +118,12 @@
 //! **Cubic**: if any pixel in the 4×4 neighbourhood is nodata, falls back
 //! to bilinear with the same nodata rule.
 //!
-//! **Lanczos**: if any pixel in the 6×6 neighbourhood is nodata, falls back
-//! to cubic.
+//! **Lanczos**: the 6×6 window is clipped to the buffer and nodata pixels
+//! are skipped, renormalising by the weight of the pixels used, as GDAL
+//! does at every scale.
+//!
+//! **All interpolating kernels**: a destination pixel whose centre lands on
+//! a nodata source pixel gets no value, whatever its neighbours.
 
 use crate::transform::{transform_scanline, Transformer};
 
@@ -61,6 +134,13 @@ pub enum ResampleAlg {
     Bilinear,          // 2×2,      radius 1
     Cubic,             // 4×4,      radius 2  (Catmull-Rom, a = -0.5)
     Lanczos,           // 6×6,      radius 3  (sinc windowed sinc)
+    /// Area-weighted mean of the source pixels a destination pixel covers,
+    /// over the valid ones; see [`Footprint`].
+    Average,
+    /// Most common value (by covered area) among the valid source pixels a
+    /// destination pixel covers, per band; see [`Footprint`] and
+    /// [`ModeTies`].
+    Mode,
 }
 
 impl ResampleAlg {
@@ -71,7 +151,287 @@ impl ResampleAlg {
             ResampleAlg::Bilinear => 1,
             ResampleAlg::Cubic => 2,
             ResampleAlg::Lanczos => 3,
+            ResampleAlg::Average | ResampleAlg::Mode => 0,
         }
+    }
+
+    /// Kernel weight at distance `x` (GDAL's `apfGWKFilter`). Zero for
+    /// nearest, which has no kernel.
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode => 0.0,
+            ResampleAlg::Bilinear => {
+                let ax = x.abs();
+                if ax <= 1.0 { 1.0 - ax } else { 0.0 }
+            }
+            ResampleAlg::Cubic => cubic_weight(x),
+            ResampleAlg::Lanczos => lanczos_weight(x),
+        }
+    }
+}
+
+/// How the interpolating kernels respond to downsampling. See the module
+/// documentation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KernelScaling {
+    /// Fixed kernel support at every ratio (gdalwarp `-wo XSCALE=1
+    /// -wo YSCALE=1`).
+    Point,
+    /// Widen the kernel by the destination/source scale estimated from the
+    /// transformer over the destination window (GDAL's default).
+    WidenWhenDownsampling,
+    /// Widen the kernel by a given destination/source scale per axis
+    /// (destination pixels per source pixel; below 1 is downsampling), as
+    /// GDAL's `XSCALE` / `YSCALE` warp options.
+    Fixed { x: f64, y: f64 },
+}
+
+/// How [`ResampleAlg::Average`] and [`ResampleAlg::Mode`] measure the
+/// overlap of a destination pixel with source pixels. Both measure area in source pixel space, which
+/// is planar area in the source CRS for an affine source; neither is area
+/// in the target CRS or on the ellipsoid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Footprint {
+    /// GDAL's footprint (`GWKAverageOrModeThread`, gdalwarpkernel.cpp
+    /// ~L7577): the axis-aligned box between the transformed top-left and
+    /// bottom-right corners of the destination pixel, with fractional
+    /// weights for the source pixels it partly covers. Exact when the
+    /// destination pixel maps to an axis-aligned rectangle; under rotation,
+    /// shear or curvature the box can be far from the true footprint.
+    GdalBox,
+    /// The destination pixel's outline, each edge split into `densify`
+    /// segments, transformed to source pixel space and intersected exactly
+    /// with the source pixels (coverage fractions from [`controlledburn`],
+    /// stored as `f32`). With renormalisation over valid pixels this is
+    /// first-order conservative remapping. No antimeridian handling.
+    Exact { densify: usize },
+}
+
+/// How [`ResampleAlg::Mode`] breaks a tie between values with equal
+/// covered area (GDAL's `MODE_TIES` warp option, GDAL >= 3.11).
+///
+/// Counts are re-compared each time a value's count grows, in source scan
+/// order (row by row, then column), so `First` is the tied value that
+/// *reached* the winning count first, not the one seen first:
+/// `[[5, 3], [3, 5]]` gives 3. This is what GDAL does for 8- and 16-bit
+/// data. For wider types (32/64-bit, floating) GDAL skips the comparison on
+/// a value's first occurrence, so `Min` / `Max` are not applied to ties at
+/// a count reached that way (all-distinct `[[5, 3], [7, 1]]` with `Min`:
+/// GDAL gives 1 for Byte, 5 for Int32); rwarp gives the same answer for
+/// every type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeTies {
+    #[default]
+    First,
+    Min,
+    Max,
+}
+
+/// Options for [`warp`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WarpOptions<T> {
+    pub alg: ResampleAlg,
+    pub scaling: KernelScaling,
+    /// Footprint for [`ResampleAlg::Average`] and [`ResampleAlg::Mode`];
+    /// ignored by the other methods.
+    pub footprint: Footprint,
+    /// Tie-breaking for [`ResampleAlg::Mode`]; ignored by the other
+    /// methods.
+    pub mode_ties: ModeTies,
+    /// Source pixels where any band equals this are nodata, and it is the
+    /// fill for destination pixels with no value. `None` fills with
+    /// [`Sample::zero`].
+    pub nodata: Option<T>,
+    /// Band whose zero values mark source pixels as nodata (an alpha band).
+    pub mask_band: Option<usize>,
+    /// Offset of the destination window in the grid the transformer maps
+    /// from, so a tile of a larger destination can be warped on its own.
+    pub dst_col_off: usize,
+    pub dst_row_off: usize,
+}
+
+impl<T: Sample> Default for WarpOptions<T> {
+    fn default() -> Self {
+        WarpOptions {
+            alg: ResampleAlg::NearestNeighbour,
+            scaling: KernelScaling::WidenWhenDownsampling,
+            footprint: Footprint::GdalBox,
+            mode_ties: ModeTies::First,
+            nodata: None,
+            mask_band: None,
+            dst_col_off: 0,
+            dst_row_off: 0,
+        }
+    }
+}
+
+/// A pixel-interleaved source buffer, laid out `(row, col, band)`, that is a
+/// window of the full source image.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceBuffer<'a, T> {
+    pub data: &'a [T],
+    pub ncol: usize,
+    pub nrow: usize,
+    pub nbands: usize,
+    /// Offset of the buffer in the full source image (the transformer's
+    /// pixel space).
+    pub col_off: usize,
+    pub row_off: usize,
+}
+
+/// Estimate the destination/source scale per axis of a destination window,
+/// as GDAL does for each warp chunk (`GDALWarpKernel::PerformWarp`,
+/// gdalwarpkernel.cpp ~L1092-1295).
+///
+/// The transformer maps a unit square at up to 10×10 points over the window
+/// to source pixels. A square that stays a quasi-rectangle (edges within
+/// ~20° of the axes, opposite sides within 10% in length) gives one scale per
+/// axis from the reciprocal of its side lengths; otherwise both axes get the
+/// reciprocal square root of its area. Samples below 10% of the per-axis
+/// maximum (a polar discontinuity, say) are dropped and the rest averaged.
+/// A scale whose reciprocal is within 0.05 of an integer is snapped to it.
+/// Returns `(1.0, 1.0)` if nothing transforms.
+///
+/// GDAL samples the chunk at `0..nDstXSize` without adding the chunk's
+/// offset (from reading the code; not yet checked against a multi-chunk
+/// gdalwarp run). This adds `dst_col_off` / `dst_row_off`, so the estimate
+/// is for the window actually warped. For a single-chunk warp, as in the
+/// test fixtures, the two agree.
+pub fn estimate_scale(
+    transformer: &impl Transformer,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    dst_col_off: usize,
+    dst_row_off: usize,
+) -> (f64, f64) {
+    const MAX_POINTS_PER_DIM: usize = 10;
+    let npx = dst_ncol.min(MAX_POINTS_PER_DIM);
+    let npy = dst_nrow.min(MAX_POINTS_PER_DIM);
+    // Sample positions span the window, the last pulled in by a pixel so
+    // its unit square stays inside.
+    let sample = |i: usize, np: usize, n: usize| -> f64 {
+        let shift = if i > 0 && i == np - 1 { -1.0 } else { 0.0 };
+        shift + if np == 1 { 0.0 } else { i as f64 * n as f64 / (np - 1) as f64 }
+    };
+    let mut xs = Vec::with_capacity(4 * npx * npy);
+    let mut ys = Vec::with_capacity(4 * npx * npy);
+    for iy in 0..npy {
+        let y = sample(iy, npy, dst_nrow) + dst_row_off as f64;
+        for ix in 0..npx {
+            let x = sample(ix, npx, dst_ncol) + dst_col_off as f64;
+            // Corners 0..3: (x, y), (x+1, y), (x, y+1), (x+1, y+1).
+            xs.extend_from_slice(&[x, x + 1.0, x, x + 1.0]);
+            ys.extend_from_slice(&[y, y, y + 1.0, y + 1.0]);
+        }
+    }
+    let ok = transformer.transform(true, &mut xs, &mut ys);
+
+    const TAN_MODEST_ANGLE: f64 = 0.35;
+    const LENGTH_RELATIVE_TOLERANCE: f64 = 0.1;
+    const EPSILON: f64 = 1e-10;
+    let mut scales: Vec<(f64, f64)> = Vec::new();
+    for i in (0..xs.len()).step_by(4) {
+        if !(ok[i] && ok[i + 1] && ok[i + 2] && ok[i + 3]) {
+            continue;
+        }
+        let (vx01, vy01) = (xs[i + 1] - xs[i], ys[i + 1] - ys[i]);
+        let (vx23, vy23) = (xs[i + 3] - xs[i + 2], ys[i + 3] - ys[i + 2]);
+        let (vx02, vy02) = (xs[i + 2] - xs[i], ys[i + 2] - ys[i]);
+        let (vx13, vy13) = (xs[i + 3] - xs[i + 1], ys[i + 3] - ys[i + 1]);
+        let len01 = vx01 * vx01 + vy01 * vy01;
+        let len23 = vx23 * vx23 + vy23 * vy23;
+        let len02 = vx02 * vx02 + vy02 * vy02;
+        let len13 = vx13 * vx13 + vy13 * vy13;
+        if vy01.abs() < TAN_MODEST_ANGLE * vx01
+            && vy23.abs() < TAN_MODEST_ANGLE * vx23
+            && (len01 - len23).abs() < LENGTH_RELATIVE_TOLERANCE * len01.abs()
+            && (len02 - len13).abs() < LENGTH_RELATIVE_TOLERANCE * len02.abs()
+        {
+            // Geometric mean of opposite sides (still squared, hence two
+            // square roots).
+            let xlen = (len01 * len23).sqrt().sqrt();
+            let ylen = (len02 * len13).sqrt().sqrt();
+            if xlen > EPSILON && ylen > EPSILON {
+                scales.push((1.0 / xlen, 1.0 / ylen));
+            }
+        } else {
+            // Shoelace area of the quadrilateral 0, 1, 3, 2.
+            let (px, py) = ([xs[i], xs[i + 1], xs[i + 3], xs[i + 2]], [ys[i], ys[i + 1], ys[i + 3], ys[i + 2]]);
+            let mut sum = 0.0;
+            for k in 0..4 {
+                sum += px[k] * (py[(k + 1) % 4] - py[(k + 3) % 4]);
+            }
+            let factor = (0.5 * sum.abs()).sqrt();
+            if factor > EPSILON {
+                scales.push((1.0 / factor, 1.0 / factor));
+            }
+        }
+    }
+
+    let (mut sx, mut sy) = (0.0, 0.0);
+    if !scales.is_empty() {
+        // GDAL sorts by area scale before averaging; kept so the running
+        // mean sums in the same order.
+        scales.sort_by(|a, b| (a.0 * a.1).total_cmp(&(b.0 * b.1)));
+        let xmax = scales.iter().fold(0.0f64, |m, s| m.max(s.0));
+        let ymax = scales.iter().fold(0.0f64, |m, s| m.max(s.1));
+        const THRESHOLD: f64 = 0.1;
+        let mut n = 0;
+        for &(x, y) in &scales {
+            if x > THRESHOLD * xmax && y > THRESHOLD * ymax {
+                n += 1;
+                let inv = 1.0 / n as f64;
+                sx += (x - sx) * inv;
+                sy += (y - sy) * inv;
+            }
+        }
+    }
+    let snap = |s: f64| -> f64 {
+        if s <= 0.0 {
+            return 1.0;
+        }
+        if s < 1.0 {
+            let r = 1.0 / s;
+            let n = (r + 0.5) as i64;
+            if (r - n as f64).abs() < 0.05 {
+                return 1.0 / n as f64;
+            }
+        }
+        s
+    };
+    (snap(sx), snap(sy))
+}
+
+/// Kernel parameters for a widened warp: the scale the kernel is evaluated
+/// at and the support radius, per axis.
+#[derive(Debug, Clone, Copy)]
+struct Widened {
+    alg: ResampleAlg,
+    sx: f64,
+    sy: f64,
+    rx: i64,
+    ry: i64,
+}
+
+/// Lanczos at its native support. GDAL runs lanczos through the same
+/// clipped, renormalised kernel at every scale (`GWKResampleOptimizedLanczos`,
+/// gdalwarpkernel.cpp ~L4188).
+const LANCZOS_POINT: Widened = Widened { alg: ResampleAlg::Lanczos, sx: 1.0, sy: 1.0, rx: 3, ry: 3 };
+
+impl Widened {
+    /// `None` when GDAL would use the point kernel at this scale.
+    fn new(alg: ResampleAlg, sx: f64, sy: f64) -> Option<Self> {
+        let widen = match alg {
+            ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode => false,
+            ResampleAlg::Bilinear | ResampleAlg::Cubic => !(sx > 0.5 && sy > 0.5),
+            ResampleAlg::Lanczos => sx < 1.0 || sy < 1.0,
+        };
+        if !widen {
+            return None;
+        }
+        let f = alg.radius() as f64;
+        let radius = |s: f64| if s < 1.0 { (f / s).ceil() as i64 } else { f as i64 };
+        Some(Widened { alg, sx: sx.min(1.0), sy: sy.min(1.0), rx: radius(sx), ry: radius(sy) })
     }
 }
 
@@ -121,6 +481,15 @@ pub fn warp_resample(
             src_col_off, src_row_off, dst_ncol, dst_nrow, nodata,
             lanczos_sample,
         ),
+        // Area methods have one implementation, the generic one.
+        ResampleAlg::Average | ResampleAlg::Mode => {
+            let src = SourceBuffer {
+                data: src_pixels, ncol: src_ncol, nrow: src_nrow, nbands: 1,
+                col_off: src_col_off, row_off: src_row_off,
+            };
+            let opts = WarpOptions { alg, nodata: Some(nodata), ..Default::default() };
+            warp(transformer, &src, dst_ncol, dst_nrow, &opts)
+        }
     }
 }
 
@@ -215,15 +584,15 @@ fn warp_interpolated(
             let buf_x = src_x[dst_col] - src_col_off as f64;
             let buf_y = src_y[dst_col] - src_row_off as f64;
 
-            // Quick bounds check: is the pixel centre even near the buffer?
-            if buf_x < -0.5 || buf_x >= src_ncol as f64 + 0.5
-                || buf_y < -0.5 || buf_y >= src_nrow as f64 + 0.5
-            {
-                continue;
-            }
+            // Sample points outside [0, n) are off the source
+            // (GWKCheckAndComputeSrcOffsets).
+            let Some((cx, cy)) = centre_pixel(buf_x, buf_y, src_ncol, src_nrow) else { continue };
+
+            // Centre on a nodata pixel: no value (GWKRealCaseThread ~L5680).
+            if src_pixels[cy * src_ncol + cx] == nodata { continue; }
 
             if let Some(val) = sample_fn(src_pixels, src_ncol, src_nrow, buf_x, buf_y, nodata) {
-                output[dst_row * dst_ncol + dst_col] = gdal_round(val);
+                output[dst_row * dst_ncol + dst_col] = settle(gdal_round(val), Some(nodata));
             }
         }
     }
@@ -231,14 +600,12 @@ fn warp_interpolated(
     output
 }
 
-/// GDAL-style rounding: round half away from zero, matching GWKRoundValueT<int16>.
+/// GDAL's rounding into an integer working type: clamp, then round half up
+/// (`ClampRoundAndAvoidNoData` / `GWKClampValueT`, gdalwarpkernel.cpp
+/// ~L1587, ~L1856). The same as [`Sample::from_f64`] for `i32`.
 #[inline]
 fn gdal_round(v: f64) -> i32 {
-    if v >= 0.0 {
-        (v + 0.5) as i32
-    } else {
-        (v - 0.5) as i32
-    }
+    i32::from_f64(v)
 }
 
 // =========================================================================
@@ -416,7 +783,10 @@ fn lanczos_weight(x: f64) -> f64 {
 
 /// Lanczos interpolation at (buf_x, buf_y).
 ///
-/// Separable 6×6 kernel (radius 3). Falls back to cubic at edges.
+/// GDAL equivalent: GWKResampleOptimizedLanczos (gdalwarpkernel.cpp
+/// ~L4188). Separable 6×6 kernel (radius 3) clipped to the buffer; nodata
+/// pixels are skipped and the result renormalised by the weight of the
+/// pixels used (no cubic fallback). None if that weight is below 1e-6.
 fn lanczos_sample(
     src: &[i32], ncol: usize, nrow: usize,
     buf_x: f64, buf_y: f64, nodata: i32,
@@ -425,63 +795,58 @@ fn lanczos_sample(
     let iy = (buf_y - 0.5).floor() as i64;
     let dx = buf_x - 0.5 - ix as f64;
     let dy = buf_y - 0.5 - iy as f64;
+    let (ncol_i, nrow_i) = (ncol as i64, nrow as i64);
+    let (i0, i1) = ((-2i64).max(-ix), 3i64.min(ncol_i - 1 - ix));
+    let (j0, j1) = ((-2i64).max(-iy), 3i64.min(nrow_i - 1 - iy));
 
-    // 6×6 neighbourhood: ix-2..ix+3, iy-2..iy+3
-    let x_start = ix - 2;
-    let y_start = iy - 2;
-    if x_start < 0 || x_start + 5 >= ncol as i64
-        || y_start < 0 || y_start + 5 >= nrow as i64
-    {
-        return cubic_sample(src, ncol, nrow, buf_x, buf_y, nodata);
-    }
-
-    // Compute and normalize weights
-    let mut wx = [0.0f64; 6];
-    let mut wy = [0.0f64; 6];
-    let mut wx_sum = 0.0;
-    let mut wy_sum = 0.0;
-    for i in 0..6 {
-        wx[i] = lanczos_weight(dx - (i as f64 - 2.0));
-        wy[i] = lanczos_weight(dy - (i as f64 - 2.0));
-        wx_sum += wx[i];
-        wy_sum += wy[i];
-    }
-    if wx_sum.abs() < 1e-10 || wy_sum.abs() < 1e-10 {
-        return None;
-    }
-    for w in &mut wx { *w /= wx_sum; }
-    for w in &mut wy { *w /= wy_sum; }
-
-    // Check for nodata, convolve
     let mut acc = 0.0;
-    for jj in 0..6usize {
-        let row_start = (y_start + jj as i64) as usize * ncol;
+    let mut wsum = 0.0;
+    for j in j0..=j1 {
+        let wy = lanczos_weight(j as f64 - dy);
+        let row_start = ((iy + j) * ncol_i + ix) as usize;
         let mut row_acc = 0.0;
-        for ii in 0..6usize {
-            let v = src[row_start + (x_start + ii as i64) as usize];
-            if v == nodata {
-                return cubic_sample(src, ncol, nrow, buf_x, buf_y, nodata);
-            }
-            row_acc += v as f64 * wx[ii];
+        let mut row_w = 0.0;
+        for i in i0..=i1 {
+            let v = src[(row_start as i64 + i) as usize];
+            if v == nodata { continue; }
+            let wx = lanczos_weight(i as f64 - dx);
+            row_acc += v as f64 * wx;
+            row_w += wx;
         }
-        acc += row_acc * wy[jj];
+        acc += row_acc * wy;
+        wsum += row_w * wy;
     }
-
+    if wsum < 1e-6 { return None; }
+    if !(0.99999..=1.00001).contains(&wsum) { acc /= wsum; }
     Some(acc)
 }
 
 // =========================================================================
-// Interleaved u8 (multi-band, one pass)
+// Generic interleaved kernel (any Sample type, multi-band, one pass)
 // =========================================================================
 
 /// A pixel sample type the generic kernel can resample.
 ///
-/// Integer types round half away from zero (GDAL's `GWKRoundValueT`) and
-/// saturate at the type's range; floats pass through and treat NaN as
-/// nodata.
-pub trait Sample: Copy + PartialEq + 'static {
+/// The kernels compute in `f64` and convert back with [`Sample::from_f64`].
+/// Integer types clamp to the type's range and then round half up,
+/// `floor(v + 0.5)`, which is what GDAL does when the warp's working type
+/// is an integer type (`ClampRoundAndAvoidNoData`, gdalwarpkernel.cpp
+/// ~L1856): -2.5 becomes -2. Floats pass through and treat NaN as nodata.
+///
+/// rwarp has one type for source and destination. gdalwarp works in the
+/// union of the source, destination and nodata types, so a floating source
+/// warped into an integer output is resampled as float and rounded on write
+/// by `GDALCopyWords`, half away from zero (-2.5 becomes -3); with rwarp
+/// that conversion is the caller's.
+pub trait Sample: Copy + PartialOrd + 'static {
     fn to_f64(self) -> f64;
+    /// Convert a resampled value; see the trait documentation.
     fn from_f64(v: f64) -> Self;
+    /// The nearest value next to `self`, used to move a resampled value off
+    /// the nodata value: one less for integers (one more at the type's
+    /// minimum), the next float up (down at the maximum). GDAL's
+    /// `AvoidNoData`, gdalwarpkernel.cpp ~L1613.
+    fn step_off(self) -> Self;
     /// The value written for unmapped / nodata destination pixels when no
     /// nodata value is given.
     fn zero() -> Self;
@@ -494,8 +859,12 @@ macro_rules! int_sample {
         impl Sample for $t {
             #[inline] fn to_f64(self) -> f64 { self as f64 }
             #[inline] fn from_f64(v: f64) -> Self {
-                let r = if v >= 0.0 { (v + 0.5).floor() } else { (v - 0.5).ceil() };
-                r.clamp(<$t>::MIN as f64, <$t>::MAX as f64) as $t
+                // Clamping after the floor gives the same result as GDAL's
+                // clamp-then-round; NaN casts to 0.
+                (v + 0.5).floor().clamp(<$t>::MIN as f64, <$t>::MAX as f64) as $t
+            }
+            #[inline] fn step_off(self) -> Self {
+                if self == <$t>::MIN { <$t>::MIN + 1 } else { self - 1 }
             }
             #[inline] fn zero() -> Self { 0 }
         }
@@ -506,34 +875,151 @@ int_sample!(u8, i8, u16, i16, u32, i32);
 impl Sample for f32 {
     #[inline] fn to_f64(self) -> f64 { self as f64 }
     #[inline] fn from_f64(v: f64) -> Self { v as f32 }
+    #[inline] fn step_off(self) -> Self { if self == f32::MAX { self.next_down() } else { self.next_up() } }
     #[inline] fn zero() -> Self { 0.0 }
     #[inline] fn is_nan(self) -> bool { self.is_nan() }
 }
 impl Sample for f64 {
     #[inline] fn to_f64(self) -> f64 { self }
     #[inline] fn from_f64(v: f64) -> Self { v }
+    #[inline] fn step_off(self) -> Self { if self == f64::MAX { self.next_down() } else { self.next_up() } }
     #[inline] fn zero() -> Self { 0.0 }
     #[inline] fn is_nan(self) -> bool { self.is_nan() }
 }
 
+/// The source pixel under a sample point, or `None` if the point is off the
+/// buffer: GDAL tests the coordinate against `[0, n)` before truncating, so
+/// `(-1, 0)` is outside, not pixel 0 (`GWKCheckAndComputeSrcOffsets`,
+/// gdalwarpkernel.cpp ~L5251).
+#[inline]
+fn centre_pixel(buf_x: f64, buf_y: f64, ncol: usize, nrow: usize) -> Option<(usize, usize)> {
+    if buf_x < 0.0 || buf_y < 0.0 || buf_x + 1.0e-10 > ncol as f64 || buf_y + 1.0e-10 > nrow as f64 {
+        return None;
+    }
+    let cx = ((buf_x + 1.0e-10) as usize).min(ncol - 1);
+    let cy = ((buf_y + 1.0e-10) as usize).min(nrow - 1);
+    Some((cx, cy))
+}
+
+/// A resampled value that lands on the nodata value is moved off it, so it
+/// does not read back as missing (GDAL's `AvoidNoData`, which also warns).
+#[inline]
+fn settle<T: Sample>(v: T, nodata: Option<T>) -> T {
+    match nodata {
+        Some(nd) if v == nd => v.step_off(),
+        _ => v,
+    }
+}
+
 /// Warp a pixel-interleaved image of any [`Sample`] type in a single pass.
 ///
-/// Layout is `(row, col, band)`; `nbands = 1` is a plain single-band raster.
 /// Each destination pixel is transformed once and the kernel weights are
-/// computed once, then applied to every band from contiguous memory. Same
-/// weights, edge fallbacks (lanczos -> cubic -> bilinear) and rounding as
-/// [`warp_resample`], so single-band integer output is identical to it.
+/// computed once, then applied to every band from contiguous memory. With
+/// [`KernelScaling::Point`] (or at scales where GDAL does not widen) the
+/// weights, edge fallbacks (lanczos -> cubic -> bilinear) and rounding are
+/// those of [`warp_resample`], so single-band integer output is identical
+/// to it.
 ///
 /// Validity is per pixel. A source pixel is nodata if any of:
-/// - `mask_band` is given and the pixel's value in that band is zero
+/// - `opts.mask_band` is given and the pixel's value in that band is zero
 ///   (an alpha band);
-/// - `nodata` is given and any band of the pixel equals it;
+/// - `opts.nodata` is given and any band of the pixel equals it;
 /// - any band is NaN (floating types).
 ///
 /// Destination pixels that are unmapped or land on nodata are written as
-/// `nodata` if given, else [`Sample::zero`]. With a `mask_band`, the mask
+/// `opts.nodata` if given, else [`Sample::zero`]. With a mask band, the mask
 /// band of the output is itself resampled like any other band, so an alpha
 /// channel survives the warp.
+///
+/// Returns `dst_ncol * dst_nrow * src.nbands` values, interleaved.
+pub fn warp<T: Sample>(
+    transformer: &impl Transformer,
+    src: &SourceBuffer<'_, T>,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions<T>,
+) -> Vec<T> {
+    let nbands = src.nbands;
+    assert_eq!(src.data.len(), src.ncol * src.nrow * nbands, "source buffer size mismatch");
+    assert!(opts.mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
+
+    let img = Interleaved {
+        src: src.data, ncol: src.ncol, nrow: src.nrow, nb: nbands,
+        mask: opts.mask_band, nodata: opts.nodata,
+    };
+    let alg = opts.alg;
+    let (sx, sy) = match opts.scaling {
+        KernelScaling::Point => (1.0, 1.0),
+        KernelScaling::WidenWhenDownsampling => {
+            estimate_scale(transformer, dst_ncol, dst_nrow, opts.dst_col_off, opts.dst_row_off)
+        }
+        KernelScaling::Fixed { x, y } => (x, y),
+    };
+    if matches!(alg, ResampleAlg::Average | ResampleAlg::Mode) {
+        return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy));
+    }
+    let widened = Widened::new(alg, sx, sy);
+
+    let fill = opts.nodata.unwrap_or_else(T::zero);
+    let mut out = vec![fill; dst_ncol * dst_nrow * nbands];
+    let mut acc = vec![0.0f64; nbands];
+    let mut row_acc = vec![0.0f64; nbands];
+    let mut wx: Vec<f64> = Vec::new();
+
+    for dst_row in 0..dst_nrow {
+        let (src_x, src_y, ok) =
+            transform_scanline(transformer, dst_row, dst_ncol, opts.dst_col_off, opts.dst_row_off);
+
+        for dst_col in 0..dst_ncol {
+            if !ok[dst_col] { continue; }
+            let buf_x = src_x[dst_col] - src.col_off as f64;
+            let buf_y = src_y[dst_col] - src.row_off as f64;
+            let o = (dst_row * dst_ncol + dst_col) * nbands;
+
+            if alg == ResampleAlg::NearestNeighbour {
+                // Test before casting, as GDAL does, so (-1, 0) is not
+                // truncated to pixel 0.
+                if buf_x < 0.0 || buf_y < 0.0 { continue; }
+                let bc = (buf_x + 1.0e-10) as i64;
+                let br = (buf_y + 1.0e-10) as i64;
+                if bc < 0 || bc >= src.ncol as i64 || br < 0 || br >= src.nrow as i64 { continue; }
+                let p = br as usize * src.ncol + bc as usize;
+                if !img.valid(p) { continue; }
+                out[o..o + nbands].copy_from_slice(img.px(p));
+                continue;
+            }
+
+            // Sample points outside [0, n) are off the source
+            // (GWKCheckAndComputeSrcOffsets).
+            let Some((cx, cy)) = centre_pixel(buf_x, buf_y, src.ncol, src.nrow) else { continue };
+
+            // GDAL skips a destination pixel whose centre lands on an
+            // invalid source pixel before any kernel runs
+            // (GWKRealCaseThread, gdalwarpkernel.cpp ~L5680).
+            if !img.valid(cy * src.ncol + cx) { continue; }
+
+            let hit = match (widened, alg) {
+                (Some(w), _) => img.widened(buf_x, buf_y, &w, &mut acc, &mut row_acc, &mut wx),
+                (None, ResampleAlg::Bilinear) => img.bilinear(buf_x, buf_y, &mut acc),
+                (None, ResampleAlg::Cubic) => img.cubic(buf_x, buf_y, &mut acc, &mut row_acc),
+                (None, ResampleAlg::Lanczos) => {
+                    img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut acc, &mut row_acc, &mut wx)
+                }
+                (None, ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode) => unreachable!(),
+            };
+            if hit {
+                for b in 0..nbands {
+                    out[o + b] = settle(T::from_f64(acc[b]), opts.nodata);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The 0.1 entry point: [`warp`] with point kernels
+/// ([`KernelScaling::Point`]), as it behaved before widening.
+#[deprecated(since = "0.2.0", note = "use `warp` with `WarpOptions`")]
 #[allow(clippy::too_many_arguments)]
 pub fn warp_resample_t<T: Sample>(
     transformer: &impl Transformer,
@@ -549,65 +1035,14 @@ pub fn warp_resample_t<T: Sample>(
     mask_band: Option<usize>,
     alg: ResampleAlg,
 ) -> Vec<T> {
-    assert_eq!(src.len(), src_ncol * src_nrow * nbands, "source buffer size mismatch");
-    assert!(mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
-
-    let img = Interleaved { src, ncol: src_ncol, nrow: src_nrow, nb: nbands, mask: mask_band, nodata };
-    let fill = nodata.unwrap_or_else(T::zero);
-    let mut out = vec![fill; dst_ncol * dst_nrow * nbands];
-    let mut acc = vec![0.0f64; nbands];
-    let mut row_acc = vec![0.0f64; nbands];
-
-    for dst_row in 0..dst_nrow {
-        let (src_x, src_y, ok) = transform_scanline(transformer, dst_row, dst_ncol, 0, 0);
-
-        for dst_col in 0..dst_ncol {
-            if !ok[dst_col] { continue; }
-            let buf_x = src_x[dst_col] - src_col_off as f64;
-            let buf_y = src_y[dst_col] - src_row_off as f64;
-            let o = (dst_row * dst_ncol + dst_col) * nbands;
-
-            if alg == ResampleAlg::NearestNeighbour {
-                // Test before casting, as GDAL does, so (-1, 0) is not
-                // truncated to pixel 0.
-                if buf_x < 0.0 || buf_y < 0.0 { continue; }
-                let bc = (buf_x + 1.0e-10) as i64;
-                let br = (buf_y + 1.0e-10) as i64;
-                if bc < 0 || bc >= src_ncol as i64 || br < 0 || br >= src_nrow as i64 { continue; }
-                let p = br as usize * src_ncol + bc as usize;
-                if !img.valid(p) { continue; }
-                out[o..o + nbands].copy_from_slice(img.px(p));
-                continue;
-            }
-
-            if buf_x < -0.5 || buf_x >= src_ncol as f64 + 0.5
-                || buf_y < -0.5 || buf_y >= src_nrow as f64 + 0.5
-            {
-                continue;
-            }
-
-            let hit = match alg {
-                ResampleAlg::Bilinear => img.bilinear(buf_x, buf_y, &mut acc),
-                ResampleAlg::Cubic => img.cubic(buf_x, buf_y, &mut acc, &mut row_acc),
-                ResampleAlg::Lanczos => img.lanczos(buf_x, buf_y, &mut acc, &mut row_acc),
-                ResampleAlg::NearestNeighbour => unreachable!(),
-            };
-            if hit {
-                for b in 0..nbands {
-                    out[o + b] = T::from_f64(acc[b]);
-                }
-            }
-        }
-    }
-    out
+    let buf = SourceBuffer { data: src, ncol: src_ncol, nrow: src_nrow, nbands, col_off: src_col_off, row_off: src_row_off };
+    let opts = WarpOptions { alg, scaling: KernelScaling::Point, nodata, mask_band, ..Default::default() };
+    warp(transformer, &buf, dst_ncol, dst_nrow, &opts)
 }
 
-/// Warp a pixel-interleaved `u8` image (RGB, RGBA, ...) in a single pass.
-/// If `alpha_band` is given, source pixels with alpha 0 are nodata and
-/// unmapped destination pixels come back all-zero (transparent).
-///
-/// This is [`warp_resample_t`] with no nodata value and `alpha_band` as the
-/// mask band.
+/// The 0.1 interleaved `u8` entry point: [`warp`] with point kernels, no
+/// nodata value and `alpha_band` as the mask band.
+#[deprecated(since = "0.2.0", note = "use `warp` with `WarpOptions`")]
 #[allow(clippy::too_many_arguments)]
 pub fn warp_resample_u8(
     transformer: &impl Transformer,
@@ -622,6 +1057,7 @@ pub fn warp_resample_u8(
     alpha_band: Option<usize>,
     alg: ResampleAlg,
 ) -> Vec<u8> {
+    #[allow(deprecated)]
     warp_resample_t(
         transformer, src, src_ncol, src_nrow, nbands, src_col_off, src_row_off,
         dst_ncol, dst_nrow, None, alpha_band, alg,
@@ -719,32 +1155,58 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         self.convolve(ix - 1, iy - 1, &wx, &wy, acc, row_acc) || self.bilinear(buf_x, buf_y, acc)
     }
 
-    /// Mirrors `lanczos_sample`, including its cubic fallback.
-    fn lanczos(&self, buf_x: f64, buf_y: f64, acc: &mut [f64], row_acc: &mut [f64]) -> bool {
+    /// Kernel widened by the downsampling scale (GDAL's `GWKResample`,
+    /// gdalwarpkernel.cpp ~L4027, and `GWKResampleNoMasksT` ~L4840).
+    ///
+    /// The window is `1 - r ..= r` around the pixel below-left of the
+    /// sample point, clipped to the buffer; weights are the kernel at
+    /// `(i - delta) * scale`. Nodata pixels are skipped and the result is
+    /// normalised by the weight of the pixels used; false if that is below
+    /// 1e-6.
+    fn widened(
+        &self, buf_x: f64, buf_y: f64, w: &Widened,
+        acc: &mut [f64], row_acc: &mut [f64], wx: &mut Vec<f64>,
+    ) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
+        let (ncol, nrow) = (self.ncol as i64, self.nrow as i64);
+
+        // For bilinear and cubic GDAL declines a centre past the buffer, or
+        // a support wider than the buffer, and uses the 4-sample bilinear
+        // formula instead (GWKResampleNoMasksT).
+        if w.alg != ResampleAlg::Lanczos && (ix >= ncol || iy >= nrow || w.rx > ncol || w.ry > nrow) {
+            return self.bilinear(buf_x, buf_y, acc);
+        }
         let dx = buf_x - 0.5 - ix as f64;
         let dy = buf_y - 0.5 - iy as f64;
-        let (x0, y0) = (ix - 2, iy - 2);
+        let (i0, i1) = ((1 - w.rx).max(-ix), w.rx.min(ncol - 1 - ix));
+        let (j0, j1) = ((1 - w.ry).max(-iy), w.ry.min(nrow - 1 - iy));
 
-        if x0 < 0 || x0 + 5 >= self.ncol as i64 || y0 < 0 || y0 + 5 >= self.nrow as i64 {
-            return self.cubic(buf_x, buf_y, acc, row_acc);
-        }
+        wx.clear();
+        wx.extend((i0..=i1).map(|i| w.alg.weight((i as f64 - dx) * w.sx)));
 
-        let mut wx = [0.0f64; 6];
-        let mut wy = [0.0f64; 6];
-        let (mut sx, mut sy) = (0.0, 0.0);
-        for i in 0..6 {
-            wx[i] = lanczos_weight(dx - (i as f64 - 2.0));
-            wy[i] = lanczos_weight(dy - (i as f64 - 2.0));
-            sx += wx[i];
-            sy += wy[i];
+        for v in acc.iter_mut() { *v = 0.0; }
+        let mut wsum = 0.0;
+        let nb = self.nb;
+        for j in j0..=j1 {
+            let wy = w.alg.weight((j as f64 - dy) * w.sy);
+            for v in row_acc.iter_mut() { *v = 0.0; }
+            let mut row_w = 0.0;
+            let start = (((iy + j) * ncol + ix + i0) as usize) * nb;
+            let run = &self.src[start..start + wx.len() * nb];
+            for (pix, &wxi) in run.chunks_exact(nb).zip(wx.iter()) {
+                if !self.valid_px(pix) { continue; }
+                for (r, &v) in row_acc.iter_mut().zip(pix) { *r += v.to_f64() * wxi; }
+                row_w += wxi;
+            }
+            for (o, &r) in acc.iter_mut().zip(row_acc.iter()) { *o += r * wy; }
+            wsum += row_w * wy;
         }
-        if sx.abs() < 1e-10 || sy.abs() < 1e-10 { return false; }
-        for w in &mut wx { *w /= sx; }
-        for w in &mut wy { *w /= sy; }
-        // Any nodata in the 6x6 window: fall back to cubic (matches GDAL).
-        self.convolve(x0, y0, &wx, &wy, acc, row_acc) || self.cubic(buf_x, buf_y, acc, row_acc)
+        if wsum < 1e-6 { return false; }
+        if !(0.99999..=1.00001).contains(&wsum) {
+            for v in acc.iter_mut() { *v /= wsum; }
+        }
+        true
     }
 
     /// Separable convolution over an in-bounds window whose top-left source
@@ -767,6 +1229,357 @@ impl<'a, T: Sample> Interleaved<'a, T> {
             for (o, &r) in acc.iter_mut().zip(row_acc.iter()) { *o += r * wyj; }
         }
         true
+    }
+}
+
+// =========================================================================
+// Area methods (average, mode)
+// =========================================================================
+
+/// What an area method does with the valid source pixels under a
+/// destination pixel's footprint and their weights.
+trait AreaReducer<T: Sample> {
+    fn reset(&mut self);
+    fn add(&mut self, pix: &[T], w: f64);
+    /// Write the result for one destination pixel; false if there is none.
+    fn write(&self, out: &mut [T]) -> bool;
+}
+
+/// Running weighted mean per band (West's weighted incremental algorithm,
+/// as GDAL's average uses).
+struct AreaMean {
+    mean: Vec<f64>,
+    total: f64,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaMean {
+    fn reset(&mut self) {
+        self.mean.fill(0.0);
+        self.total = 0.0;
+    }
+
+    #[inline]
+    fn add(&mut self, pix: &[T], w: f64) {
+        self.total += w;
+        let f = w / self.total;
+        for (m, &v) in self.mean.iter_mut().zip(pix) {
+            *m += f * (v.to_f64() - *m);
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        if self.total <= 0.0 { return false; }
+        for (o, &v) in out.iter_mut().zip(&self.mean) { *o = T::from_f64(v); }
+        true
+    }
+}
+
+/// Weighted mode per band. Weights accumulate in `f32` like GDAL's
+/// `pafCounts`, so ties fall where GDAL's do. The mode is re-decided every
+/// time a value's count grows, including its first occurrence, which is
+/// GDAL's histogram path for 8- and 16-bit types (gdalwarpkernel.cpp
+/// ~L8115-8170); see [`ModeTies`] for how wider types differ in GDAL.
+struct AreaMode<T> {
+    ties: ModeTies,
+    /// Per band: distinct values and their counts, and the mode's index.
+    bins: Vec<Vec<(T, f32)>>,
+    mode: Vec<Option<usize>>,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaMode<T> {
+    fn reset(&mut self) {
+        for b in &mut self.bins { b.clear(); }
+        self.mode.fill(None);
+    }
+
+    fn add(&mut self, pix: &[T], w: f64) {
+        let w = w as f32;
+        for ((&v, bins), mode) in pix.iter().zip(&mut self.bins).zip(&mut self.mode) {
+            let i = match bins.iter().position(|b| b.0 == v) {
+                Some(i) => { bins[i].1 += w; i }
+                None => { bins.push((v, w)); bins.len() - 1 }
+            };
+            let better = match *mode {
+                None => true,
+                Some(m) => {
+                    let (c, cm) = (bins[i].1, bins[m].1);
+                    c > cm || (c == cm && match self.ties {
+                        ModeTies::First => false,
+                        ModeTies::Min => v < bins[m].0,
+                        ModeTies::Max => v > bins[m].0,
+                    })
+                }
+            };
+            if better { *mode = Some(i); }
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        if self.mode.iter().any(Option::is_none) { return false; }
+        for ((o, bins), m) in out.iter_mut().zip(&self.bins).zip(&self.mode) {
+            *o = bins[m.unwrap()].0;
+        }
+        true
+    }
+}
+
+/// Source window of a destination pixel under GDAL's box footprint
+/// (`GWKAverageOrModeComputeSourceCoords`, gdalwarpkernel.cpp ~L6919):
+/// fractional bounds in buffer pixels and the integer range they touch.
+#[derive(Debug, Clone, Copy)]
+struct SrcBox {
+    x0: f64, x1: f64, y0: f64, y1: f64,
+    ix0: i64, ix1: i64, iy0: i64, iy1: i64,
+    wrap: bool,
+}
+
+impl SrcBox {
+    /// GDAL's per-pixel weight: the fraction of the source pixel inside the
+    /// box along each axis (`COMPUTE_WEIGHT`, ~L6849). Only the first and
+    /// last row/column are partial. A box that overhangs the buffer edge
+    /// gives its edge pixel a weight above 1, as in GDAL.
+    #[inline]
+    fn weight(&self, ix: i64, iy: i64) -> f64 {
+        let wy = if iy == self.iy0 {
+            if self.iy0 + 1 == self.iy1 { 1.0 } else { 1.0 - (self.y0 - self.iy0 as f64) }
+        } else if iy + 1 == self.iy1 {
+            1.0 - (self.iy1 as f64 - self.y1)
+        } else {
+            1.0
+        };
+        if ix == self.ix0 {
+            if self.ix0 + 1 == self.ix1 { wy } else { wy * (1.0 - (self.x0 - self.ix0 as f64)) }
+        } else if ix + 1 == self.ix1 {
+            wy * (1.0 - (self.ix1 as f64 - self.x1))
+        } else {
+            wy
+        }
+    }
+}
+
+/// Warp with an area method, row by row.
+fn warp_area<T: Sample>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    src_off: (f64, f64),
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions<T>,
+    scale: (f64, f64),
+) -> Vec<T> {
+    let nb = img.nb;
+    match opts.alg {
+        ResampleAlg::Mode => {
+            let red = AreaMode { ties: opts.mode_ties, bins: vec![Vec::new(); nb], mode: vec![None; nb] };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
+        _ => {
+            let red = AreaMean { mean: vec![0.0; nb], total: 0.0 };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warp_area_with<T: Sample, R: AreaReducer<T>>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    src_off: (f64, f64),
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions<T>,
+    scale: (f64, f64),
+    mut red: R,
+) -> Vec<T> {
+    let nb = img.nb;
+    let fill = opts.nodata.unwrap_or_else(T::zero);
+    let mut out = vec![fill; dst_ncol * dst_nrow * nb];
+    for dst_row in 0..dst_nrow {
+        let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
+        match opts.footprint {
+            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, row_out),
+            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut red, row_out),
+        }
+    }
+    out
+}
+
+/// One destination row under GDAL's box footprint (`GWKAverageOrModeThread`
+/// and `GWKAverageOrModeComputeLineCoords`, gdalwarpkernel.cpp ~L6873-7030,
+/// ~L7960 for the average itself).
+#[allow(clippy::too_many_arguments)]
+fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    (col_off, row_off): (f64, f64),
+    dst_row: usize,
+    dst_ncol: usize,
+    opts: &WarpOptions<T>,
+    (sx, sy): (f64, f64),
+    red: &mut R,
+    row_out: &mut [T],
+) {
+    let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
+    // Top-left and bottom-right corners of every pixel in the row.
+    let mut x1: Vec<f64> = (0..dst_ncol).map(|c| c as f64 + xoff).collect();
+    let mut y1 = vec![yoff; dst_ncol];
+    let mut x2: Vec<f64> = (0..dst_ncol).map(|c| c as f64 + 1.0 + xoff).collect();
+    let mut y2 = vec![yoff + 1.0; dst_ncol];
+    let ok1 = transformer.transform(true, &mut x1, &mut y1);
+    let ok2 = transformer.transform(true, &mut x2, &mut y2);
+
+    let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
+    // Corners well outside the buffer are rejected (GDAL issue #2365).
+    let xmargin = 2.0 * 1f64.max((1.0 / sx).ceil());
+    let ymargin = 2.0 * 1f64.max((1.0 / sy).ceil());
+    const EPSILON: f64 = 1e-10;
+
+    for c in 0..dst_ncol {
+        if !(ok1[c] && ok2[c]) { continue; }
+        let in_range = |v: f64, off: f64, n: f64, m: f64| v - off >= -m && v - off - n <= m;
+        if !(in_range(x1[c], col_off, ncol as f64, xmargin) && in_range(x2[c], col_off, ncol as f64, xmargin)
+            && in_range(y1[c], row_off, nrow as f64, ymargin) && in_range(y2[c], row_off, nrow as f64, ymargin))
+        {
+            continue;
+        }
+        // The transform need not preserve ordering (GDAL #5433).
+        if x1[c] > x2[c] { std::mem::swap(&mut x1[c], &mut x2[c]); }
+
+        // A target pixel straddling the antimeridian maps to the two ends
+        // of the source row; GDAL detects it from the corners and a probe at
+        // the top-edge midpoint (#6478), and wraps the box past the right
+        // edge.
+        let mut wrap = false;
+        let threshold = 2i64.min(ncol / 10) as f64;
+        if col_off == 0.0 && c + 1 < dst_ncol
+            && 2.0 * x1[c] - x1[c + 1] < threshold
+            && ncol as f64 - x2[c] < threshold
+        {
+            let (mut px, mut py) = ([c as f64 + 0.5 + xoff], [yoff]);
+            let pok = transformer.transform(true, &mut px, &mut py);
+            if pok[0] && px[0] < x1[c] {
+                wrap = true;
+                std::mem::swap(&mut x1[c], &mut x2[c]);
+                x2[c] += ncol as f64;
+            }
+        }
+
+        let (bx0, bx1) = (x1[c] - col_off, x2[c] - col_off);
+        if !(bx1 > -EPSILON && bx0 < ncol as f64 + EPSILON) { continue; }
+        let ix0 = (bx0 + EPSILON).floor().max(0.0) as i64;
+        let mut ix1 = (bx1 - EPSILON).ceil().min(i32::MAX as f64) as i64;
+        if !wrap { ix1 = ix1.min(ncol); }
+        if ix0 == ix1 && ix1 < ncol { ix1 += 1; }
+
+        if y1[c] > y2[c] { std::mem::swap(&mut y1[c], &mut y2[c]); }
+        let (by0, by1) = (y1[c] - row_off, y2[c] - row_off);
+        if !(by1 > -EPSILON && by0 < nrow as f64 + EPSILON) { continue; }
+        let iy0 = (by0 + EPSILON).floor().max(0.0) as i64;
+        let mut iy1 = ((by1 - EPSILON).ceil() as i64).min(nrow);
+        if iy0 == iy1 && iy1 < nrow { iy1 += 1; }
+
+        let b = SrcBox { x0: bx0, x1: bx1, y0: by0, y1: by1, ix0, ix1, iy0, iy1, wrap };
+        red.reset();
+        for iy in b.iy0..b.iy1 {
+            for ix in b.ix0..b.ix1 {
+                let col = if b.wrap { ix % ncol } else { ix };
+                let p = (iy * ncol + col) as usize;
+                if !img.valid(p) { continue; }
+                let w = b.weight(ix, iy);
+                if w > 0.0 { red.add(img.px(p), w); }
+            }
+        }
+        let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
+        if red.write(px) {
+            for v in px.iter_mut() { *v = settle(*v, opts.nodata); }
+        }
+    }
+}
+
+/// One destination row under the exact footprint: each pixel's outline,
+/// densified and transformed, burned onto the source pixels it touches
+/// with exact coverage fractions.
+#[allow(clippy::too_many_arguments)]
+fn area_row_exact<T: Sample, R: AreaReducer<T>>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    (col_off, row_off): (f64, f64),
+    dst_row: usize,
+    dst_ncol: usize,
+    opts: &WarpOptions<T>,
+    densify: usize,
+    red: &mut R,
+    row_out: &mut [T],
+) {
+    use controlledburn::{burn, BurnOptions, Coord, Geometry, GridSpec, Polygon};
+
+    let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
+    let per = 4 * densify;
+    let mut xs = Vec::with_capacity(per * dst_ncol);
+    let mut ys = Vec::with_capacity(per * dst_ncol);
+    for c in 0..dst_ncol {
+        let (x0, y0) = (c as f64 + xoff, yoff);
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0 + t); ys.push(y0);             // top, left to right
+        }
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0 + 1.0); ys.push(y0 + t);       // right, downwards
+        }
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0 + 1.0 - t); ys.push(y0 + 1.0); // bottom, right to left
+        }
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0); ys.push(y0 + 1.0 - t);       // left, upwards
+        }
+    }
+    let ok = transformer.transform(true, &mut xs, &mut ys);
+
+    let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
+    for c in 0..dst_ncol {
+        let r = c * per..(c + 1) * per;
+        if !ok[r.clone()].iter().all(|&v| v) { continue; }
+        // Source pixel space, y flipped so that row 0 is at the top of the
+        // grid as controlledburn expects.
+        let mut ring: Vec<Coord> = xs[r.clone()].iter().zip(&ys[r])
+            .map(|(&x, &y)| Coord::new(x - col_off, -(y - row_off)))
+            .collect();
+        if !ring.iter().all(|p| p.is_finite()) { continue; }
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for p in &ring {
+            minx = minx.min(p.x); maxx = maxx.max(p.x);
+            miny = miny.min(-p.y); maxy = maxy.max(-p.y);
+        }
+        // Burn onto just the buffer pixels under the footprint's bbox.
+        // (Burning a whole row in one call measured no faster.)
+        let c0 = (minx.floor() as i64).max(0);
+        let c1 = (maxx.ceil() as i64).min(ncol);
+        let r0 = (miny.floor() as i64).max(0);
+        let r1 = (maxy.ceil() as i64).min(nrow);
+        if c0 >= c1 || r0 >= r1 { continue; }
+        ring.push(ring[0]);
+        let grid = GridSpec::new(c0 as f64, -(r1 as f64), c1 as f64, -(r0 as f64), (c1 - c0) as u32, (r1 - r0) as u32);
+        let Ok(res) = burn(&[Geometry::Polygon(Polygon::new(vec![ring]))], &grid, BurnOptions::coverage()) else { continue };
+
+        red.reset();
+        let at = |row: i32, col: i64| ((r0 + row as i64) * ncol + c0 + col) as usize;
+        for run in &res.runs {
+            for col in run.col_start..run.col_end {
+                let p = at(run.row, col as i64);
+                if img.valid(p) { red.add(img.px(p), 1.0); }
+            }
+        }
+        for e in &res.edges {
+            let p = at(e.row, e.col as i64);
+            if img.valid(p) && e.fraction > 0.0 { red.add(img.px(p), e.fraction as f64); }
+        }
+        let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
+        if red.write(px) {
+            for v in px.iter_mut() { *v = settle(*v, opts.nodata); }
+        }
     }
 }
 
@@ -826,6 +1639,18 @@ mod tests {
 
     // ---- interleaved kernel -------------------------------------------
 
+    /// [`warp`] with point kernels, the configuration the per-band
+    /// reference kernel implements.
+    #[allow(clippy::too_many_arguments)]
+    fn point<T: Sample>(
+        t: &impl Transformer, src: &[T], w: usize, h: usize, nbands: usize,
+        dw: usize, dh: usize, nodata: Option<T>, mask_band: Option<usize>, alg: ResampleAlg,
+    ) -> Vec<T> {
+        let buf = SourceBuffer { data: src, ncol: w, nrow: h, nbands, col_off: 0, row_off: 0 };
+        let opts = WarpOptions { alg, scaling: KernelScaling::Point, nodata, mask_band, ..Default::default() };
+        warp(t, &buf, dw, dh, &opts)
+    }
+
     /// Identity-ish transformer with a fractional offset and slight scale so
     /// every kernel path (including edges) is exercised.
     struct Shift;
@@ -859,7 +1684,7 @@ mod tests {
         let src = synthetic_rgba(w, h);
         let (dw, dh) = (37, 30);
         for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
-            let fast = warp_resample_u8(&Shift, &src, w, h, 4, 0, 0, dw, dh, Some(3), alg);
+            let fast = point(&Shift, &src, w, h, 4, dw, dh, None, Some(3), alg);
             for b in 0..4 {
                 let band: Vec<i32> = (0..w * h).map(|i| src[i * 4 + b] as i32).collect();
                 let slow = warp_resample(&Shift, &band, w, h, 0, 0, dw, dh, -1, alg);
@@ -882,7 +1707,7 @@ mod tests {
             fn transform(&self, _: bool, x: &mut [f64], _y: &mut [f64]) -> Vec<bool> { vec![true; x.len()] }
         }
         for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
-            let out = warp_resample_u8(&Id, &src, w, h, 4, 0, 0, w, h, Some(3), alg);
+            let out = point(&Id, &src, w, h, 4, w, h, None, Some(3), alg);
             // Hole is transparent...
             assert_eq!(out[(10 * w + 10) * 4 + 3], 0, "{alg:?}");
             // ...and a pixel well away from it is untouched under identity.
@@ -899,7 +1724,7 @@ mod tests {
         impl Transformer for Id {
             fn transform(&self, _: bool, x: &mut [f64], _y: &mut [f64]) -> Vec<bool> { vec![true; x.len()] }
         }
-        let out = warp_resample_u8(&Id, &src, w, h, 3, 0, 0, w, h, None, ResampleAlg::Bilinear);
+        let out = point(&Id, &src, w, h, 3, w, h, None, None, ResampleAlg::Bilinear);
         assert_eq!(out, src);
     }
 
@@ -913,7 +1738,7 @@ mod tests {
         for i in (0..w * h).step_by(37) { band[i] = -9999; }
         for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
             let reference = warp_resample(&Shift, &band, w, h, 0, 0, 37, 30, -9999, alg);
-            let generic = warp_resample_t(&Shift, &band, w, h, 1, 0, 0, 37, 30, Some(-9999), None, alg);
+            let generic = point(&Shift, &band, w, h, 1, 37, 30, Some(-9999), None, alg);
             assert_eq!(reference, generic, "{alg:?}");
         }
     }
@@ -924,8 +1749,8 @@ mod tests {
         let band: Vec<i32> = (0..w * h).map(|i| ((i * 31) % 200) as i32).collect();
         let bandf: Vec<f32> = band.iter().map(|&v| v as f32).collect();
         for alg in [ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Lanczos] {
-            let vi = warp_resample_t(&Shift, &band, w, h, 1, 0, 0, 20, 18, Some(-1), None, alg);
-            let vf = warp_resample_t(&Shift, &bandf, w, h, 1, 0, 0, 20, 18, Some(-1.0), None, alg);
+            let vi = point(&Shift, &band, w, h, 1, 20, 18, Some(-1), None, alg);
+            let vf = point(&Shift, &bandf, w, h, 1, 20, 18, Some(-1.0), None, alg);
             let mut fractional = 0;
             for i in 0..vi.len() {
                 if vi[i] == -1 { assert_eq!(vf[i], -1.0); continue; }
@@ -948,14 +1773,25 @@ mod tests {
             fn transform(&self, _: bool, x: &mut [f64], _y: &mut [f64]) -> Vec<bool> { vec![true; x.len()] }
         }
         for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear, ResampleAlg::Cubic] {
-            let out = warp_resample_t(&Id, &src, w, h, 1, 0, 0, w, h, Some(-9999.0), None, alg);
+            let out = point(&Id, &src, w, h, 1, w, h, Some(-9999.0), None, alg);
             assert_eq!(out[8 * w + 8], -9999.0, "{alg:?}: hole should be filled with nodata");
             assert_eq!(out[2 * w + 2], 10.0, "{alg:?}: flat field preserved");
             assert!(out.iter().all(|v| !v.is_nan()), "{alg:?}: NaN leaked into output");
         }
         // Without a nodata value the fill is zero.
-        let out = warp_resample_t(&Id, &src, w, h, 1, 0, 0, w, h, None, None, ResampleAlg::Bilinear);
+        let out = point(&Id, &src, w, h, 1, w, h, None, None, ResampleAlg::Bilinear);
         assert_eq!(out[8 * w + 8], 0.0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_entry_points_are_point_warps() {
+        let (w, h) = (24, 20);
+        let src = synthetic_rgba(w, h);
+        for alg in [ResampleAlg::Bilinear, ResampleAlg::Lanczos] {
+            let old = warp_resample_u8(&Shift, &src, w, h, 4, 0, 0, 10, 9, Some(3), alg);
+            assert_eq!(old, point(&Shift, &src, w, h, 4, 10, 9, None, Some(3), alg), "{alg:?}");
+        }
     }
 
     #[test]
@@ -963,7 +1799,10 @@ mod tests {
         assert_eq!(u16::from_f64(65535.7), 65535);
         assert_eq!(u16::from_f64(-3.0), 0);
         assert_eq!(u16::from_f64(2.5), 3);
-        assert_eq!(i16::from_f64(-2.5), -3);
+        assert_eq!(i16::from_f64(-2.5), -2);
+        assert_eq!(i16::from_f64(-2.6), -3);
+        assert_eq!(i8::from_f64(-200.0), -128);
+        assert_eq!(i32::from_f64(f64::NAN), 0);
         assert_eq!(i32::from_f64(-0.4), 0);
         assert_eq!(u8::from_f64(255.49), 255);
     }
