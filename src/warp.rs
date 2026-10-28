@@ -926,6 +926,53 @@ pub fn warp<T: Sample>(
     out
 }
 
+/// The 0.1 entry point: [`warp`] with point kernels
+/// ([`KernelScaling::Point`]), as it behaved before widening.
+#[deprecated(since = "0.2.0", note = "use `warp` with `WarpOptions`")]
+#[allow(clippy::too_many_arguments)]
+pub fn warp_resample_t<T: Sample>(
+    transformer: &impl Transformer,
+    src: &[T],
+    src_ncol: usize,
+    src_nrow: usize,
+    nbands: usize,
+    src_col_off: usize,
+    src_row_off: usize,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    nodata: Option<T>,
+    mask_band: Option<usize>,
+    alg: ResampleAlg,
+) -> Vec<T> {
+    let buf = SourceBuffer { data: src, ncol: src_ncol, nrow: src_nrow, nbands, col_off: src_col_off, row_off: src_row_off };
+    let opts = WarpOptions { alg, scaling: KernelScaling::Point, nodata, mask_band, ..Default::default() };
+    warp(transformer, &buf, dst_ncol, dst_nrow, &opts)
+}
+
+/// The 0.1 interleaved `u8` entry point: [`warp`] with point kernels, no
+/// nodata value and `alpha_band` as the mask band.
+#[deprecated(since = "0.2.0", note = "use `warp` with `WarpOptions`")]
+#[allow(clippy::too_many_arguments)]
+pub fn warp_resample_u8(
+    transformer: &impl Transformer,
+    src: &[u8],
+    src_ncol: usize,
+    src_nrow: usize,
+    nbands: usize,
+    src_col_off: usize,
+    src_row_off: usize,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    alpha_band: Option<usize>,
+    alg: ResampleAlg,
+) -> Vec<u8> {
+    #[allow(deprecated)]
+    warp_resample_t(
+        transformer, src, src_ncol, src_nrow, nbands, src_col_off, src_row_off,
+        dst_ncol, dst_nrow, None, alpha_band, alg,
+    )
+}
+
 /// View over a pixel-interleaved buffer with per-pixel validity.
 struct Interleaved<'a, T: Sample> {
     src: &'a [T],
@@ -1558,6 +1605,17 @@ mod tests {
         // Without a nodata value the fill is zero.
         let out = point(&Id, &src, w, h, 1, w, h, None, None, ResampleAlg::Bilinear);
         assert_eq!(out[8 * w + 8], 0.0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_entry_points_are_point_warps() {
+        let (w, h) = (24, 20);
+        let src = synthetic_rgba(w, h);
+        for alg in [ResampleAlg::Bilinear, ResampleAlg::Lanczos] {
+            let old = warp_resample_u8(&Shift, &src, w, h, 4, 0, 0, 10, 9, Some(3), alg);
+            assert_eq!(old, point(&Shift, &src, w, h, 4, 10, 9, None, Some(3), alg), "{alg:?}");
+        }
     }
 
     #[test]
