@@ -2,7 +2,7 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
-## Unreleased (0.3.0)
+## 0.3.0 (2026-10-28)
 
 This release changes the API: options types are `#[non_exhaustive]`.
 
