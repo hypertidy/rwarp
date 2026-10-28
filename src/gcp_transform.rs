@@ -25,7 +25,7 @@
 //! ## Integration with the warp pipeline
 //!
 //! `GcpTransformer` implements [`crate::Transformer`], so it composes with
-//! `ApproxTransformer`, `compute_source_window`, `collect_chunk_list`, and
+//! `ApproxTransformer`, `compute_source_window`, `plan_chunks`, and
 //! `warp_resample` identically to `GenImgProjTransformer`. A GCP-warped
 //! source is planned and executed with the same API as a geotransform-based
 //! source:
@@ -33,8 +33,8 @@
 //! ```rust,ignore
 //! let gcp_t = GcpTransformer::new(&pixel, &line, &geo_x, &geo_y, 0)?;
 //! let approx_t = ApproxTransformer::new(gcp_t, 0.125);
-//! let chunks = collect_chunk_list(&approx_t, src_size, dst_off, dst_size,
-//!                                  1, 0.5, 8, None);
+//! let plan = plan_chunks(&approx_t, src_size, dst_size,
+//!                        &ChunkOptions::new(ResampleAlg::Bilinear));
 //! ```
 //!
 //! ## Limitations vs GDAL
