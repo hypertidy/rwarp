@@ -323,7 +323,8 @@ pub enum Footprint {
     /// with the source pixels (coverage fractions from
     /// [`controlledburn::CoverageWindow`], rounded to `f32`). With
     /// renormalisation over valid pixels this is first-order conservative
-    /// remapping. No antimeridian handling.
+    /// remapping. No antimeridian handling. The same overlaps, unrounded,
+    /// are available as a table from [`crate::weights::exact_weights`].
     Exact { densify: usize },
 }
 
@@ -1844,7 +1845,7 @@ pub fn warp_to<S: Sample, D: Sample>(
 
 /// Writing results: the working type, the destination nodata per band, and
 /// the fill.
-struct Output<D> {
+pub(crate) struct Output<D> {
     working: Working,
     src_nd: Vec<Option<f64>>,
     dst_nd: Vec<Option<f64>>,
@@ -1853,8 +1854,12 @@ struct Output<D> {
 
 impl<D: Sample> Output<D> {
     fn new(src_dt: DataType, nb: usize, opts: &WarpOptions) -> Self {
-        let mut src_nd = opts.src_nodata.per_band(nb);
-        let dst_nd = match &opts.dst_nodata {
+        Self::from_nodata(src_dt, nb, &opts.src_nodata, &opts.dst_nodata)
+    }
+
+    pub(crate) fn from_nodata(src_dt: DataType, nb: usize, src_nodata: &Nodata, dst_nodata: &DstNodata) -> Self {
+        let mut src_nd = src_nodata.per_band(nb);
+        let dst_nd = match dst_nodata {
             DstNodata::FromSource => src_nd.clone(),
             DstNodata::None => vec![None; nb],
             DstNodata::Value(v) => vec![Some(*v); nb],
@@ -1876,13 +1881,13 @@ impl<D: Sample> Output<D> {
     }
 
     /// The source nodata as `S`, per band, where representable.
-    fn src_nodata<S: Sample>(&self) -> Vec<Option<S>> {
+    pub(crate) fn src_nodata<S: Sample>(&self) -> Vec<Option<S>> {
         self.src_nd.iter()
             .map(|v| v.filter(|&v| S::DATA_TYPE.is_exact(v)).map(S::from_f64))
             .collect()
     }
 
-    fn filled(&self, npix: usize) -> Vec<D> {
+    pub(crate) fn filled(&self, npix: usize) -> Vec<D> {
         let nb = self.fill.len();
         (0..npix * nb).map(|i| self.fill[i % nb]).collect()
     }
@@ -1926,7 +1931,7 @@ impl<D: Sample> Output<D> {
 
     /// A reducer's result for band `b`, if any.
     #[inline]
-    fn result<S: Sample>(&self, r: Res<S>, b: usize) -> Option<D> {
+    pub(crate) fn result<S: Sample>(&self, r: Res<S>, b: usize) -> Option<D> {
         match r {
             Res::None => None,
             Res::Computed(v) => Some(self.computed(v, b)),
@@ -1984,22 +1989,22 @@ pub fn warp_resample_u8(
 }
 
 /// View over a pixel-interleaved buffer with per-band validity.
-struct Interleaved<'a, T: Sample> {
-    src: &'a [T],
-    ncol: usize,
-    nrow: usize,
-    nb: usize,
-    mask: Option<usize>,
+pub(crate) struct Interleaved<'a, T: Sample> {
+    pub(crate) src: &'a [T],
+    pub(crate) ncol: usize,
+    pub(crate) nrow: usize,
+    pub(crate) nb: usize,
+    pub(crate) mask: Option<usize>,
     /// Source nodata per band, where representable in `T`.
-    nodata: Vec<Option<T>>,
-    rule: BandNodata,
+    pub(crate) nodata: Vec<Option<T>>,
+    pub(crate) rule: BandNodata,
     /// The cutline's density per buffer pixel, if one is in use.
-    cut: Option<Cut<'a>>,
+    pub(crate) cut: Option<Cut<'a>>,
 }
 
 /// A cutline's density over the source buffer and how the kernels use it.
 #[derive(Clone, Copy)]
-struct Cut<'a> {
+pub(crate) struct Cut<'a> {
     density: &'a [f32],
     /// [`CutlineRule::Exact`]: densities are coverage weights.
     exact: bool,
@@ -2149,7 +2154,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     /// above `BAND_DENSITY_THRESHOLD`, at its full weight. Under the exact
     /// rule the pixel's covered part counts with weight `w c` and the rest,
     /// `w (1 - c)`, as invalid (which only the average thresholds see).
-    fn reduce<R: AreaReducer<T>>(&self, red: &mut R, p: usize, w: f64, band_ok: &mut [bool]) {
+    pub(crate) fn reduce<R: AreaReducer<T>>(&self, red: &mut R, p: usize, w: f64, band_ok: &mut [bool]) {
         let pix = self.px(p);
         let mut pixel_ok = self.pixel_ok(pix);
         if let Some(c) = self.cut {
@@ -2411,7 +2416,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 
 /// What an area method does with the source pixels under a destination
 /// pixel's footprint and their weights.
-trait AreaReducer<T: Sample> {
+pub(crate) trait AreaReducer<T: Sample> {
     fn reset(&mut self);
     /// A source pixel with weight `w > 0`: `pixel_ok` is the whole-pixel
     /// validity, `band_ok` the per-band validity (see [`BandNodata`]).
@@ -2424,7 +2429,7 @@ trait AreaReducer<T: Sample> {
 /// working type like any resampled value), a source value (copied
 /// exactly), or none.
 #[derive(Debug, Clone, Copy)]
-enum Res<T> {
+pub(crate) enum Res<T> {
     None,
     Computed(f64),
     Copied(T),
@@ -2432,9 +2437,9 @@ enum Res<T> {
 
 /// Running weighted mean per band over its valid pixels (West's weighted
 /// incremental algorithm, as GDAL's average uses).
-struct AreaMean {
-    mean: Vec<f64>,
-    total: Vec<f64>,
+pub(crate) struct AreaMean {
+    pub(crate) mean: Vec<f64>,
+    pub(crate) total: Vec<f64>,
 }
 
 impl<T: Sample> AreaReducer<T> for AreaMean {
@@ -2758,7 +2763,9 @@ fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
     let mut out = out_spec.filled(dst_ncol * dst_nrow);
     let mut row_res: Vec<Res<T>> = vec![Res::None; dst_ncol * nb];
     let mut exact = match opts.footprint {
-        Footprint::Exact { densify } => Some(Lattice::new(transformer, dst_ncol, densify.max(1), opts)),
+        Footprint::Exact { densify } => {
+            Some(Lattice::new(transformer, dst_ncol, densify.max(1), (opts.dst_col_off, opts.dst_row_off)))
+        }
         Footprint::GdalBox => None,
     };
     for dst_row in 0..dst_nrow {
@@ -2886,7 +2893,11 @@ impl LatticeLine {
 /// rather than twice, and each row line goes to the transformer as a real
 /// scanline (constant y, increasing x), the shape an
 /// [`ApproxTransformer`](crate::approx::ApproxTransformer) interpolates.
-struct Lattice {
+///
+/// Shared by the exact footprint of [`warp`] and by
+/// [`crate::weights::exact_weights`]: both walk it the same way and
+/// measure each pixel with [`Lattice::cover`].
+pub(crate) struct Lattice {
     densify: usize,
     ncol: usize,
     xoff: f64,
@@ -2901,17 +2912,32 @@ struct Lattice {
     vert: LatticeLine,
     /// Scratch for one interior level.
     level: LatticeLine,
-    /// Scratch: one pixel's outline, and its coverage window.
-    rx: Vec<f64>,
-    ry: Vec<f64>,
-    win: controlledburn::CoverageWindow,
+    /// Scratch: one pixel's outline (after [`Lattice::cover`]), and its
+    /// coverage window.
+    pub(crate) rx: Vec<f64>,
+    pub(crate) ry: Vec<f64>,
+    pub(crate) win: controlledburn::CoverageWindow,
+}
+
+/// What one destination pixel's exact footprint touches; see
+/// [`Lattice::cover`].
+pub(crate) enum Cover {
+    /// A point of the outline failed to transform, or is not finite.
+    Failed,
+    /// The outline's bounding box misses the source buffer.
+    Outside,
+    /// Coverage of buffer pixels `c0..c0 + w` by `r0..` is in the window,
+    /// row-major ([`controlledburn::CoverageWindow::coverage`]).
+    Window { c0: i64, r0: i64, w: usize },
 }
 
 impl Lattice {
-    fn new(transformer: &impl Transformer, ncol: usize, densify: usize, opts: &WarpOptions) -> Self {
+    /// The lattice of a destination window `ncol` pixels wide at offset
+    /// `(dst_col_off, dst_row_off)`, ready for [`Lattice::row`]`(0)`.
+    pub(crate) fn new(transformer: &impl Transformer, ncol: usize, densify: usize, (dst_col_off, dst_row_off): (usize, usize)) -> Self {
         let mut lat = Lattice {
             densify, ncol,
-            xoff: opts.dst_col_off as f64, yoff: opts.dst_row_off as f64,
+            xoff: dst_col_off as f64, yoff: dst_row_off as f64,
             top: LatticeLine::default(), bot: LatticeLine::default(), vert: LatticeLine::default(),
             level: LatticeLine::default(),
             rx: Vec::new(), ry: Vec::new(), win: controlledburn::CoverageWindow::default(),
@@ -2933,7 +2959,7 @@ impl Lattice {
 
     /// Advance to destination row `row`: the previous bottom line becomes
     /// the top line; transform the new bottom line and column interiors.
-    fn row(&mut self, transformer: &impl Transformer, row: usize) {
+    pub(crate) fn row(&mut self, transformer: &impl Transformer, row: usize) {
         std::mem::swap(&mut self.top, &mut self.bot);
         self.fill_row_line(row + 1);
         self.bot.transform(transformer);
@@ -2981,6 +3007,32 @@ impl Lattice {
         for k in (1..d).rev() { push(&self.vert, (k - 1) * m + c); }
         ok
     }
+
+    /// Exact coverage of the buffer pixels (`ncol` by `nrow`, at
+    /// `src_off` in the full source) by pixel `c` of the current row: its
+    /// outline (left in `rx`, `ry`, in buffer pixels) and, unless it fails
+    /// or misses the buffer, its coverage over the buffer pixels under its
+    /// bounding box (left in `win`). The window clamps pieces beyond its
+    /// columns exactly, so the coverage is exact wherever the outline goes.
+    pub(crate) fn cover(&mut self, c: usize, src_off: (f64, f64), (ncol, nrow): (i64, i64)) -> Cover {
+        if !self.ring(c, src_off) { return Cover::Failed; }
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for (&x, &y) in self.rx.iter().zip(&self.ry) {
+            minx = minx.min(x); maxx = maxx.max(x);
+            miny = miny.min(y); maxy = maxy.max(y);
+        }
+        if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) { return Cover::Failed; }
+        let c0 = (minx.floor() as i64).max(0);
+        let c1 = (maxx.ceil() as i64).min(ncol);
+        let r0 = (miny.floor() as i64).max(0);
+        let r1 = (maxy.ceil() as i64).min(nrow);
+        if c0 >= c1 || r0 >= r1 { return Cover::Outside; }
+        let (w, h) = ((c1 - c0) as usize, (r1 - r0) as usize);
+        self.win.reset(c0, r0, w, h);
+        self.win.add_ring(&self.rx, &self.ry, 1.0);
+        self.win.resolve();
+        Cover::Window { c0, r0, w }
+    }
 }
 
 /// One destination row under the exact footprint: each pixel's outline,
@@ -3004,24 +3056,8 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
     let band_ok = &mut vec![false; img.nb];
     let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
     for c in 0..dst_ncol {
-        if !lat.ring(c, src_off) { continue; }
-        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
-        for (&x, &y) in lat.rx.iter().zip(&lat.ry) {
-            minx = minx.min(x); maxx = maxx.max(x);
-            miny = miny.min(y); maxy = maxy.max(y);
-        }
-        if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) { continue; }
-        // Only the buffer pixels under the footprint's bbox; the window
-        // clamps pieces beyond its columns exactly.
-        let c0 = (minx.floor() as i64).max(0);
-        let c1 = (maxx.ceil() as i64).min(ncol);
-        let r0 = (miny.floor() as i64).max(0);
-        let r1 = (maxy.ceil() as i64).min(nrow);
-        if c0 >= c1 || r0 >= r1 { continue; }
-        let (w, h) = ((c1 - c0) as usize, (r1 - r0) as usize);
-        lat.win.reset(c0, r0, w, h);
-        lat.win.add_ring(&lat.rx, &lat.ry, 1.0);
-        let cov = lat.win.resolve();
+        let Cover::Window { c0, r0, w } = lat.cover(c, src_off, (ncol, nrow)) else { continue };
+        let cov = lat.win.coverage();
 
         red.reset();
         let at = |k: usize| ((r0 + (k / w) as i64) * ncol + c0 + (k % w) as i64) as usize;

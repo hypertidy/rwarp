@@ -72,7 +72,8 @@ area in source pixel space:
 - **`Footprint::Exact { densify }`** transforms the target pixel's outline
   and intersects it exactly with the source pixels. With renormalisation
   over valid pixels, `Average` is then first-order conservative remapping.
-  It costs about 25 times the box.
+  It costs about 25 times the box. The same overlaps are available as a
+  weight table; see [Conservative weights](weights.md).
 
 `Mode` counts covered area per value and breaks ties with `ModeTies`.
 Counts are re-compared every time a value's count grows, in scan order, so

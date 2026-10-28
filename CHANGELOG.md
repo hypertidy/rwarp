@@ -22,6 +22,23 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   backends. The LAEA chunk fixtures are back across 180 degrees.
   The `proj` feature now also depends on `proj-sys` (already a dependency
   of `proj`), to ask PROJ whether a CRS is geographic.
+- `weights` module: conservative remapping weights from the exact
+  footprint, as values (stage 1 of `design/conservative.md`).
+  `exact_weights` returns `Weights`, one entry per overlapping (target
+  cell, source cell) pair with full-grid indices and the overlap as an
+  unrounded `f64` fraction of the source cell, plus each target cell's
+  outline area in source pixel space (`dst_area`, `NaN` where it failed).
+  `Weights::normalised` gives ESMF's `S` under `Normalization::FracArea`
+  or `DestArea`; `Weights::apply` applies the weights to one or more bands,
+  skipping source nodata; `Weights::esmf_row_col` gives ESMF/SCRIP's
+  1-based flattened indices. `exact_weights_with` streams them per target
+  cell. `WeightOptions` (densify, target offset for tiling, drop and snap
+  tolerances, `f32` rounding; `WeightOptions::warp_compatible`),
+  `ApplyOptions` and `GridWindow`, all `#[non_exhaustive]` with builders;
+  serde derives behind `serde`. `apply(FracArea)` with warp-compatible
+  weights reproduces `warp()` with `Footprint::Exact` and `Average` bit for
+  bit. `warp()` shares the lattice and per-pixel coverage step and its
+  output is unchanged. (2026-10-28)
 - GDAL's backmap geolocation inverse, as an option beside the quad index:
   `GeolocOptions::with_inverse(GeolocInverse::Backmap)` (`GeolocInverse`:
   `QuadIndex`, the default; `Backmap`; `BackmapEstimate` for
