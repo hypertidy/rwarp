@@ -2,6 +2,8 @@
 name = "rwarp"
 version = "0.2.0"
 edition = "2021"
+# f32::next_up / next_down (Sample::step_off).
+rust-version = "1.86"
 authors = ["Michael Sumner <mdsumner@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "GDAL warp pipeline in Rust: coordinate transforms, approximate transforms, source window computation, and resampling kernels."
