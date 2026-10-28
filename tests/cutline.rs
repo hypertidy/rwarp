@@ -102,12 +102,20 @@ struct Affine {
 
 impl Transformer for Affine {
     fn transform(&self, dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
-        assert!(dst_to_src);
         let g = &self.gt;
         for (x, y) in x.iter_mut().zip(y.iter_mut()) {
-            let (gx, gy) = (g[0] + *x * g[1] + *y * g[2], g[3] + *x * g[4] + *y * g[5]);
-            *x = gx;
-            *y = N as f64 - gy;
+            if dst_to_src {
+                let (gx, gy) = (g[0] + *x * g[1] + *y * g[2], g[3] + *x * g[4] + *y * g[5]);
+                *x = gx;
+                *y = N as f64 - gy;
+            } else {
+                // The warp asks for source to destination at the buffer's
+                // corners (GWKOneSourceCornerFailsToReproject).
+                let (gx, gy) = (*x - g[0], N as f64 - *y - g[3]);
+                let det = g[1] * g[5] - g[2] * g[4];
+                *x = (gx * g[5] - gy * g[2]) / det;
+                *y = (gy * g[1] - gx * g[4]) / det;
+            }
         }
         vec![true; x.len()]
     }

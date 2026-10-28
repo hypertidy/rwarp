@@ -157,6 +157,18 @@
 //! a source pixel that is invalid as a whole (every band nodata, under the
 //! default rule) gets no value, whatever its neighbours.
 //!
+//! **Edge of the transformer's domain** (point methods, nearest included):
+//! when a corner of the source buffer fails to transform forward (source to
+//! destination), as at the holes and edges of geolocation arrays, and a
+//! sample point lands on a source pixel invalid as a whole, GDAL checks
+//! whether that pixel's top-left corner, or the corner one line down or
+//! one pixel right, fails to transform forward. If one does, the pixel is
+//! on the edge of the domain and the first valid neighbour (right, below,
+//! left, above) is used instead (`GWKOneSourceCornerFailsToReproject`,
+//! `GWKAdjustSrcOffsetOnEdge`, ~L5365-5462). rwarp does the same. (GDAL's
+//! variant for alpha and cutline densities, `pafUnifiedSrcDensity`, is not
+//! reproduced: there rwarp tests the pixel's validity, mask band included.)
+//!
 //! **Average, mode**: invalid pixels add neither value nor weight to that
 //! band; with [`AverageThresholds`] in use, average treats the bands
 //! together.
@@ -1603,6 +1615,46 @@ fn retry_alone(
     src_y[dst_col] = y[0];
 }
 
+/// Whether a corner of the source buffer fails to transform forward
+/// (source to destination): GDAL's `GWKOneSourceCornerFailsToReproject`,
+/// which enables [`adjust_on_edge`].
+fn one_source_corner_fails<T>(transformer: &impl Transformer, src: &SourceBuffer<'_, T>) -> bool {
+    for iy in 0..=1 {
+        for ix in 0..=1 {
+            let mut x = [(src.col_off + ix * src.ncol) as f64];
+            let mut y = [(src.row_off + iy * src.nrow) as f64];
+            if !transformer.transform(false, &mut x, &mut y)[0] {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// GDAL's `GWKAdjustSrcOffsetOnEdge`: for an invalid buffer pixel `p` whose
+/// top-left corner, or the corner one line down or one pixel right, fails
+/// to transform forward, the first valid neighbour (right, below, left,
+/// above), if any.
+fn adjust_on_edge<T: Sample>(transformer: &impl Transformer, src: &SourceBuffer<'_, T>, img: &Interleaved<'_, T>, p: usize) -> Option<usize> {
+    let (col, row) = (p % src.ncol, p / src.ncol);
+    let (x, y) = ((src.col_off + col) as f64, (src.row_off + row) as f64);
+    let ok = |x: f64, y: f64| transformer.transform(false, &mut [x], &mut [y])[0];
+    if ok(x, y) && ok(x, y + 1.0) && ok(x + 1.0, y) {
+        return None;
+    }
+    if col + 1 < src.ncol && img.valid(p + 1) {
+        Some(p + 1)
+    } else if row + 1 < src.nrow && img.valid(p + src.ncol) {
+        Some(p + src.ncol)
+    } else if col > 0 && img.valid(p - 1) {
+        Some(p - 1)
+    } else if row > 0 && img.valid(p - src.ncol) {
+        Some(p - src.ncol)
+    } else {
+        None
+    }
+}
+
 /// A resampled value that lands on the nodata value is moved off it, so it
 /// does not read back as missing (GDAL's `AvoidNoData`, which also warns).
 #[inline]
@@ -1698,6 +1750,15 @@ pub fn warp_to<S: Sample, D: Sample>(
 
     let mut out = out_spec.filled(dst_ncol * dst_nrow);
     let mut sc = Scratch::new(nbands);
+    // GWKOneSourceCornerFailsToReproject, on first need.
+    let mut corner_fails: Option<bool> = None;
+    let mut on_edge = |p: usize| -> Option<usize> {
+        if *corner_fails.get_or_insert_with(|| one_source_corner_fails(transformer, src)) {
+            adjust_on_edge(transformer, src, &img, p)
+        } else {
+            None
+        }
+    };
 
     for dst_row in 0..dst_nrow {
         let (mut src_x, mut src_y, mut ok) =
@@ -1720,9 +1781,17 @@ pub fn warp_to<S: Sample, D: Sample>(
                 let bc = (buf_x + 1.0e-10) as i64;
                 let br = (buf_y + 1.0e-10) as i64;
                 if bc < 0 || bc >= src.ncol as i64 || br < 0 || br >= src.nrow as i64 { continue; }
-                let p = br as usize * src.ncol + bc as usize;
+                let mut p = br as usize * src.ncol + bc as usize;
+                if !img.valid(p) {
+                    // GWKNearestThread / GWKRealCaseThread: a neighbour on
+                    // the edge of the transformer's domain.
+                    match on_edge(p) {
+                        Some(q) => p = q,
+                        None => continue,
+                    }
+                }
                 let pix = img.px(p);
-                if !img.pixel_ok(pix) || !img.centre_ok(p) { continue; }
+                if !img.centre_ok(p) { continue; }
                 let d = img.density(p);
                 for b in 0..nbands {
                     if !img.band_ok(pix, b) { continue; }
@@ -1742,8 +1811,12 @@ pub fn warp_to<S: Sample, D: Sample>(
             // GDAL skips a destination pixel whose centre lands on an
             // invalid source pixel before any kernel runs
             // (GWKRealCaseThread, gdalwarpkernel.cpp ~L5680).
+            // On the edge of the transformer's domain, GDAL accepts a
+            // valid neighbour instead (GWKAdjustSrcOffsetOnEdge); the kernel
+            // still runs at the sample point.
             let p = cy * src.ncol + cx;
-            if !img.valid(p) || !img.centre_ok(p) { continue; }
+            if !img.centre_ok(p) { continue; }
+            if !img.valid(p) && on_edge(p).is_none() { continue; }
 
             let any = match (widened, alg) {
                 (Some(w), _) => img.widened(buf_x, buf_y, &w, &mut sc),

@@ -88,7 +88,8 @@
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
 //! | Chunk planning, whole-raster chunked warp (`plan_chunks`, `warp_chunks`) | lon/lat sources to Mercator, polar stereographic and LAEA under `-wm 100000` or the default, MEM and tiled targets, near/bilinear/cubic/lanczos (`tests/chunks.rs`) | chunk lists and every output pixel identical to `gdalwarp` (GDAL 3.14.0dev-739fcf03bf), 16 cases of 1 to 28 chunks, with both CRS backends |
 //! | Longitude wrapping of a geographic source (`CENTER_LONG`) | sources across 180 degrees stored as 170..190, -190..-170, 140..200 and 0..360, and one wider than 360 under a `-te` across 180, to LAEA, Mercator, polar stereographic and lon/lat targets across 180 (`tests/chunks.rs`) | centre longitude as GDAL's; exact transformer within 1e-12 px of GDAL's (libproj); chunk lists and every output pixel identical to `gdalwarp` with both CRS backends, 11 cases |
-//! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
+//! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target, both inverse methods (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
+//! | GDAL's backmap geolocation inverse (`GeolocInverse::Backmap`) | swath by centres and by corners to lon/lat and polar stereographic, a polar ring and a swath across 180 degrees, holes in the arrays with source nodata, overlapping scans (`tests/geoloc_backmap.rs`) | success at every target pixel as GDAL's, positions within 5e-10 px; the backmap estimate the same; 24 warps (near, bilinear, cubic; `-et 0` and `0.125`) identical to `gdalwarp` with proj4rs and the fixtures' PROJ (nearest identical, interpolated within 2e-8 relative, with an older libproj) |
 //! | Cutline (`-cutline`, `CUTLINE_ALL_TOUCHED`, `-cblend`) | synthetic Float32, ties through pixel centres, holes, multipolygons, nodata, every method, rotated and LAEA to lon/lat (`tests/cutline.rs`) | within 1e-6 relative of `gdalwarp` (67 cases); differs only at centre ties on a diagonal (rounding, 5 pixels) and where GDAL's all-touched line walker burns corner-touched pixels or uses tolerances (3 cases) |
 //!
 //! **Downsampled interpolated warps:** when the output is coarser than the
@@ -147,7 +148,7 @@
 //! |-------|-----------------|-------|
 //! | `transform.rs` | `gdaltransformer.cpp`, `ogr/ogrct.cpp` | ~L2800, ~L3100, ~L3500; `InsertCenterLong` ~L1423 and source wrap ~L2444 (at `739fcf03bf`) |
 //! | `gcp_transform.rs` | `alg/gdal_crs.c` | GCP polynomial fit |
-//! | `geoloc_transform.rs` | `alg/gdalgeoloc.cpp` | `PixelLineToXY`, `Transform`, `GDALInverseBilinearInterpolation` |
+//! | `geoloc_transform.rs` | `alg/gdalgeoloc.cpp`, `alg/rasterfill.cpp` | `PixelLineToXY`, `Transform`, `GDALInverseBilinearInterpolation`, `GenerateBackMap`, `GDALFillNodata` (at `739fcf03bf`) |
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
 //! | `plan.rs` | `gdalwarpoperation.cpp` | ~L977-1670, ~L2640-3390 (at `739fcf03bf`) |
