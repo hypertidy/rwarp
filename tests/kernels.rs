@@ -407,3 +407,46 @@ fn mode_first_is_first_to_reach_the_count() {
     };
     assert_eq!((run(ModeTies::First), run(ModeTies::Min), run(ModeTies::Max)), (3, 3, 5));
 }
+
+// ---- rounding, clamping, nodata avoidance, source bounds ------------------
+
+fn run_typed<T: Sample>(g: &Grid) -> Vec<f64> {
+    let src = read_grid(g.header("src"));
+    let data: Vec<T> = src.vals.iter().map(|&v| T::from_f64(v as f64)).collect();
+    let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: 1, col_off: 0, row_off: 0 };
+    let nodata = match g.header("nodata") {
+        "-" => None,
+        v => Some(T::from_f64(v.parse().unwrap())),
+    };
+    let scaling = match g.header("wo") {
+        "-" => KernelScaling::WidenWhenDownsampling,
+        "XSCALE=1 YSCALE=1" => KernelScaling::Point,
+        other => panic!("unhandled warp options {other}"),
+    };
+    let opts = WarpOptions { alg: alg_of(g.header("alg")), scaling, nodata, ..Default::default() };
+    warp(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
+}
+
+/// Integer outputs clamp then round half up (-22.5 -> -22, cubic overshoot
+/// clamped to the type), a resampled value equal to nodata steps off it
+/// (-12 -> -13; float 0.0 -> the next float up), and sample points outside
+/// [0, n) get no value. All identical to gdalwarp.
+#[test]
+fn rounding_clamping_avoidance_and_bounds_match_gdal() {
+    let names: Vec<String> = ["round_", "clamp_", "avoid_", "bounds_"]
+        .iter()
+        .flat_map(|p| mode_fixtures(p))
+        .collect();
+    assert_eq!(names.len(), 12);
+    for name in names {
+        let g = read_grid(&name);
+        let got = match g.header("src_type") {
+            "Byte" => run_typed::<u8>(&g),
+            "Int16" => run_typed::<i16>(&g),
+            "Int32" => run_typed::<i32>(&g),
+            "Float32" => run_typed::<f32>(&g),
+            other => panic!("unknown type {other}"),
+        };
+        assert_same(&name, &g.vals, &got);
+    }
+}

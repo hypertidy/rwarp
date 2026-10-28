@@ -153,6 +153,7 @@ def main():
         print(name, sx, sy)
 
     main_mode()
+    main_round()
 
 
 # ---- mode -----------------------------------------------------------------
@@ -244,6 +245,86 @@ def main_mode():
                     "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
                    w, w, vals)
     print(len(cases), "mode cases")
+
+
+
+# ---- rounding, clamping, nodata avoidance, source bounds -----------------
+
+def pattern_round(r, c):
+    """Column pairs whose mean is k + 0.5 for k of both signs."""
+    return (c % 2) - 3 + 10 * ((r % 4) - 2)
+
+
+def pattern_avoid(r, c):
+    """Column pairs averaging -12 (the nodata value, never in the source) on
+    even rows and 6 on odd rows."""
+    if r % 2 == 0:
+        return -13 if c % 2 == 0 else -11
+    return 5 if c % 2 == 0 else 7
+
+
+def pattern_avoid_float(r, c):
+    """Column pairs averaging exactly 0.0 (the nodata value)."""
+    return -1.0 if c % 2 == 0 else 1.0
+
+
+def pattern_step(r, c):
+    """A 0/255 step, which cubic overshoots both ways."""
+    return 0 if c < 32 else 255
+
+
+ROUND_PATTERNS = {"round": pattern_round, "avoid": pattern_avoid,
+                  "avoid_float": pattern_avoid_float, "step": pattern_step}
+
+
+def main_round():
+    import array
+
+    gdal.SetConfigOption("CPL_DEBUG", None)
+    for pname, f in ROUND_PATTERNS.items():
+        write_grid(os.path.join(HERE, f"src_{pname}.txt"), [f"gdal {gdal.__version__}"],
+                   N, N, [f(r, c) for r in range(N) for c in range(N)])
+    # name, src pattern, type, alg, bounds, width, nodata, warp options
+    point = {"XSCALE": "1", "YSCALE": "1"}
+    cases = [
+        # Means at k + 0.5: GDAL rounds half up (-2.5 -> -2).
+        ("round_int16_average_2x", "round", "Int16", "average", [0, 0, N, N], 32, None, {}),
+        ("round_int16_bilinear_2x", "round", "Int16", "bilinear", [0, 0, N, N], 32, None, {}),
+        ("round_int32_average_2x", "round", "Int32", "average", [0, 0, N, N], 32, None, {}),
+        # Cubic overshoot on a step, half a pixel off: clamped to 0..255.
+        ("clamp_byte_cubic_shift", "step", "Byte", "cubic", [0.5, 0, N + 0.5, N], N, None, point),
+        ("clamp_int16_cubic_shift", "step", "Int16", "cubic", [0.5, 0, N + 0.5, N], N, None, point),
+        # A resampled value equal to nodata is moved off it.
+        ("avoid_int16_average_2x", "avoid", "Int16", "average", [0, 0, N, N], 32, -12, {}),
+        ("avoid_int16_bilinear_2x", "avoid", "Int16", "bilinear", [0, 0, N, N], 32, -12, {}),
+        ("avoid_float32_average_2x", "avoid_float", "Float32", "average", [0, 0, N, N], 32, 0, {}),
+        # Destination pixel centres on the source edge: [0, n) is inside.
+        ("bounds_bilinear_left", "round", "Int16", "bilinear", [-1, 0, N - 1, N], N, -9999, point),
+        ("bounds_bilinear_left_half", "round", "Int16", "bilinear", [-0.5, 0, N - 0.5, N], N, -9999, point),
+        ("bounds_bilinear_right_half", "round", "Int16", "bilinear", [0.5, 0, N + 0.5, N], N, -9999, point),
+        ("bounds_lanczos_left", "round", "Int16", "lanczos", [-1, 0, N - 1, N], N, -9999, point),
+    ]
+    for name, pname, tname, alg, bounds, w, nodata, wo in cases:
+        f = ROUND_PATTERNS[pname]
+        dtype = MODE_TYPES[tname]
+        src = gdal.GetDriverByName("MEM").Create("", N, N, 1, dtype)
+        src.SetGeoTransform([0, 1, 0, N, 0, -1])
+        src.GetRasterBand(1).WriteRaster(
+            0, 0, N, N, array.array("d", [f(r, c) for r in range(N) for c in range(N)]).tobytes(),
+            buf_type=gdal.GDT_Float64)
+        if nodata is not None:
+            src.GetRasterBand(1).SetNoDataValue(nodata)
+        out = gdal.Warp("", src, format="MEM", outputBounds=bounds, width=w, height=N,
+                        resampleAlg=alg, errorThreshold=0, warpOptions=wo,
+                        dstNodata=nodata)
+        vals = array.array("d", out.GetRasterBand(1).ReadRaster(buf_type=gdal.GDT_Float64))
+        opts = " ".join(f"{k}={v}" for k, v in wo.items()) or "-"
+        write_grid(os.path.join(HERE, f"{name}.txt"),
+                   [f"gdal {gdal.__version__}", f"alg {alg}", f"src src_{pname}", f"src_type {tname}",
+                    f"nodata {'-' if nodata is None else nodata}", f"wo {opts}",
+                    "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
+                   w, N, vals)
+    print(len(cases), "rounding cases")
 
 
 if __name__ == "__main__":

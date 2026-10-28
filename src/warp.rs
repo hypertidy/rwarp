@@ -86,6 +86,26 @@
 //! value's first occurrence, so its `Min` / `Max` depend on the data type.
 //! rwarp gives the 8/16-bit answer for every type.
 //!
+//! ## Output values: rounding, clamping, nodata, source bounds
+//!
+//! Every resampling method computes in `f64`. Integer outputs clamp to the
+//! type and round half up, `floor(v + 0.5)` ([`Sample::from_f64`]), as GDAL
+//! does with an integer working type for bilinear, cubic, lanczos and
+//! average alike (`ClampRoundAndAvoidNoData` / `GWKClampValueT`,
+//! gdalwarpkernel.cpp ~L1587, ~L1856). Nearest and mode copy a source value
+//! and never round.
+//!
+//! A resampled value equal to the nodata value is moved off it by one step
+//! ([`Sample::step_off`]: one less for integers, the next float up), so a
+//! valid output pixel does not read back as missing (GDAL's `AvoidNoData`,
+//! ~L1613; GDAL also warns once).
+//!
+//! Sample points outside `[0, n)` of the source buffer are off the source
+//! for every method but the area ones, which use footprints
+//! (`GWKCheckAndComputeSrcOffsets`, ~L5251). GDAL retries such points with
+//! the exact transformer when an approximate one is in use; rwarp uses the
+//! transformer it is given.
+//!
 //! ## Nodata handling (point kernels)
 //!
 //! **Nearest-neighbour**: nodata pixels in source are skipped; destination
@@ -564,21 +584,15 @@ fn warp_interpolated(
             let buf_x = src_x[dst_col] - src_col_off as f64;
             let buf_y = src_y[dst_col] - src_row_off as f64;
 
-            // Quick bounds check: is the pixel centre even near the buffer?
-            if buf_x < -0.5 || buf_x >= src_ncol as f64 + 0.5
-                || buf_y < -0.5 || buf_y >= src_nrow as f64 + 0.5
-            {
-                continue;
-            }
+            // Sample points outside [0, n) are off the source
+            // (GWKCheckAndComputeSrcOffsets).
+            let Some((cx, cy)) = centre_pixel(buf_x, buf_y, src_ncol, src_nrow) else { continue };
 
             // Centre on a nodata pixel: no value (GWKRealCaseThread ~L5680).
-            if buf_x >= 0.0 && buf_y >= 0.0 {
-                let (cx, cy) = ((buf_x + 1.0e-10) as usize, (buf_y + 1.0e-10) as usize);
-                if cx < src_ncol && cy < src_nrow && src_pixels[cy * src_ncol + cx] == nodata { continue; }
-            }
+            if src_pixels[cy * src_ncol + cx] == nodata { continue; }
 
             if let Some(val) = sample_fn(src_pixels, src_ncol, src_nrow, buf_x, buf_y, nodata) {
-                output[dst_row * dst_ncol + dst_col] = gdal_round(val);
+                output[dst_row * dst_ncol + dst_col] = settle(gdal_round(val), Some(nodata));
             }
         }
     }
@@ -586,14 +600,12 @@ fn warp_interpolated(
     output
 }
 
-/// GDAL-style rounding: round half away from zero, matching GWKRoundValueT<int16>.
+/// GDAL's rounding into an integer working type: clamp, then round half up
+/// (`ClampRoundAndAvoidNoData` / `GWKClampValueT`, gdalwarpkernel.cpp
+/// ~L1587, ~L1856). The same as [`Sample::from_f64`] for `i32`.
 #[inline]
 fn gdal_round(v: f64) -> i32 {
-    if v >= 0.0 {
-        (v + 0.5) as i32
-    } else {
-        (v - 0.5) as i32
-    }
+    i32::from_f64(v)
 }
 
 // =========================================================================
@@ -815,12 +827,26 @@ fn lanczos_sample(
 
 /// A pixel sample type the generic kernel can resample.
 ///
-/// Integer types round half away from zero (GDAL's `GWKRoundValueT`) and
-/// saturate at the type's range; floats pass through and treat NaN as
-/// nodata.
+/// The kernels compute in `f64` and convert back with [`Sample::from_f64`].
+/// Integer types clamp to the type's range and then round half up,
+/// `floor(v + 0.5)`, which is what GDAL does when the warp's working type
+/// is an integer type (`ClampRoundAndAvoidNoData`, gdalwarpkernel.cpp
+/// ~L1856): -2.5 becomes -2. Floats pass through and treat NaN as nodata.
+///
+/// rwarp has one type for source and destination. gdalwarp works in the
+/// union of the source, destination and nodata types, so a floating source
+/// warped into an integer output is resampled as float and rounded on write
+/// by `GDALCopyWords`, half away from zero (-2.5 becomes -3); with rwarp
+/// that conversion is the caller's.
 pub trait Sample: Copy + PartialOrd + 'static {
     fn to_f64(self) -> f64;
+    /// Convert a resampled value; see the trait documentation.
     fn from_f64(v: f64) -> Self;
+    /// The nearest value next to `self`, used to move a resampled value off
+    /// the nodata value: one less for integers (one more at the type's
+    /// minimum), the next float up (down at the maximum). GDAL's
+    /// `AvoidNoData`, gdalwarpkernel.cpp ~L1613.
+    fn step_off(self) -> Self;
     /// The value written for unmapped / nodata destination pixels when no
     /// nodata value is given.
     fn zero() -> Self;
@@ -833,8 +859,12 @@ macro_rules! int_sample {
         impl Sample for $t {
             #[inline] fn to_f64(self) -> f64 { self as f64 }
             #[inline] fn from_f64(v: f64) -> Self {
-                let r = if v >= 0.0 { (v + 0.5).floor() } else { (v - 0.5).ceil() };
-                r.clamp(<$t>::MIN as f64, <$t>::MAX as f64) as $t
+                // Clamping after the floor gives the same result as GDAL's
+                // clamp-then-round; NaN casts to 0.
+                (v + 0.5).floor().clamp(<$t>::MIN as f64, <$t>::MAX as f64) as $t
+            }
+            #[inline] fn step_off(self) -> Self {
+                if self == <$t>::MIN { <$t>::MIN + 1 } else { self - 1 }
             }
             #[inline] fn zero() -> Self { 0 }
         }
@@ -845,14 +875,40 @@ int_sample!(u8, i8, u16, i16, u32, i32);
 impl Sample for f32 {
     #[inline] fn to_f64(self) -> f64 { self as f64 }
     #[inline] fn from_f64(v: f64) -> Self { v as f32 }
+    #[inline] fn step_off(self) -> Self { if self == f32::MAX { self.next_down() } else { self.next_up() } }
     #[inline] fn zero() -> Self { 0.0 }
     #[inline] fn is_nan(self) -> bool { self.is_nan() }
 }
 impl Sample for f64 {
     #[inline] fn to_f64(self) -> f64 { self }
     #[inline] fn from_f64(v: f64) -> Self { v }
+    #[inline] fn step_off(self) -> Self { if self == f64::MAX { self.next_down() } else { self.next_up() } }
     #[inline] fn zero() -> Self { 0.0 }
     #[inline] fn is_nan(self) -> bool { self.is_nan() }
+}
+
+/// The source pixel under a sample point, or `None` if the point is off the
+/// buffer: GDAL tests the coordinate against `[0, n)` before truncating, so
+/// `(-1, 0)` is outside, not pixel 0 (`GWKCheckAndComputeSrcOffsets`,
+/// gdalwarpkernel.cpp ~L5251).
+#[inline]
+fn centre_pixel(buf_x: f64, buf_y: f64, ncol: usize, nrow: usize) -> Option<(usize, usize)> {
+    if buf_x < 0.0 || buf_y < 0.0 || buf_x + 1.0e-10 > ncol as f64 || buf_y + 1.0e-10 > nrow as f64 {
+        return None;
+    }
+    let cx = ((buf_x + 1.0e-10) as usize).min(ncol - 1);
+    let cy = ((buf_y + 1.0e-10) as usize).min(nrow - 1);
+    Some((cx, cy))
+}
+
+/// A resampled value that lands on the nodata value is moved off it, so it
+/// does not read back as missing (GDAL's `AvoidNoData`, which also warns).
+#[inline]
+fn settle<T: Sample>(v: T, nodata: Option<T>) -> T {
+    match nodata {
+        Some(nd) if v == nd => v.step_off(),
+        _ => v,
+    }
 }
 
 /// Warp a pixel-interleaved image of any [`Sample`] type in a single pass.
@@ -933,19 +989,14 @@ pub fn warp<T: Sample>(
                 continue;
             }
 
-            if buf_x < -0.5 || buf_x >= src.ncol as f64 + 0.5
-                || buf_y < -0.5 || buf_y >= src.nrow as f64 + 0.5
-            {
-                continue;
-            }
+            // Sample points outside [0, n) are off the source
+            // (GWKCheckAndComputeSrcOffsets).
+            let Some((cx, cy)) = centre_pixel(buf_x, buf_y, src.ncol, src.nrow) else { continue };
 
             // GDAL skips a destination pixel whose centre lands on an
             // invalid source pixel before any kernel runs
             // (GWKRealCaseThread, gdalwarpkernel.cpp ~L5680).
-            if buf_x >= 0.0 && buf_y >= 0.0 {
-                let (cx, cy) = ((buf_x + 1.0e-10) as usize, (buf_y + 1.0e-10) as usize);
-                if cx < src.ncol && cy < src.nrow && !img.valid(cy * src.ncol + cx) { continue; }
-            }
+            if !img.valid(cy * src.ncol + cx) { continue; }
 
             let hit = match (widened, alg) {
                 (Some(w), _) => img.widened(buf_x, buf_y, &w, &mut acc, &mut row_acc, &mut wx),
@@ -958,7 +1009,7 @@ pub fn warp<T: Sample>(
             };
             if hit {
                 for b in 0..nbands {
-                    out[o + b] = T::from_f64(acc[b]);
+                    out[o + b] = settle(T::from_f64(acc[b]), opts.nodata);
                 }
             }
         }
@@ -1438,7 +1489,10 @@ fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
                 if w > 0.0 { red.add(img.px(p), w); }
             }
         }
-        red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
+        let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
+        if red.write(px) {
+            for v in px.iter_mut() { *v = settle(*v, opts.nodata); }
+        }
     }
 }
 
@@ -1522,7 +1576,10 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
             let p = at(e.row, e.col as i64);
             if img.valid(p) && e.fraction > 0.0 { red.add(img.px(p), e.fraction as f64); }
         }
-        red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
+        let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
+        if red.write(px) {
+            for v in px.iter_mut() { *v = settle(*v, opts.nodata); }
+        }
     }
 }
 
@@ -1742,7 +1799,10 @@ mod tests {
         assert_eq!(u16::from_f64(65535.7), 65535);
         assert_eq!(u16::from_f64(-3.0), 0);
         assert_eq!(u16::from_f64(2.5), 3);
-        assert_eq!(i16::from_f64(-2.5), -3);
+        assert_eq!(i16::from_f64(-2.5), -2);
+        assert_eq!(i16::from_f64(-2.6), -3);
+        assert_eq!(i8::from_f64(-200.0), -128);
+        assert_eq!(i32::from_f64(f64::NAN), 0);
         assert_eq!(i32::from_f64(-0.4), 0);
         assert_eq!(u8::from_f64(255.49), 255);
     }
