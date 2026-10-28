@@ -2,7 +2,8 @@
 //! through 2D coordinate arrays (curvilinear grids, satellite swaths).
 //!
 //! Follows GDAL's geolocation transformer (`alg/gdalgeoloc.cpp`, read at
-//! GDAL master, October 2026; the logic has been stable since GDAL 3.5):
+//! GDAL 3.14.0dev `739fcf03bf`, October 2026; the logic has been stable
+//! since GDAL 3.5, apart from the 3.12 option to force longitude wrapping):
 //!
 //! | rwarp | GDAL |
 //! |-------|------|
@@ -11,6 +12,7 @@
 //! | [`GeolocArrays::geo_to_pixel`] | `GDALGeoLoc::Transform`, `bDstToSrc = TRUE`, max-accuracy path |
 //! | `inverse_bilinear` | `GDALInverseBilinearInterpolation` |
 //! | `shift_geo_x` / `unshift_geo_x` | `ShiftGeoX` / `UnshiftGeoX` |
+//! | `backmap::Backmap` (private) | `GDALGeoLoc::LoadGeolocFinish`, `GDALGeoLoc::GenerateBackMap`, `GDALFillNodata`, and the backmap inverse in `GDALGeoLoc::Transform` |
 //!
 //! ## The model
 //!
@@ -34,34 +36,62 @@
 //!
 //! ## Inverse (geo -> pixel)
 //!
-//! GDAL first takes an approximate answer from a "backmap" raster, then
-//! searches a few grid squares around it for the quadrilateral of four
-//! samples that contains the point, and solves the exact inverse bilinear
-//! interpolation there. rwarp skips the backmap: it indexes every
-//! quadrilateral (including one ring of extrapolated quadrilaterals outside
-//! the arrays) in a uniform bucket grid, takes the first containing
-//! quadrilateral in row-major order, and solves the same exact inverse.
+//! Two methods, chosen with [`GeolocOptions::inverse`]
+//! ([`GeolocInverse`]). Both end in the same exact inverse bilinear
+//! interpolation (`GDALInverseBilinearInterpolation`) in a quadrilateral of
+//! four samples that contains the point; they differ in which
+//! quadrilateral they find.
+//!
+//! - [`GeolocInverse::QuadIndex`] (the default) indexes every
+//!   quadrilateral (including one ring of extrapolated quadrilaterals
+//!   outside the arrays) in a uniform bucket grid and takes the first
+//!   containing quadrilateral in row-major order. Its domain is exactly the
+//!   union of the quadrilaterals.
+//! - [`GeolocInverse::Backmap`] is GDAL's method, ported in GDAL's
+//!   arithmetic order: a float32 "backmap" raster over the arrays' extent
+//!   gives an approximate pixel/line, and a spiral search of up to 3 squares
+//!   around it (5 near the poles) finds the containing quadrilateral.
+//!   Nearest-neighbour warps through it are pixel-identical to gdalwarp's.
+//!   [`GeolocInverse::BackmapEstimate`] stops at the backmap's estimate, as
+//!   GDAL does with `GDAL_GEOLOC_USE_MAX_ACCURACY=NO`.
 //!
 //! For grids whose quadrilaterals do not overlap, the containing
 //! quadrilateral is unique except on shared edges, where the inverse is
-//! continuous, so the result is the same as GDAL's. Differences can appear
-//! only where quadrilaterals overlap (folded swaths), where GDAL takes the
-//! first match in a spiral search from its backmap estimate and rwarp takes
-//! the first in row-major order, and where GDAL's limited search radius (3
-//! squares, 5 near the poles) fails to find a quadrilateral that rwarp's
-//! index finds. GDAL's approximate-only path
-//! (`GDAL_GEOLOC_USE_MAX_ACCURACY=NO`) is not reproduced.
+//! continuous, so the two methods agree wherever both succeed. They differ:
+//!
+//! - where quadrilaterals overlap (folded swaths): GDAL takes the first
+//!   match in its spiral from the backmap estimate, the index the first in
+//!   row-major order;
+//! - where the backmap has no estimate (holes it could not fill) or its
+//!   estimate is more than the search radius from the containing
+//!   quadrilateral (folds, gaps in the arrays): GDAL fails where the index
+//!   succeeds;
+//! - beyond the arrays' edges: GDAL's search reaches extrapolated squares
+//!   more than one beyond the top and left edges (its test is
+//!   `iX >= -1 || iY >= -1`), within the backmap's extent; the index stops
+//!   one ring out on every side.
+//!
+//! GDAL's experimental quadtree inverse
+//! (`GDAL_GEOLOC_INVERSE_METHOD=QUADTREE`; the default is `BACKMAP` in
+//! GDAL 3.14) is not reproduced. It is close in spirit to the quad index:
+//! every square, first match, no backmap.
 //!
 //! ## Other departures from GDAL
 //!
 //! - NaN samples are treated as missing, as well as samples equal to the
 //!   nodata value. GDAL compares only against the nodata value.
 //! - Only the X array is checked for nodata, as GDAL does.
-//! - `SWAP_XY` and the quadtree inverse (`GEOLOC_USE_QUADTREE`) are not
-//!   implemented.
+//! - `SWAP_XY` is not implemented.
 //! - Whether longitudes wrap at the antimeridian is an explicit option
 //!   ([`GeolocOptions::lon_wrap`]). GDAL decides it from the SRS: geographic,
-//!   with every longitude in `[-180, 180]`.
+//!   with every longitude in `[-180, 180]`, or forces it with
+//!   `GEOLOC_NORMALIZE_LONGITUDE_MINUS_180_PLUS_180=YES` (GDAL 3.12); `true`
+//!   matches either.
+//! - The backmap is built in memory at any size. GDAL keeps it in temporary
+//!   GTiff files for arrays of 24 megapixels or more
+//!   (`GDAL_GEOLOC_USE_TEMP_DATASETS`), with the same arithmetic.
+
+mod backmap;
 
 use crate::crs::{crs_pair, CrsTransform};
 use crate::Transformer;
@@ -90,10 +120,31 @@ impl GeolocConvention {
     }
 }
 
+/// How [`GeolocArrays::geo_to_pixel`] finds the quadrilateral containing a
+/// point. See the [module docs](self#inverse-geo---pixel) for where the
+/// methods differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GeolocInverse {
+    /// An index of every quadrilateral, first match in row-major order.
+    /// rwarp's default: its domain is the union of the quadrilaterals,
+    /// with no dependence on a sampled raster.
+    #[default]
+    QuadIndex,
+    /// GDAL's float32 backmap and local spiral search, for pixel-identical
+    /// results with gdalwarp. GDAL's default (`BACKMAP`).
+    Backmap,
+    /// GDAL's backmap estimate alone, without the exact refinement
+    /// (`GDAL_GEOLOC_USE_MAX_ACCURACY=NO`): fast, approximate.
+    BackmapEstimate,
+}
+
 /// Options describing how geolocation arrays relate to the raster.
 ///
 /// The defaults match GDAL's defaults: offsets 0, steps 1,
-/// [`GeolocConvention::TopLeftCorner`], no nodata, no longitude wrapping.
+/// [`GeolocConvention::TopLeftCorner`], no nodata, no longitude wrapping,
+/// backmap oversampling 1.3; except for the inverse, which defaults to
+/// [`GeolocInverse::QuadIndex`] (GDAL's is [`GeolocInverse::Backmap`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct GeolocOptions {
@@ -113,6 +164,12 @@ pub struct GeolocOptions {
     /// GDAL sets this when the geolocation SRS is geographic and every
     /// longitude lies in `[-180, 180]`.
     pub lon_wrap: bool,
+    /// The inverse method.
+    pub inverse: GeolocInverse,
+    /// `GEOLOC_BACKMAP_OVERSAMPLE_FACTOR`: backmap nodes per array sample
+    /// along each axis, clamped to `[0.1, 2]` as GDAL does. Used by the
+    /// backmap methods only.
+    pub backmap_oversample: f64,
 }
 
 impl Default for GeolocOptions {
@@ -125,6 +182,8 @@ impl Default for GeolocOptions {
             convention: GeolocConvention::TopLeftCorner,
             nodata_x: None,
             lon_wrap: false,
+            inverse: GeolocInverse::QuadIndex,
+            backmap_oversample: 1.3,
         }
     }
 }
@@ -156,6 +215,18 @@ impl GeolocOptions {
 
     pub fn with_lon_wrap(mut self, lon_wrap: bool) -> Self {
         self.lon_wrap = lon_wrap;
+        self
+    }
+
+    /// The inverse method; see [`GeolocInverse`].
+    pub fn with_inverse(mut self, inverse: GeolocInverse) -> Self {
+        self.inverse = inverse;
+        self
+    }
+
+    /// `GEOLOC_BACKMAP_OVERSAMPLE_FACTOR`, for the backmap methods.
+    pub fn with_backmap_oversample(mut self, factor: f64) -> Self {
+        self.backmap_oversample = factor;
         self
     }
 }
@@ -304,6 +375,13 @@ impl QuadIndex {
     }
 }
 
+/// The lookup structure for the inverse, per [`GeolocInverse`].
+#[derive(Debug, Clone)]
+enum InverseIndex {
+    Quads(QuadIndex),
+    Backmap(backmap::Backmap),
+}
+
 /// Geolocation arrays for one raster, with a lookup structure for the
 /// inverse transform.
 ///
@@ -315,7 +393,7 @@ pub struct GeolocArrays {
     ncol: usize,
     nrow: usize,
     opts: GeolocOptions,
-    index: QuadIndex,
+    index: InverseIndex,
 }
 
 impl GeolocArrays {
@@ -349,10 +427,34 @@ impl GeolocArrays {
             ncol,
             nrow,
             opts,
-            index: QuadIndex::new(Vec::new()),
+            index: InverseIndex::Quads(QuadIndex::new(Vec::new())),
         };
-        g.index = QuadIndex::new(g.build_quads());
+        g.index = g.build_index()?;
         Ok(g)
+    }
+
+    fn build_index(&self) -> Result<InverseIndex, String> {
+        Ok(match self.opts.inverse {
+            GeolocInverse::QuadIndex => InverseIndex::Quads(QuadIndex::new(self.build_quads())),
+            GeolocInverse::Backmap | GeolocInverse::BackmapEstimate => {
+                let f = self.opts.backmap_oversample;
+                if !f.is_finite() {
+                    return Err("backmap oversampling factor must be finite".to_string());
+                }
+                // GDAL clamps GEOLOC_BACKMAP_OVERSAMPLE_FACTOR to [0.1, 2].
+                InverseIndex::Backmap(backmap::Backmap::new(self, f.clamp(0.1, 2.0))?)
+            }
+        })
+    }
+
+    /// Size `(width, height)` and geotransform of GDAL's backmap, built for
+    /// [`GeolocInverse::Backmap`] and [`GeolocInverse::BackmapEstimate`];
+    /// `None` for [`GeolocInverse::QuadIndex`].
+    pub fn backmap_grid(&self) -> Option<((usize, usize), [f64; 6])> {
+        match &self.index {
+            InverseIndex::Backmap(b) => Some(b.grid()),
+            InverseIndex::Quads(_) => None,
+        }
     }
 
     /// The options these arrays were built with.
@@ -547,12 +649,22 @@ impl GeolocArrays {
 
     /// Georeferenced coordinates to raster pixel/line.
     ///
-    /// Follows `GDALGeoLoc::Transform` with `bDstToSrc = TRUE` on its
-    /// max-accuracy path: the containing quadrilateral, then the exact
-    /// inverse bilinear interpolation. See the module docs for how the
-    /// quadrilateral is found.
+    /// Follows `GDALGeoLoc::Transform` with `bDstToSrc = TRUE`: the
+    /// containing quadrilateral, then the exact inverse bilinear
+    /// interpolation; or, with [`GeolocInverse::BackmapEstimate`], the
+    /// backmap's estimate. See the module docs for how the quadrilateral is
+    /// found.
     pub fn geo_to_pixel(&self, gx: f64, gy: f64) -> Option<(f64, f64)> {
-        let q = self.index.find(gx, gy)?;
+        let index = match &self.index {
+            InverseIndex::Quads(index) => index,
+            InverseIndex::Backmap(b) => {
+                let refine = self.opts.inverse != GeolocInverse::BackmapEstimate;
+                return b
+                    .inverse(self, gx, gy, refine)
+                    .filter(|(p, l)| p.is_finite() && l.is_finite());
+            }
+        };
+        let q = index.find(gx, gy)?;
         let (mut i, mut j) = (q.ix as f64, q.iy as f64);
         inverse_bilinear(
             gx, gy, q.x[0], q.y[0], q.x[1], q.y[1], q.x[2], q.y[2], q.x[3], q.y[3], &mut i,
@@ -843,7 +955,7 @@ mod tests {
         let mut g = affine_arrays(GT, 5, 5, opts);
         g.x[0] = -999.0;
         g.x[12] = f64::NAN;
-        g.index = QuadIndex::new(g.build_quads());
+        g.index = g.build_index().unwrap();
         assert!(g.pixel_to_geo(0.2, 0.2).is_none());
         assert!(g.pixel_to_geo(2.5, 2.5).is_none());
         assert!(g.pixel_to_geo(4.5, 0.5).is_some());

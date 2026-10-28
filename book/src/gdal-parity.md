@@ -25,12 +25,16 @@ build, and the tests compare rwarp's results to them.
 | Nodata, per band and unified, average thresholds | single- and three-band Float32, every method | within 1e-6 relative (30 cases) |
 | Rounding, clamping, nodata avoidance, source bounds | Byte/Int16/Int32/Float32 | identical (12 cases) |
 | Antimeridian split read | GEBCO, Fiji tile | 70 times fewer source pixels than a naive read |
-| Geolocation arrays | synthetic swath, both conventions, curvilinear source and target | coordinates within 1e-6 px; nearest warps identical to `gdalwarp -et 0` |
+| Geolocation arrays | synthetic swath, both conventions, curvilinear source and target, both inverse methods | coordinates within 1e-6 px; nearest warps identical to `gdalwarp -et 0` |
+| Geolocation backmap inverse (`GeolocInverse::Backmap`) | 9 synthetic cases: a curved swath by cell centres and by corners to lon/lat (fine and coarse) and south polar stereographic, a polar ring and a swath across the antimeridian, holes in the arrays with source nodata, overlapping scans; `-et 0`, and `-et 0.125` for two | success identical to GDAL's transformer at every target pixel centre (31,356), positions within 5e-10 px; the backmap's estimate (`GDAL_GEOLOC_USE_MAX_ACCURACY=NO`) the same; 24 warps (near, bilinear, cubic) identical to gdalwarp, every pixel, with both CRS backends |
+| Neighbour on the edge of the transformer's domain (`GWKAdjustSrcOffsetOnEdge`) | the holes case above | 12 of 4560 pixels differ without it |
 | Cutline: centre rule, all touched, blend distance | synthetic Float32; edges and vertices through pixel centres, holes, multipolygons, source nodata, every method but mode, 1:1, 2.78:1 and upsampled, 30 degree rotated, LAEA to lon/lat with the cutline in either CRS | within 1e-6 relative of gdalwarp (67 cases; the reprojected ones identical with libproj and proj4rs) |
 | Cutline tie rules | GDAL's own rasterizer on centre-tie polygons | identical, except 5 centres on one diagonal edge where GDAL's intercept is a rounding error either side |
 
-The kernel, chunk and cutline fixtures use GDAL 3.14.0dev (`739fcf03bf`);
-the geolocation fixtures use GDAL 3.8.4.
+The fixtures use GDAL 3.14.0dev (`739fcf03bf`). The first geolocation
+fixture was made with GDAL 3.8.4; regenerated with 3.14 only the CRS
+step's last digits moved (1e-8 px), and GDAL's geolocation code is the
+same from 3.12 to 3.14.
 
 ## Longitude wrapping (`CENTER_LONG`)
 
@@ -63,7 +67,7 @@ and a compound CRS by its horizontal part; NTF (Paris), in grads, is not.
 | Kernel scale estimate in a chunked warp | taken at the top-left of the whole output for every chunk | taken over the window being warped (`ScaleOrigin::Chunk`, the default; `ScaleOrigin::Output` or `ChunkOptions::gdalwarp` for GDAL's) | GDAL's sample points omit the chunk offset; chunked and single-chunk gdalwarp output differ. On the Mercator lanczos fixture, half the pixels differ |
 | Source window padding under `XSCALE`/`YSCALE` | padded for the estimated scale | padded for the smaller of the given and estimated scales (`ChunkOptions::pad_for_fixed_scale`, default on; off in `ChunkOptions::gdalwarp`) | a kernel stretched by the given scale is otherwise clipped at the window edge, so tiles warped on their own differ there |
 | `MODE_TIES` for 32/64-bit and float data | `Min`/`Max` skipped for a value's first occurrence | the 8/16-bit behaviour for every type | the same data should not give different modes by type |
-| Geolocation inverse | backmap plus local search | index of all quadrilaterals | same answer on unfolded grids; see [Curvilinear grids](guide/curvilinear.md) |
+| Geolocation inverse, by default | backmap plus local search | index of all quadrilaterals (`GeolocInverse::QuadIndex`); GDAL's is `GeolocInverse::Backmap`, identical to gdalwarp | the index does not depend on a sampled raster. Same answer inside the raster on grids without overlapping quadrilaterals; differs at folds and at the seam of a grid wrapping 360 degrees, where GDAL leaves pixels empty; see [Curvilinear grids](guide/curvilinear.md) |
 | Cutline all touched | centre rule plus each boundary line walked pixel to pixel, with tolerances | pixels with any covered area (above 1e-9) | GDAL also burns pixels touched only at a corner (below-right of it), skips edges within 1e-4 of a pixel wall, and burns one column for an edge within 0.01 px of vertical even where the polygon is in the column to its left |
 | Cutline centre ties on diagonals | intercept rounding | intercept rounding, computed differently | GDAL keeps 23 and drops 5 of the 28 centres on one 45 degree edge; neither is a rule |
 | `Cutline::from_transformer` densification | skipped when `-cblend` is given (unless `GDALWARP_DENSIFY_CUTLINE=YES`) | always | the helper does not know about blending; densifying only makes the transformed cutline more accurate |
@@ -76,6 +80,11 @@ and a compound CRS by its horizontal part; NTF (Paris), in grads, is not.
   wraps the source only, as a `CENTER_LONG` in the source CRS does.
 - `CHECK_WITH_INVERT_PROJ`, `STREAMABLE_OUTPUT`, and GDAL's shortcut for a
   translation by whole pixels in chunk planning.
+- Geolocation: `SWAP_XY`, GDAL's experimental quadtree inverse
+  (`GDAL_GEOLOC_INVERSE_METHOD=QUADTREE`), and its temporary-file backmap
+  for arrays of 24 megapixels or more (same arithmetic as the in-memory
+  one rwarp ports). GDAL's alpha and cutline-density variant of the
+  domain-edge neighbour (`GWKAdjustSrcOffsetOnEdgeUnifiedSrcDensity`).
 
 GDAL's retry of a sample point just off the source window with the exact
 transformer is done: `warp()` transforms such a point again on its own,
@@ -104,3 +113,22 @@ pixels the boundary touches only at a corner, and a whole column along an
 edge within 0.01 pixels of vertical; centre ties on diagonal edges are
 rounding; blend distance dilates the cutline for the area methods instead
 of feathering it; and `-cblend` turns off cutline densification.
+
+The geolocation backmap port found these: the inverse's spiral search
+admits a square when `iX >= -1 || iY >= -1` (probably meant `&&`), so it
+reaches extrapolated squares well beyond the top and left edges but only
+one beyond the right and bottom; on arrays wrapping 360 degrees the
+backmap averages positions from both ends of the rows across the
+antimeridian, and the search radius of 3 cannot recover, leaving a line of
+empty pixels along the antimeridian (51 of 4900 in the polar test case);
+next to a missing sample `PixelLineToXY` extrapolates past the last line
+along the line only, folding the extrapolated square back over the grid;
+`isPointOnRingBoundary` tests for an exactly zero cross product (an OGR
+FIXME), so only vertices and axis-aligned edges count as on the boundary;
+`GenerateBackMap` casts a negative sample position to `unsigned`; and its
+per-block sample ranges drop the last samples beyond the arrays' edge
+when the edge falls within two samples of a multiple of 256 (they land in
+a block that is never processed). In the warp kernel,
+`GWKAdjustSrcOffsetOnEdge` gives a source pixel that is nodata the value
+of a neighbour whenever a corner near it fails to transform, so source
+nodata next to holes in geolocation arrays is filled.
