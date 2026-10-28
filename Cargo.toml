@@ -32,7 +32,7 @@ proj4rs = { version = "0.3.0", default-features = false, features = ["crs-defini
 vaster = { version = "0.2.0" }
 # Exact coverage fractions for the exact-overlap area footprint. Pure Rust,
 # no dependencies, builds for wasm.
-controlledburn = "0.2.1"
+controlledburn = "0.2.2"
 half = { version = "2", optional = true }
 
 [workspace]

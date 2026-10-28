@@ -72,8 +72,12 @@
 //!   conservative remapping with areas in source pixel space.
 //!
 //! For a destination pixel that maps to an axis-aligned rectangle the two
-//! agree. The exact footprint costs about 25x the box (4 µs a pixel at
-//! 4:1 in the timing test).
+//! agree. The exact footprint transforms the destination pixel lattice
+//! once per row band (shared corners and edge points, each row line and
+//! each densify level a scanline, so an approximate transformer applies),
+//! and takes coverage from a reused [`controlledburn::CoverageWindow`]. It
+//! costs about 3x the box at 3.5:1 in the timing test (0.8 microseconds a
+//! pixel), less at higher ratios.
 //!
 //! ## Mode
 //!
@@ -261,9 +265,10 @@ pub enum Footprint {
     GdalBox,
     /// The destination pixel's outline, each edge split into `densify`
     /// segments, transformed to source pixel space and intersected exactly
-    /// with the source pixels (coverage fractions from [`controlledburn`],
-    /// stored as `f32`). With renormalisation over valid pixels this is
-    /// first-order conservative remapping. No antimeridian handling.
+    /// with the source pixels (coverage fractions from
+    /// [`controlledburn::CoverageWindow`], rounded to `f32`). With
+    /// renormalisation over valid pixels this is first-order conservative
+    /// remapping. No antimeridian handling.
     Exact { densify: usize },
 }
 
@@ -2315,11 +2320,18 @@ fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
     let nb = img.nb;
     let mut out = out_spec.filled(dst_ncol * dst_nrow);
     let mut row_res: Vec<Res<T>> = vec![Res::None; dst_ncol * nb];
+    let mut exact = match opts.footprint {
+        Footprint::Exact { densify } => Some(Lattice::new(transformer, dst_ncol, densify.max(1), opts)),
+        Footprint::GdalBox => None,
+    };
     for dst_row in 0..dst_nrow {
         row_res.fill(Res::None);
-        match opts.footprint {
-            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, &mut row_res),
-            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut red, &mut row_res),
+        match exact.as_mut() {
+            None => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, &mut row_res),
+            Some(lat) => {
+                lat.row(transformer, dst_row);
+                area_row_exact(lat, img, src_off, dst_ncol, &mut red, &mut row_res);
+            }
         }
         let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
         for (i, (o, &r)) in row_out.iter_mut().zip(row_res.iter()).enumerate() {
@@ -2417,84 +2429,170 @@ fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
     }
 }
 
-/// One destination row under the exact footprint: each pixel's outline,
-/// densified and transformed, burned onto the source pixels it touches
-/// with exact coverage fractions.
-#[allow(clippy::too_many_arguments)]
-fn area_row_exact<T: Sample, R: AreaReducer<T>>(
-    transformer: &impl Transformer,
-    img: &Interleaved<'_, T>,
-    (col_off, row_off): (f64, f64),
-    dst_row: usize,
-    dst_ncol: usize,
-    opts: &WarpOptions,
+/// Points of one transformed line of the destination lattice.
+#[derive(Default)]
+struct LatticeLine {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    ok: Vec<bool>,
+}
+
+impl LatticeLine {
+    fn transform(&mut self, transformer: &impl Transformer) {
+        self.ok = transformer.transform(true, &mut self.x, &mut self.y);
+    }
+}
+
+/// The destination pixel lattice of one row band, transformed to source
+/// pixel space. Each pixel's outline is assembled from shared points, so a
+/// corner is transformed once rather than four times and an edge point once
+/// rather than twice, and each row line goes to the transformer as a real
+/// scanline (constant y, increasing x), the shape an
+/// [`ApproxTransformer`](crate::approx::ApproxTransformer) interpolates.
+struct Lattice {
     densify: usize,
+    ncol: usize,
+    xoff: f64,
+    yoff: f64,
+    /// Row lines at the top and bottom of the band: `ncol * densify + 1`
+    /// points, left to right.
+    top: LatticeLine,
+    bot: LatticeLine,
+    /// Interior points of the band's column lines, one scanline per
+    /// interior level: line `c`, point `k` (1 to `densify - 1`, downwards)
+    /// at `(k - 1) * (ncol + 1) + c`.
+    vert: LatticeLine,
+    /// Scratch for one interior level.
+    level: LatticeLine,
+    /// Scratch: one pixel's outline, and its coverage window.
+    rx: Vec<f64>,
+    ry: Vec<f64>,
+    win: controlledburn::CoverageWindow,
+}
+
+impl Lattice {
+    fn new(transformer: &impl Transformer, ncol: usize, densify: usize, opts: &WarpOptions) -> Self {
+        let mut lat = Lattice {
+            densify, ncol,
+            xoff: opts.dst_col_off as f64, yoff: opts.dst_row_off as f64,
+            top: LatticeLine::default(), bot: LatticeLine::default(), vert: LatticeLine::default(),
+            level: LatticeLine::default(),
+            rx: Vec::new(), ry: Vec::new(), win: controlledburn::CoverageWindow::default(),
+        };
+        lat.fill_row_line(0);
+        lat.bot.transform(transformer);
+        lat
+    }
+
+    /// Fill `bot` with the untransformed row line `row` of the destination.
+    fn fill_row_line(&mut self, row: usize) {
+        let (n, d) = (self.ncol * self.densify + 1, self.densify as f64);
+        let y = self.yoff + row as f64;
+        self.bot.x.clear();
+        self.bot.y.clear();
+        self.bot.x.extend((0..n).map(|k| self.xoff + k as f64 / d));
+        self.bot.y.resize(n, y);
+    }
+
+    /// Advance to destination row `row`: the previous bottom line becomes
+    /// the top line; transform the new bottom line and column interiors.
+    fn row(&mut self, transformer: &impl Transformer, row: usize) {
+        std::mem::swap(&mut self.top, &mut self.bot);
+        self.fill_row_line(row + 1);
+        self.bot.transform(transformer);
+        let d = self.densify;
+        if d > 1 {
+            // Each interior level is a scanline too (constant y), so it goes
+            // to the transformer on its own.
+            self.vert.x.clear();
+            self.vert.y.clear();
+            self.vert.ok.clear();
+            for k in 1..d {
+                let y = self.yoff + row as f64 + k as f64 / d as f64;
+                self.level.x.clear();
+                self.level.y.clear();
+                self.level.x.extend((0..=self.ncol).map(|c| self.xoff + c as f64));
+                self.level.y.resize(self.ncol + 1, y);
+                self.level.transform(transformer);
+                self.vert.x.extend_from_slice(&self.level.x);
+                self.vert.y.extend_from_slice(&self.level.y);
+                self.vert.ok.extend_from_slice(&self.level.ok);
+            }
+        }
+    }
+
+    /// Outline of pixel `c` in the band, offset into the source buffer:
+    /// top left to right, right edge down, bottom right to left, left edge
+    /// up (as rwarp 0.2 built it). False if any point failed.
+    fn ring(&mut self, c: usize, (col_off, row_off): (f64, f64)) -> bool {
+        let d = self.densify;
+        self.rx.clear();
+        self.ry.clear();
+        let mut ok = true;
+        let (rx, ry) = (&mut self.rx, &mut self.ry);
+        let mut push = |l: &LatticeLine, k: usize| {
+            rx.push(l.x[k] - col_off);
+            ry.push(l.y[k] - row_off);
+            ok &= l.ok[k];
+        };
+        for k in 0..d { push(&self.top, c * d + k); }
+        push(&self.top, (c + 1) * d);
+        let m = self.ncol + 1;
+        for k in 1..d { push(&self.vert, (k - 1) * m + c + 1); }
+        for k in 0..d { push(&self.bot, (c + 1) * d - k); }
+        push(&self.bot, c * d);
+        for k in (1..d).rev() { push(&self.vert, (k - 1) * m + c); }
+        ok
+    }
+}
+
+/// One destination row under the exact footprint: each pixel's outline,
+/// densified and transformed (as part of the shared [`Lattice`]), with
+/// exact coverage of the source pixels it touches from a
+/// [`controlledburn::CoverageWindow`].
+///
+/// Weights follow what `controlledburn::burn` gave rwarp 0.2: within 1e-6
+/// of 1 counts as 1, at or below 1e-6 is dropped, other fractions are
+/// rounded to `f32`; fully covered pixels are reduced first, then the
+/// partly covered ones, each in source scan order.
+fn area_row_exact<T: Sample, R: AreaReducer<T>>(
+    lat: &mut Lattice,
+    img: &Interleaved<'_, T>,
+    src_off: (f64, f64),
+    dst_ncol: usize,
     red: &mut R,
     row_out: &mut [Res<T>],
 ) {
+    const TOL: f64 = 1e-6;
     let band_ok = &mut vec![false; img.nb];
-    use controlledburn::{burn, BurnOptions, Coord, Geometry, GridSpec, Polygon};
-
-    let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
-    let per = 4 * densify;
-    let mut xs = Vec::with_capacity(per * dst_ncol);
-    let mut ys = Vec::with_capacity(per * dst_ncol);
-    for c in 0..dst_ncol {
-        let (x0, y0) = (c as f64 + xoff, yoff);
-        for k in 0..densify {
-            let t = k as f64 / densify as f64;
-            xs.push(x0 + t); ys.push(y0);             // top, left to right
-        }
-        for k in 0..densify {
-            let t = k as f64 / densify as f64;
-            xs.push(x0 + 1.0); ys.push(y0 + t);       // right, downwards
-        }
-        for k in 0..densify {
-            let t = k as f64 / densify as f64;
-            xs.push(x0 + 1.0 - t); ys.push(y0 + 1.0); // bottom, right to left
-        }
-        for k in 0..densify {
-            let t = k as f64 / densify as f64;
-            xs.push(x0); ys.push(y0 + 1.0 - t);       // left, upwards
-        }
-    }
-    let ok = transformer.transform(true, &mut xs, &mut ys);
-
     let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
     for c in 0..dst_ncol {
-        let r = c * per..(c + 1) * per;
-        if !ok[r.clone()].iter().all(|&v| v) { continue; }
-        // Source pixel space, y flipped so that row 0 is at the top of the
-        // grid as controlledburn expects.
-        let mut ring: Vec<Coord> = xs[r.clone()].iter().zip(&ys[r])
-            .map(|(&x, &y)| Coord::new(x - col_off, -(y - row_off)))
-            .collect();
-        if !ring.iter().all(|p| p.is_finite()) { continue; }
+        if !lat.ring(c, src_off) { continue; }
         let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
-        for p in &ring {
-            minx = minx.min(p.x); maxx = maxx.max(p.x);
-            miny = miny.min(-p.y); maxy = maxy.max(-p.y);
+        for (&x, &y) in lat.rx.iter().zip(&lat.ry) {
+            minx = minx.min(x); maxx = maxx.max(x);
+            miny = miny.min(y); maxy = maxy.max(y);
         }
-        // Burn onto just the buffer pixels under the footprint's bbox.
-        // (Burning a whole row in one call measured no faster.)
+        if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) { continue; }
+        // Only the buffer pixels under the footprint's bbox; the window
+        // clamps pieces beyond its columns exactly.
         let c0 = (minx.floor() as i64).max(0);
         let c1 = (maxx.ceil() as i64).min(ncol);
         let r0 = (miny.floor() as i64).max(0);
         let r1 = (maxy.ceil() as i64).min(nrow);
         if c0 >= c1 || r0 >= r1 { continue; }
-        ring.push(ring[0]);
-        let grid = GridSpec::new(c0 as f64, -(r1 as f64), c1 as f64, -(r0 as f64), (c1 - c0) as u32, (r1 - r0) as u32);
-        let Ok(res) = burn(&[Geometry::Polygon(Polygon::new(vec![ring]))], &grid, BurnOptions::coverage()) else { continue };
+        let (w, h) = ((c1 - c0) as usize, (r1 - r0) as usize);
+        lat.win.reset(c0, r0, w, h);
+        lat.win.add_ring(&lat.rx, &lat.ry, 1.0);
+        let cov = lat.win.resolve();
 
         red.reset();
-        let at = |row: i32, col: i64| ((r0 + row as i64) * ncol + c0 + col) as usize;
-        for run in &res.runs {
-            for col in run.col_start..run.col_end {
-                img.reduce(red, at(run.row, col as i64), 1.0, band_ok);
-            }
+        let at = |k: usize| ((r0 + (k / w) as i64) * ncol + c0 + (k % w) as i64) as usize;
+        for (k, &f) in cov.iter().enumerate() {
+            if f >= 1.0 - TOL { img.reduce(red, at(k), 1.0, band_ok); }
         }
-        for e in &res.edges {
-            if e.fraction > 0.0 { img.reduce(red, at(e.row, e.col as i64), e.fraction as f64, band_ok); }
+        for (k, &f) in cov.iter().enumerate() {
+            if f > TOL && f < 1.0 - TOL { img.reduce(red, at(k), f as f32 as f64, band_ok); }
         }
         red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
     }

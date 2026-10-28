@@ -25,6 +25,7 @@ gains variants.
   `Footprint::Exact` (first-order conservative). `controlledburn` is a new
   dependency. (2026-10-28)
 - `ResampleAlg::Mode` with `ModeTies` (`MODE_TIES`). (2026-10-28)
+
 - `BandNodata` (`UNIFIED_SRC_NODATA`) and `AverageThresholds`
   (`NODATA_VALUES_PCT_THRESHOLD`, `EXCLUDED_VALUES`). (2026-10-28)
 - `ResampleAlg::CubicSpline`, `Min`, `Max`, `Med`, `Q1`, `Q3` and `Rms`,
@@ -52,6 +53,16 @@ gains variants.
 - Multi-band nodata follows GDAL's default (a pixel is nodata only where
   every band is); the 0.1 rule is `BandNodata::AnyBand`.
 - `Sample` requires `PartialOrd`.
+- `Footprint::Exact` is 2 to 6x faster. The destination pixel lattice is
+  transformed once per row band (shared corners and edge points) instead
+  of four points per pixel, and coverage comes from
+  `controlledburn::CoverageWindow` (0.2.2) instead of one `burn` call per
+  pixel. With an exact transformer the output is unchanged, except for
+  pixels straddling the antimeridian, which the exact footprint does not
+  handle (it gave a different wrong answer before). The lattice's row
+  lines go to the transformer as scanlines, so an `ApproxTransformer` now
+  approximates them, as for the box footprint; before, it transformed the
+  exact footprint's points exactly.
 - `WarpOptions` is not generic: `nodata: Option<T>` is replaced by
   `src_nodata: Nodata` and `dst_nodata: DstNodata`.
 - Bilinear uses GDAL's general formula for types and cases where GDAL
