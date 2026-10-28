@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use rwarp::warp::{estimate_scale, warp, KernelScaling, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{estimate_scale, warp, Footprint, KernelScaling, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::Transformer;
 
 const N: usize = 64;
@@ -54,26 +54,32 @@ fn read_grid(name: &str) -> Grid {
 }
 
 /// Destination pixel -> source pixel through the geotransforms gdalwarp
-/// uses: source `[0, 1, 0, 64, 0, -1]`, destination the same extent at
-/// `dw` x `dh`.
+/// uses: the destination's `gt`, then the inverse of the source's
+/// `[0, 1, 0, 64, 0, -1]`.
 struct Affine {
-    dx: f64,
-    dy: f64,
+    gt: [f64; 6],
 }
 
 impl Affine {
+    /// Destination covering the source extent at `dw` x `dh`.
     fn new(dw: usize, dh: usize) -> Self {
-        Affine { dx: N as f64 / dw as f64, dy: N as f64 / dh as f64 }
+        Affine { gt: [0.0, N as f64 / dw as f64, 0.0, N as f64, 0.0, -(N as f64) / dh as f64] }
+    }
+
+    fn of(g: &Grid) -> Self {
+        let v: Vec<f64> = g.header("dst_gt").split_whitespace().map(|v| v.parse().unwrap()).collect();
+        Affine { gt: v.try_into().unwrap() }
     }
 }
 
 impl Transformer for Affine {
     fn transform(&self, dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
         assert!(dst_to_src);
+        let g = &self.gt;
         for (x, y) in x.iter_mut().zip(y.iter_mut()) {
-            *x *= self.dx;
-            let geo_y = N as f64 - *y * self.dy;
-            *y = N as f64 - geo_y;
+            let (gx, gy) = (g[0] + *x * g[1] + *y * g[2], g[3] + *x * g[4] + *y * g[5]);
+            *x = gx;
+            *y = N as f64 - gy;
         }
         vec![true; x.len()]
     }
@@ -84,6 +90,7 @@ fn alg_of(name: &str) -> ResampleAlg {
         "bilinear" => ResampleAlg::Bilinear,
         "cubic" => ResampleAlg::Cubic,
         "lanczos" => ResampleAlg::Lanczos,
+        "average" => ResampleAlg::Average,
         _ => panic!("unknown alg {name}"),
     }
 }
@@ -106,7 +113,7 @@ fn run_case(name: &str) -> (Grid, Vec<f32>) {
         nodata: Some(NODATA),
         ..Default::default()
     };
-    let got = warp(&Affine::new(expect.ncol, expect.nrow), &buf, expect.ncol, expect.nrow, &opts);
+    let got = warp(&Affine::of(&expect), &buf, expect.ncol, expect.nrow, &opts);
     (expect, got)
 }
 
@@ -149,15 +156,18 @@ parity!(
     bilinear_1p49x, lanczos_1p49x,
     bilinear_4x_point, cubic_4x_point, lanczos_4x_point,
     bilinear_4x_nodata, cubic_4x_nodata, lanczos_4x_nodata,
+    bilinear_rot30, lanczos_rot30,
+    average_4x, average_2p78x, average_aniso, average_1p49x,
+    average_upsample, average_overhang, average_4x_nodata, average_rot30,
 );
 
 #[test]
 fn estimated_scale_matches_gdal() {
-    for name in ["bilinear_4x", "bilinear_2p78x", "bilinear_aniso", "bilinear_1p49x"] {
+    for name in ["bilinear_4x", "bilinear_2p78x", "bilinear_aniso", "bilinear_1p49x", "bilinear_rot30", "average_upsample"] {
         let g = read_grid(name);
         let mut s = g.header("gdal_scale").split_whitespace().map(|v| v.parse::<f64>().unwrap());
         let (gx, gy) = (s.next().unwrap(), s.next().unwrap());
-        let (sx, sy) = estimate_scale(&Affine::new(g.ncol, g.nrow), g.ncol, g.nrow, 0, 0);
+        let (sx, sy) = estimate_scale(&Affine::of(&g), g.ncol, g.nrow, 0, 0);
         // GDAL logs the scale with %f.
         assert!((sx - gx).abs() < 5e-7 && (sy - gy).abs() < 5e-7, "{name}: gdal ({gx}, {gy}) rwarp ({sx}, {sy})");
     }
@@ -187,4 +197,92 @@ fn widening_changes_output_and_point_does_not_widen() {
     let widened = warp(&t, &buf, 16, 16, &opts(KernelScaling::WidenWhenDownsampling));
     assert_eq!(point, fixed_one, "scale 1 is the point kernel");
     assert_ne!(point, widened);
+}
+
+// ---- average: exact footprint ---------------------------------------------
+
+fn average(t: &impl Transformer, src: &Grid, dw: usize, dh: usize, footprint: Footprint) -> Vec<f32> {
+    let buf = SourceBuffer { data: &src.vals[..], ncol: src.ncol, nrow: src.nrow, nbands: 1, col_off: 0, row_off: 0 };
+    let opts = WarpOptions { alg: ResampleAlg::Average, footprint, nodata: Some(NODATA), ..Default::default() };
+    warp(t, &buf, dw, dh, &opts)
+}
+
+/// Where the destination pixel maps to an axis-aligned rectangle, GDAL's
+/// box is the exact footprint, so the two agree (up to the f32 coverage
+/// fractions controlledburn stores).
+#[test]
+fn exact_equals_gdal_box_when_axis_aligned() {
+    for name in ["average_4x", "average_2p78x", "average_aniso", "average_upsample", "average_4x_nodata"] {
+        let g = read_grid(name);
+        let src = read_grid(if g.header("nodata_src") == "True" { "src_nodata" } else { "src" });
+        let t = Affine::of(&g);
+        let exact = average(&t, &src, g.ncol, g.nrow, Footprint::Exact { densify: 1 });
+        assert_close(name, &g, &exact, 1e-5);
+    }
+}
+
+/// A source whose value is its column index, and one destination pixel
+/// rotated 45 degrees into a diamond centred on x = 5: by symmetry the
+/// exact area-weighted mean is 4.5. GDAL's box degenerates to the column
+/// at x = 5 (the top-left and bottom-right corners share it) and gives 5.
+#[test]
+fn rotated_diamond_exact_vs_gdal_box() {
+    let (w, h) = (10usize, 10usize);
+    let vals: Vec<f32> = (0..w * h).map(|i| (i % w) as f32).collect();
+    let src = Grid { header: vec![], ncol: w, nrow: h, vals };
+    // A 4x4 pixel rotated 45 degrees. Through `Affine` (source y = 64 -
+    // geo y) its corners land at source (5, 1), (7.83, 3.83), (2.17, 3.83)
+    // and (5, 6.66): a diamond centred on x = 5, inside the 10x10 source.
+    let s = 2f64.sqrt() * 2.0;
+    let t = Affine { gt: [5.0, s, -s, N as f64 - 1.0, -s, -s] };
+    let exact = average(&t, &src, 1, 1, Footprint::Exact { densify: 1 });
+    let gdal_box = average(&t, &src, 1, 1, Footprint::GdalBox);
+    assert!((exact[0] - 4.5).abs() < 1e-5, "exact {}", exact[0]);
+    assert_eq!(gdal_box[0], 5.0);
+}
+
+/// Under an affine rotation the footprint is a quadrilateral, so densifying
+/// its edges changes nothing; and GDAL's box differs from it.
+#[test]
+fn exact_under_rotation_is_densify_invariant_and_differs_from_box() {
+    let src = read_grid("src");
+    let g = read_grid("average_rot30");
+    let t = Affine::of(&g);
+    let a = average(&t, &src, g.ncol, g.nrow, Footprint::Exact { densify: 1 });
+    let b = average(&t, &src, g.ncol, g.nrow, Footprint::Exact { densify: 8 });
+    for (x, y) in a.iter().zip(&b) {
+        assert!((x - y).abs() <= 1e-4 * x.abs().max(1.0), "{x} vs {y}");
+    }
+    // And the box differs from the exact footprint under rotation.
+    let boxed = average(&t, &src, g.ncol, g.nrow, Footprint::GdalBox);
+    assert!(a.iter().zip(&boxed).any(|(x, y)| (x - y).abs() > 1.0));
+}
+
+/// Cost of the exact footprint against GDAL's box.
+/// `cargo test --release --test kernels -- --ignored --nocapture timing`
+#[test]
+#[ignore]
+fn timing_average_footprints() {
+    let (w, h) = (1024usize, 1024usize);
+    let vals: Vec<f32> = (0..w * h).map(|i| (i % 997) as f32).collect();
+    let buf = SourceBuffer { data: &vals[..], ncol: w, nrow: h, nbands: 1, col_off: 0, row_off: 0 };
+    // 256x256 over the 1024x1024 source (4:1), rotated slightly.
+    struct Rot;
+    impl Transformer for Rot {
+        fn transform(&self, _: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+            let (c, s) = (0.1f64.cos(), 0.1f64.sin());
+            for (x, y) in x.iter_mut().zip(y.iter_mut()) {
+                let (u, v) = (*x * 3.5, *y * 3.5);
+                *x = 60.0 + c * u - s * v;
+                *y = 60.0 + s * u + c * v;
+            }
+            vec![true; x.len()]
+        }
+    }
+    for footprint in [Footprint::GdalBox, Footprint::Exact { densify: 1 }, Footprint::Exact { densify: 4 }] {
+        let opts = WarpOptions { alg: ResampleAlg::Average, footprint, ..Default::default() };
+        let t = std::time::Instant::now();
+        let _ = warp(&Rot, &buf, 256, 256, &opts);
+        eprintln!("{footprint:?}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
 }

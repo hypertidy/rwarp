@@ -1,4 +1,4 @@
-//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos.
+//! Warp kernels: nearest-neighbour, bilinear, cubic, lanczos, average.
 //!
 //! Maps GDAL's gdalwarpkernel.cpp (~line 5510 onwards) and
 //! gdalresamplingkernels.h.
@@ -51,6 +51,29 @@
 //! `GWKResample`). The point kernels keep their edge and nodata fallbacks
 //! described below.
 //!
+//! ## Average
+//!
+//! [`ResampleAlg::Average`] is the weighted mean of the source pixels a
+//! destination pixel's footprint covers, over the valid ones only (nodata
+//! pixels add neither value nor weight, so the mean is renormalised).
+//! [`Footprint`] chooses how coverage is measured, in source pixel space:
+//!
+//! - [`Footprint::GdalBox`] (default) is GDAL's: transform the destination
+//!   pixel's top-left and bottom-right corners, take the axis-aligned box
+//!   between them, weight each source pixel by the fraction of it inside
+//!   the box per axis (`GWKAverageOrModeThread`, gdalwarpkernel.cpp
+//!   ~L6845-7030, ~L7960). It follows GDAL's quirks: only two corners are
+//!   used, so a rotated pixel can collapse to a thin box; a box overhanging
+//!   the buffer edge weights the edge pixel above 1; a target pixel on the
+//!   antimeridian wraps past the right edge.
+//! - [`Footprint::Exact`] intersects the transformed outline exactly with
+//!   the source pixels, which with renormalisation is first-order
+//!   conservative remapping with areas in source pixel space.
+//!
+//! For a destination pixel that maps to an axis-aligned rectangle the two
+//! agree. The exact footprint costs about 25x the box (4 µs a pixel at
+//! 4:1 in the timing test).
+//!
 //! ## Nodata handling (point kernels)
 //!
 //! **Nearest-neighbour**: nodata pixels in source are skipped; destination
@@ -79,6 +102,9 @@ pub enum ResampleAlg {
     Bilinear,          // 2×2,      radius 1
     Cubic,             // 4×4,      radius 2  (Catmull-Rom, a = -0.5)
     Lanczos,           // 6×6,      radius 3  (sinc windowed sinc)
+    /// Area-weighted mean of the source pixels a destination pixel covers,
+    /// over the valid ones; see [`Footprint`].
+    Average,
 }
 
 impl ResampleAlg {
@@ -89,6 +115,7 @@ impl ResampleAlg {
             ResampleAlg::Bilinear => 1,
             ResampleAlg::Cubic => 2,
             ResampleAlg::Lanczos => 3,
+            ResampleAlg::Average => 0,
         }
     }
 
@@ -96,7 +123,7 @@ impl ResampleAlg {
     /// nearest, which has no kernel.
     fn weight(self, x: f64) -> f64 {
         match self {
-            ResampleAlg::NearestNeighbour => 0.0,
+            ResampleAlg::NearestNeighbour | ResampleAlg::Average => 0.0,
             ResampleAlg::Bilinear => {
                 let ax = x.abs();
                 if ax <= 1.0 { 1.0 - ax } else { 0.0 }
@@ -123,11 +150,35 @@ pub enum KernelScaling {
     Fixed { x: f64, y: f64 },
 }
 
+/// How [`ResampleAlg::Average`] measures the overlap of a destination
+/// pixel with source pixels. Both measure area in source pixel space, which
+/// is planar area in the source CRS for an affine source; neither is area
+/// in the target CRS or on the ellipsoid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Footprint {
+    /// GDAL's footprint (`GWKAverageOrModeThread`, gdalwarpkernel.cpp
+    /// ~L7577): the axis-aligned box between the transformed top-left and
+    /// bottom-right corners of the destination pixel, with fractional
+    /// weights for the source pixels it partly covers. Exact when the
+    /// destination pixel maps to an axis-aligned rectangle; under rotation,
+    /// shear or curvature the box can be far from the true footprint.
+    GdalBox,
+    /// The destination pixel's outline, each edge split into `densify`
+    /// segments, transformed to source pixel space and intersected exactly
+    /// with the source pixels (coverage fractions from [`controlledburn`],
+    /// stored as `f32`). With renormalisation over valid pixels this is
+    /// first-order conservative remapping. No antimeridian handling.
+    Exact { densify: usize },
+}
+
 /// Options for [`warp`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WarpOptions<T> {
     pub alg: ResampleAlg,
     pub scaling: KernelScaling,
+    /// Footprint for [`ResampleAlg::Average`]; ignored by the other
+    /// methods.
+    pub footprint: Footprint,
     /// Source pixels where any band equals this are nodata, and it is the
     /// fill for destination pixels with no value. `None` fills with
     /// [`Sample::zero`].
@@ -145,6 +196,7 @@ impl<T: Sample> Default for WarpOptions<T> {
         WarpOptions {
             alg: ResampleAlg::NearestNeighbour,
             scaling: KernelScaling::WidenWhenDownsampling,
+            footprint: Footprint::GdalBox,
             nodata: None,
             mask_band: None,
             dst_col_off: 0,
@@ -310,7 +362,7 @@ impl Widened {
     /// `None` when GDAL would use the point kernel at this scale.
     fn new(alg: ResampleAlg, sx: f64, sy: f64) -> Option<Self> {
         let widen = match alg {
-            ResampleAlg::NearestNeighbour => false,
+            ResampleAlg::NearestNeighbour | ResampleAlg::Average => false,
             ResampleAlg::Bilinear | ResampleAlg::Cubic => !(sx > 0.5 && sy > 0.5),
             ResampleAlg::Lanczos => sx < 1.0 || sy < 1.0,
         };
@@ -369,6 +421,15 @@ pub fn warp_resample(
             src_col_off, src_row_off, dst_ncol, dst_nrow, nodata,
             lanczos_sample,
         ),
+        // Area methods have one implementation, the generic one.
+        ResampleAlg::Average => {
+            let src = SourceBuffer {
+                data: src_pixels, ncol: src_ncol, nrow: src_nrow, nbands: 1,
+                col_off: src_col_off, row_off: src_row_off,
+            };
+            let opts = WarpOptions { alg, nodata: Some(nodata), ..Default::default() };
+            warp(transformer, &src, dst_ncol, dst_nrow, &opts)
+        }
     }
 }
 
@@ -791,14 +852,17 @@ pub fn warp<T: Sample>(
         mask: opts.mask_band, nodata: opts.nodata,
     };
     let alg = opts.alg;
-    let widened = match opts.scaling {
-        KernelScaling::Point => None,
+    let (sx, sy) = match opts.scaling {
+        KernelScaling::Point => (1.0, 1.0),
         KernelScaling::WidenWhenDownsampling => {
-            let (sx, sy) = estimate_scale(transformer, dst_ncol, dst_nrow, opts.dst_col_off, opts.dst_row_off);
-            Widened::new(alg, sx, sy)
+            estimate_scale(transformer, dst_ncol, dst_nrow, opts.dst_col_off, opts.dst_row_off)
         }
-        KernelScaling::Fixed { x, y } => Widened::new(alg, x, y),
+        KernelScaling::Fixed { x, y } => (x, y),
     };
+    if alg == ResampleAlg::Average {
+        return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy));
+    }
+    let widened = Widened::new(alg, sx, sy);
 
     let fill = opts.nodata.unwrap_or_else(T::zero);
     let mut out = vec![fill; dst_ncol * dst_nrow * nbands];
@@ -850,7 +914,7 @@ pub fn warp<T: Sample>(
                 (None, ResampleAlg::Lanczos) => {
                     img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut acc, &mut row_acc, &mut wx)
                 }
-                (None, ResampleAlg::NearestNeighbour) => unreachable!(),
+                (None, ResampleAlg::NearestNeighbour | ResampleAlg::Average) => unreachable!(),
             };
             if hit {
                 for b in 0..nbands {
@@ -1027,6 +1091,272 @@ impl<'a, T: Sample> Interleaved<'a, T> {
             for (o, &r) in acc.iter_mut().zip(row_acc.iter()) { *o += r * wyj; }
         }
         true
+    }
+}
+
+// =========================================================================
+// Area methods (average)
+// =========================================================================
+
+/// Running weighted mean over the bands of the source pixels a footprint
+/// covers (West's weighted incremental algorithm, as GDAL's average uses).
+struct AreaMean<'a> {
+    mean: &'a mut [f64],
+    total: f64,
+}
+
+impl<'a> AreaMean<'a> {
+    fn new(mean: &'a mut [f64]) -> Self {
+        for v in mean.iter_mut() { *v = 0.0; }
+        AreaMean { mean, total: 0.0 }
+    }
+
+    #[inline]
+    fn add<T: Sample>(&mut self, pix: &[T], w: f64) {
+        self.total += w;
+        let f = w / self.total;
+        for (m, &v) in self.mean.iter_mut().zip(pix) {
+            *m += f * (v.to_f64() - *m);
+        }
+    }
+}
+
+/// Source window of a destination pixel under GDAL's box footprint
+/// (`GWKAverageOrModeComputeSourceCoords`, gdalwarpkernel.cpp ~L6919):
+/// fractional bounds in buffer pixels and the integer range they touch.
+#[derive(Debug, Clone, Copy)]
+struct SrcBox {
+    x0: f64, x1: f64, y0: f64, y1: f64,
+    ix0: i64, ix1: i64, iy0: i64, iy1: i64,
+    wrap: bool,
+}
+
+impl SrcBox {
+    /// GDAL's per-pixel weight: the fraction of the source pixel inside the
+    /// box along each axis (`COMPUTE_WEIGHT`, ~L6849). Only the first and
+    /// last row/column are partial. A box that overhangs the buffer edge
+    /// gives its edge pixel a weight above 1, as in GDAL.
+    #[inline]
+    fn weight(&self, ix: i64, iy: i64) -> f64 {
+        let wy = if iy == self.iy0 {
+            if self.iy0 + 1 == self.iy1 { 1.0 } else { 1.0 - (self.y0 - self.iy0 as f64) }
+        } else if iy + 1 == self.iy1 {
+            1.0 - (self.iy1 as f64 - self.y1)
+        } else {
+            1.0
+        };
+        if ix == self.ix0 {
+            if self.ix0 + 1 == self.ix1 { wy } else { wy * (1.0 - (self.x0 - self.ix0 as f64)) }
+        } else if ix + 1 == self.ix1 {
+            wy * (1.0 - (self.ix1 as f64 - self.x1))
+        } else {
+            wy
+        }
+    }
+}
+
+/// Warp with an area method, row by row.
+fn warp_area<T: Sample>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    src_off: (f64, f64),
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions<T>,
+    scale: (f64, f64),
+) -> Vec<T> {
+    let nb = img.nb;
+    let fill = opts.nodata.unwrap_or_else(T::zero);
+    let mut out = vec![fill; dst_ncol * dst_nrow * nb];
+    let mut mean = vec![0.0f64; nb];
+    for dst_row in 0..dst_nrow {
+        let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
+        match opts.footprint {
+            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut mean, row_out),
+            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut mean, row_out),
+        }
+    }
+    out
+}
+
+/// One destination row under GDAL's box footprint (`GWKAverageOrModeThread`
+/// and `GWKAverageOrModeComputeLineCoords`, gdalwarpkernel.cpp ~L6873-7030,
+/// ~L7960 for the average itself).
+#[allow(clippy::too_many_arguments)]
+fn area_row_gdal_box<T: Sample>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    (col_off, row_off): (f64, f64),
+    dst_row: usize,
+    dst_ncol: usize,
+    opts: &WarpOptions<T>,
+    (sx, sy): (f64, f64),
+    mean: &mut [f64],
+    row_out: &mut [T],
+) {
+    let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
+    // Top-left and bottom-right corners of every pixel in the row.
+    let mut x1: Vec<f64> = (0..dst_ncol).map(|c| c as f64 + xoff).collect();
+    let mut y1 = vec![yoff; dst_ncol];
+    let mut x2: Vec<f64> = (0..dst_ncol).map(|c| c as f64 + 1.0 + xoff).collect();
+    let mut y2 = vec![yoff + 1.0; dst_ncol];
+    let ok1 = transformer.transform(true, &mut x1, &mut y1);
+    let ok2 = transformer.transform(true, &mut x2, &mut y2);
+
+    let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
+    // Corners well outside the buffer are rejected (GDAL issue #2365).
+    let xmargin = 2.0 * 1f64.max((1.0 / sx).ceil());
+    let ymargin = 2.0 * 1f64.max((1.0 / sy).ceil());
+    const EPSILON: f64 = 1e-10;
+
+    for c in 0..dst_ncol {
+        if !(ok1[c] && ok2[c]) { continue; }
+        let in_range = |v: f64, off: f64, n: f64, m: f64| v - off >= -m && v - off - n <= m;
+        if !(in_range(x1[c], col_off, ncol as f64, xmargin) && in_range(x2[c], col_off, ncol as f64, xmargin)
+            && in_range(y1[c], row_off, nrow as f64, ymargin) && in_range(y2[c], row_off, nrow as f64, ymargin))
+        {
+            continue;
+        }
+        // The transform need not preserve ordering (GDAL #5433).
+        if x1[c] > x2[c] { std::mem::swap(&mut x1[c], &mut x2[c]); }
+
+        // A target pixel straddling the antimeridian maps to the two ends
+        // of the source row; GDAL detects it from the corners and a probe at
+        // the top-edge midpoint (#6478), and wraps the box past the right
+        // edge.
+        let mut wrap = false;
+        let threshold = 2i64.min(ncol / 10) as f64;
+        if col_off == 0.0 && c + 1 < dst_ncol
+            && 2.0 * x1[c] - x1[c + 1] < threshold
+            && ncol as f64 - x2[c] < threshold
+        {
+            let (mut px, mut py) = ([c as f64 + 0.5 + xoff], [yoff]);
+            let pok = transformer.transform(true, &mut px, &mut py);
+            if pok[0] && px[0] < x1[c] {
+                wrap = true;
+                std::mem::swap(&mut x1[c], &mut x2[c]);
+                x2[c] += ncol as f64;
+            }
+        }
+
+        let (bx0, bx1) = (x1[c] - col_off, x2[c] - col_off);
+        if !(bx1 > -EPSILON && bx0 < ncol as f64 + EPSILON) { continue; }
+        let ix0 = (bx0 + EPSILON).floor().max(0.0) as i64;
+        let mut ix1 = (bx1 - EPSILON).ceil().min(i32::MAX as f64) as i64;
+        if !wrap { ix1 = ix1.min(ncol); }
+        if ix0 == ix1 && ix1 < ncol { ix1 += 1; }
+
+        if y1[c] > y2[c] { std::mem::swap(&mut y1[c], &mut y2[c]); }
+        let (by0, by1) = (y1[c] - row_off, y2[c] - row_off);
+        if !(by1 > -EPSILON && by0 < nrow as f64 + EPSILON) { continue; }
+        let iy0 = (by0 + EPSILON).floor().max(0.0) as i64;
+        let mut iy1 = ((by1 - EPSILON).ceil() as i64).min(nrow);
+        if iy0 == iy1 && iy1 < nrow { iy1 += 1; }
+
+        let b = SrcBox { x0: bx0, x1: bx1, y0: by0, y1: by1, ix0, ix1, iy0, iy1, wrap };
+        let mut m = AreaMean::new(mean);
+        for iy in b.iy0..b.iy1 {
+            for ix in b.ix0..b.ix1 {
+                let col = if b.wrap { ix % ncol } else { ix };
+                let p = (iy * ncol + col) as usize;
+                if !img.valid(p) { continue; }
+                let w = b.weight(ix, iy);
+                if w > 0.0 { m.add(img.px(p), w); }
+            }
+        }
+        if m.total > 0.0 {
+            for (o, &v) in row_out[c * img.nb..(c + 1) * img.nb].iter_mut().zip(m.mean.iter()) {
+                *o = T::from_f64(v);
+            }
+        }
+    }
+}
+
+/// One destination row under the exact footprint: each pixel's outline,
+/// densified and transformed, burned onto the source pixels it touches
+/// with exact coverage fractions.
+#[allow(clippy::too_many_arguments)]
+fn area_row_exact<T: Sample>(
+    transformer: &impl Transformer,
+    img: &Interleaved<'_, T>,
+    (col_off, row_off): (f64, f64),
+    dst_row: usize,
+    dst_ncol: usize,
+    opts: &WarpOptions<T>,
+    densify: usize,
+    mean: &mut [f64],
+    row_out: &mut [T],
+) {
+    use controlledburn::{burn, BurnOptions, Coord, Geometry, GridSpec, Polygon};
+
+    let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
+    let per = 4 * densify;
+    let mut xs = Vec::with_capacity(per * dst_ncol);
+    let mut ys = Vec::with_capacity(per * dst_ncol);
+    for c in 0..dst_ncol {
+        let (x0, y0) = (c as f64 + xoff, yoff);
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0 + t); ys.push(y0);             // top, left to right
+        }
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0 + 1.0); ys.push(y0 + t);       // right, downwards
+        }
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0 + 1.0 - t); ys.push(y0 + 1.0); // bottom, right to left
+        }
+        for k in 0..densify {
+            let t = k as f64 / densify as f64;
+            xs.push(x0); ys.push(y0 + 1.0 - t);       // left, upwards
+        }
+    }
+    let ok = transformer.transform(true, &mut xs, &mut ys);
+
+    let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
+    for c in 0..dst_ncol {
+        let r = c * per..(c + 1) * per;
+        if !ok[r.clone()].iter().all(|&v| v) { continue; }
+        // Source pixel space, y flipped so that row 0 is at the top of the
+        // grid as controlledburn expects.
+        let mut ring: Vec<Coord> = xs[r.clone()].iter().zip(&ys[r])
+            .map(|(&x, &y)| Coord::new(x - col_off, -(y - row_off)))
+            .collect();
+        if !ring.iter().all(|p| p.is_finite()) { continue; }
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for p in &ring {
+            minx = minx.min(p.x); maxx = maxx.max(p.x);
+            miny = miny.min(-p.y); maxy = maxy.max(-p.y);
+        }
+        // Burn onto just the buffer pixels under the footprint's bbox.
+        // (Burning a whole row in one call measured no faster.)
+        let c0 = (minx.floor() as i64).max(0);
+        let c1 = (maxx.ceil() as i64).min(ncol);
+        let r0 = (miny.floor() as i64).max(0);
+        let r1 = (maxy.ceil() as i64).min(nrow);
+        if c0 >= c1 || r0 >= r1 { continue; }
+        ring.push(ring[0]);
+        let grid = GridSpec::new(c0 as f64, -(r1 as f64), c1 as f64, -(r0 as f64), (c1 - c0) as u32, (r1 - r0) as u32);
+        let Ok(res) = burn(&[Geometry::Polygon(Polygon::new(vec![ring]))], &grid, BurnOptions::coverage()) else { continue };
+
+        let mut m = AreaMean::new(mean);
+        let at = |row: i32, col: i64| ((r0 + row as i64) * ncol + c0 + col) as usize;
+        for run in &res.runs {
+            for col in run.col_start..run.col_end {
+                let p = at(run.row, col as i64);
+                if img.valid(p) { m.add(img.px(p), 1.0); }
+            }
+        }
+        for e in &res.edges {
+            let p = at(e.row, e.col as i64);
+            if img.valid(p) && e.fraction > 0.0 { m.add(img.px(p), e.fraction as f64); }
+        }
+        if m.total > 0.0 {
+            for (o, &v) in row_out[c * img.nb..(c + 1) * img.nb].iter_mut().zip(m.mean.iter()) {
+                *o = T::from_f64(v);
+            }
+        }
     }
 }
 

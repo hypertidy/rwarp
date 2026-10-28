@@ -41,8 +41,8 @@
 //! [read]  (caller: fetch bytes from COG / Zarr / parquet byte-ref store)
 //!       │
 //!       ▼
-//! [warp]  warp_resample
-//!         → nearest / bilinear / cubic / lanczos kernel
+//! [warp]  warp
+//!         → nearest / bilinear / cubic / lanczos / average kernel
 //! ```
 //!
 //! Before touching any pixels you can inspect
@@ -57,7 +57,7 @@
 //! | [`gcp_transform`] | `GcpTransformer` (polynomial order 1–3) | `GDALGCPTransform` |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `ComputeSourceWindow`, `CollectChunkList` | `GDALWarpOperation` planning |
-//! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
+//! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening and area-weighted average, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
 //!
 //! ## Validation status
 //!
@@ -74,6 +74,8 @@
 //! | Bilinear/cubic/lanczos | GEBCO at ~1:1 ratio | 65536/65536 identical to GDAL |
 //! | Kernel widening, scale estimate | synthetic 64×64 Float32, 1.5:1 to 4:1, anisotropic, with nodata (`tests/kernels.rs`) | within 1e-6 relative of `gdalwarp` (GDAL 3.14.0dev-739fcf03bf) |
 //! | Point kernels at any ratio | same, against `gdalwarp -wo XSCALE=1 -wo YSCALE=1` | within 1e-6 relative |
+//! | Average (GDAL box) | same, plus upsampling, overhanging and 30°-rotated destinations | within 1e-6 relative of `gdalwarp -r average` |
+//! | Average (exact footprint) | axis-aligned cases vs the GDAL box; 45° diamond vs the analytic mean | within 1e-5 (f32 coverage fractions) |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
 //!
 //! **Downsampled interpolated warps:** when the output is coarser than the
@@ -133,7 +135,7 @@
 //! | `gcp_transform.rs` | `alg/gdal_crs.c` | GCP polynomial fit |
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
-//! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840 (at `739fcf03bf`, 3.14.0dev) |
+//! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840; average ~L6845-7030, ~L7577, ~L7960 (at `739fcf03bf`, 3.14.0dev) |
 
 pub mod crs;
 pub mod transform;

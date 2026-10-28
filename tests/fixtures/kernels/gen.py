@@ -67,7 +67,42 @@ CASES = [
     ("bilinear_4x_nodata", "bilinear", 16, 16, {}, True),
     ("cubic_4x_nodata", "cubic", 16, 16, {}, True),
     ("lanczos_4x_nodata", "lanczos", 16, 16, {}, True),
+    # Rotated destination: the scale estimate takes its area branch.
+    ("bilinear_rot30", "bilinear", 8, 8, {}, False),
+    ("lanczos_rot30", "lanczos", 8, 8, {}, False),
+    # Average (GDAL's box footprint).
+    ("average_4x", "average", 16, 16, {}, False),
+    ("average_2p78x", "average", 23, 23, {}, False),
+    ("average_aniso", "average", 16, 40, {}, False),
+    ("average_1p49x", "average", 43, 43, {}, False),
+    ("average_upsample", "average", 128, 128, {}, False),
+    ("average_overhang", "average", 20, 20, {}, False),
+    ("average_4x_nodata", "average", 16, 16, {}, True),
+    ("average_rot30", "average", 8, 8, {}, False),
 ]
+
+
+def rot30_gt():
+    """8x8 pixels of size 4 rotated 30 degrees about the source centre."""
+    t, size = math.radians(30), 4.0
+    g1, g2, g4, g5 = size * math.cos(t), size * math.sin(t), size * math.sin(t), -size * math.cos(t)
+    return [32 - 4 * (g1 + g2), g1, g2, 32 - 4 * (g4 + g5), g4, g5]
+
+
+def dst_dataset(name, w, h):
+    """Destination for cases that need more than outputBounds."""
+    if name.endswith("rot30"):
+        gt = rot30_gt()
+    elif name == "average_overhang":
+        # Overhangs the source by 8 on every side.
+        gt = [-8, 80 / w, 0, N + 8, 0, -80 / h]
+    else:
+        return None
+    ds = gdal.GetDriverByName("MEM").Create("", w, h, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform(gt)
+    ds.GetRasterBand(1).SetNoDataValue(NODATA)
+    ds.GetRasterBand(1).Fill(NODATA)
+    return ds
 
 
 def write_grid(path, header, w, h, vals):
@@ -93,10 +128,17 @@ def main():
         msgs = []
         gdal.PushErrorHandler(lambda cls, no, msg: msgs.append(msg))
         try:
-            out = gdal.Warp("", mem_source(source(holes), holes), format="MEM",
-                            outputBounds=[0, 0, N, N], width=w, height=h,
-                            resampleAlg=alg, errorThreshold=0, outputType=gdal.GDT_Float32,
-                            dstNodata=NODATA, warpOptions=wo)
+            src = mem_source(source(holes), holes)
+            dst = dst_dataset(name, w, h)
+            if dst is None:
+                out = gdal.Warp("", src, format="MEM",
+                                outputBounds=[0, 0, N, N], width=w, height=h,
+                                resampleAlg=alg, errorThreshold=0, outputType=gdal.GDT_Float32,
+                                dstNodata=NODATA, warpOptions=wo)
+            else:
+                gdal.Warp(dst, src, resampleAlg=alg, errorThreshold=0, dstNodata=NODATA,
+                          warpOptions=wo)
+                out = dst
         finally:
             gdal.PopErrorHandler()
         scale = next((m for m in msgs if "dfXScale" in m), None)
@@ -105,7 +147,8 @@ def main():
         opts = " ".join(f"{k}={v}" for k, v in wo.items()) or "-"
         write_grid(os.path.join(HERE, f"{name}.txt"),
                    [f"gdal {gdal.__version__}", f"alg {alg}", f"wo {opts}",
-                    f"nodata_src {holes}", f"gdal_scale {sx} {sy}"],
+                    f"nodata_src {holes}", f"gdal_scale {sx} {sy}",
+                    "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
                    w, h, vals)
         print(name, sx, sy)
 
