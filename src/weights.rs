@@ -527,7 +527,7 @@ impl Weights {
     pub fn apply<S: Sample, D: Sample>(&self, src: &SourceBuffer<'_, S>, norm: Normalization, opts: &ApplyOptions) -> Vec<D> {
         let nb = src.nbands;
         assert_eq!(src.data.len(), src.ncol * src.nrow * nb, "source buffer size mismatch");
-        assert!(opts.mask_band.map_or(true, |a| a < nb), "mask_band out of range");
+        assert!(opts.mask_band.is_none_or(|a| a < nb), "mask_band out of range");
         let ncell = self.dst_size[0] * self.dst_size[1];
         assert_eq!(self.dst_area.len(), ncell, "dst_area size mismatch");
         let out_spec = Output::<D>::from_nodata(S::DATA_TYPE, nb, &opts.src_nodata, &opts.dst_nodata);
