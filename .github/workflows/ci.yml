@@ -1,0 +1,105 @@
+# Tests, builds and packaging on every pull request and push to main.
+# Independent of pages.yml, which builds and deploys the wasm demo.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Default features: the proj crate over the system libproj.
+  libproj:
+    name: test (libproj)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libproj
+        run: sudo apt-get update && sudo apt-get install -y libproj-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      # Catches what would stop a crates.io release, such as a git
+      # dependency without a version; verifies the packaged crate builds.
+      - run: cargo package
+
+  # Pure-Rust backend on each platform.
+  proj4rs:
+    name: test (proj4rs, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features --features proj4rs
+
+  # The rust-version in Cargo.toml. Cargo.lock is not committed, so resolve
+  # dependency versions that support it.
+  msrv:
+    name: test (MSRV)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features --features proj4rs
+
+  # rwarp-wasm's native tests, and both crates building for the browser
+  # target (no wasm-pack, no deploy: that is pages.yml).
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            rwarp-wasm
+      - run: cargo test --manifest-path rwarp-wasm/Cargo.toml
+      - run: cargo build --no-default-features --features proj4rs --target wasm32-unknown-unknown
+      - run: cargo build --manifest-path rwarp-wasm/Cargo.toml --target wasm32-unknown-unknown --release
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --no-default-features --features proj4rs
+
+  # Advisory until the existing warnings are sorted out.
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --no-default-features --features proj4rs
