@@ -1,4 +1,7 @@
-# Build rwarp-wasm and publish the demo to GitHub Pages.
+# Build the documentation site and publish it to GitHub Pages:
+#   /        the book (book/), with the changelog
+#   /demo/   the rwarp-wasm browser demo
+#   /api/    rustdoc for main
 # One-time setup in the repo: Settings -> Pages -> Source: "GitHub Actions".
 name: pages
 
@@ -9,6 +12,9 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "rwarp-wasm/**"
+      - "book/**"
+      - "examples/**"
+      - "CHANGELOG.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -40,13 +46,27 @@ jobs:
           cargo test --manifest-path rwarp-wasm/Cargo.toml
       - name: Build wasm
         run: wasm-pack build --target web --release rwarp-wasm
-      - name: Assemble site
+      - name: Install mdBook
         run: |
-          mkdir -p site/pkg
-          cp rwarp-wasm/www/* site/
-          cp rwarp-wasm/pkg/rwarp_wasm.js rwarp-wasm/pkg/rwarp_wasm_bg.wasm site/pkg/
-          # www/ imports ../pkg/...; on the site both live at the root.
-          sed -i 's#"\.\./pkg/#"./pkg/#' site/worker.js site/index.html
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build book
+        run: mdbook build book --dest-dir ../site
+      - name: Build API docs
+        # proj4rs backend: no libproj needed on the runner.
+        run: |
+          cargo doc --no-deps --no-default-features --features proj4rs
+          mkdir -p site/api
+          cp -r target/doc/. site/api/
+      - name: Assemble demo
+        run: |
+          mkdir -p site/demo/pkg
+          cp rwarp-wasm/www/* site/demo/
+          cp rwarp-wasm/pkg/rwarp_wasm.js rwarp-wasm/pkg/rwarp_wasm_bg.wasm site/demo/pkg/
+          # www/ imports ../pkg/...; on the site pkg/ sits beside the demo.
+          sed -i 's#"\.\./pkg/#"./pkg/#' site/demo/worker.js site/demo/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
