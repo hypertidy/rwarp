@@ -9,7 +9,7 @@
 use rwarp::geoloc_transform::{
     GenImgGeolocTransformer, GeolocArrays, GeolocConvention, GeolocOptions, PixelGeo,
 };
-use rwarp::warp::{warp, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{warp, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 
 fn main() -> Result<(), String> {
     let (ncol, nrow) = (24, 18);
@@ -46,7 +46,7 @@ fn main() -> Result<(), String> {
         .flat_map(|r| (0..ncol).map(move |c| (c + 1000 * r) as i32))
         .collect();
     let src = SourceBuffer { data: &data, ncol, nrow, nbands: 1, col_off: 0, row_off: 0 };
-    let wopts = WarpOptions { alg: ResampleAlg::NearestNeighbour, nodata: Some(-1), ..Default::default() };
+    let wopts = WarpOptions { alg: ResampleAlg::NearestNeighbour, src_nodata: Nodata::Value(-1.0), ..Default::default() };
     let out = warp(&t, &src, 40, 32, &wopts);
 
     let covered = out.iter().filter(|&&v| v != -1).count();

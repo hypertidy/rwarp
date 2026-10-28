@@ -11,7 +11,7 @@
 use rwarp::approx::ApproxTransformer;
 use rwarp::source_window::compute_source_window;
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::warp::{warp, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{warp, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 
 const WEBMERC_HALF: f64 = 20037508.342789244;
 const LAEA_TAS: &str = "+proj=laea +lat_0=-42 +lon_0=147 +datum=WGS84 +units=m +no_defs";
@@ -52,7 +52,7 @@ fn main() -> Result<(), String> {
     };
 
     // 4. Warp.
-    let opts = WarpOptions { alg: ResampleAlg::Bilinear, nodata: Some(f32::NAN), ..Default::default() };
+    let opts = WarpOptions { alg: ResampleAlg::Bilinear, src_nodata: Nodata::Value(f64::NAN), ..Default::default() };
     let out = warp(&t, &src, 256, 256, &opts);
     let valid = out.iter().filter(|v| !v.is_nan()).count();
     println!("warped {} of {} target pixels", valid, out.len());

@@ -156,6 +156,7 @@ def main():
     main_round()
     main_nodata()
     main_methods()
+    main_convert()
 
 
 # ---- mode -----------------------------------------------------------------
@@ -518,6 +519,101 @@ def main_methods():
                      "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
                     w, w, res)
     print(len(cases), "method/type cases")
+
+
+
+# ---- separate source and output types, per-band nodata ---------------------
+
+CONVERT_PATTERNS = {
+    "float": lambda: [source(False)],
+    "float_nodata": lambda: [source(True)],
+    # Column pairs averaging to k + 0.5 of both signs.
+    "round": lambda: [[float(pattern_round(r, c)) for r in range(N) for c in range(N)]],
+    # -300..499: clamps into Byte.
+    "wide": lambda: [[((r * 97 + c * 31) % 800) - 300 for r in range(N) for c in range(N)]],
+    # 0..65535: clamps into Int16.
+    "ushort": lambda: [[(r * 1031 + c * 517) % 65536 for r in range(N) for c in range(N)]],
+    # 0.2 here and there: nearest copies it, and it rounds to 0 in Byte.
+    "small": lambda: [[0.2 if (r + c) % 3 == 0 else 1.0 + c for r in range(N) for c in range(N)]],
+    "big": lambda: [big_ints(True)],
+}
+
+
+def multiband_pernd():
+    """multiband() with a different nodata value per band."""
+    bands = multiband()
+    for b, nd in ((1, -8888.0), (2, 7777.0)):
+        bands[b] = [nd if v == NODATA else v for v in bands[b]]
+    return bands
+
+
+CONVERT_PATTERNS["mb_pernd"] = multiband_pernd
+
+# The mode section iterates MODE_TYPES, so the extra types live here.
+ALL_TYPES = {**MODE_TYPES, "UInt16": gdal.GDT_UInt16, "Float64": gdal.GDT_Float64}
+
+
+def main_convert():
+    import array
+
+    gdal.SetConfigOption("CPL_DEBUG", None)
+    pernd = [NODATA, -8888.0, 7777.0]
+    # name, pattern, source type, output type, alg, width,
+    # source nodata per band (None: none), destination nodata
+    # (None: none given to gdalwarp, "from_source": left to gdalwarp)
+    cases = [
+        ("conv_f32_i16_average", "round", "Float32", "Int16", "average", 32, None, None),
+        ("conv_f32_i16_bilinear", "float", "Float32", "Int16", "bilinear", 43, None, None),
+        ("conv_f32_u8_bilinear_nd", "float_nodata", "Float32", "Byte", "bilinear", 43, [NODATA], [255]),
+        ("conv_f32_u8_cubic", "float", "Float32", "Byte", "cubic", 43, None, None),
+        ("conv_i16_u8_average", "wide", "Int16", "Byte", "average", 16, None, None),
+        ("conv_i16_u8_near", "wide", "Int16", "Byte", "near", 43, None, None),
+        ("conv_u16_i16_near", "ushort", "UInt16", "Int16", "near", 43, None, None),
+        ("conv_u16_i16_average", "ushort", "UInt16", "Int16", "average", 16, None, None),
+        ("conv_u8_f32_bilinear", "wide", "Byte", "Float32", "bilinear", 43, None, None),
+        ("conv_i32_f32_average", "ushort", "Int32", "Float32", "average", 23, None, None),
+        ("conv_f64_f32_cubic", "float", "Float64", "Float32", "cubic", 43, None, None),
+        ("conv_i64_f64_bilinear", "big", "Int64", "Float64", "bilinear", 43, None, None),
+        ("conv_f16_f16_bilinear", "float", "Float16", "Float16", "bilinear", 43, None, None),
+        ("conv_mb_pernd_average", "mb_pernd", "Float32", "Float32", "average", 16, pernd, [1, 2, 3]),
+        ("conv_mb_pernd_bilinear", "mb_pernd", "Float32", "Float32", "bilinear", 43, pernd, [1, 2, 3]),
+        ("conv_mb_pernd_near", "mb_pernd", "Float32", "Int16", "near", 43, pernd, [1, 2, 3]),
+        ("conv_dst_nd_differs", "float_nodata", "Float32", "Float32", "bilinear", 43, [NODATA], [0]),
+        ("conv_f32_u8_nd0_gotcha", "small", "Float32", "Byte", "near", 64, None, [0]),
+        ("conv_u8_srcnd_unrepresentable", "wide", "Byte", "Byte", "average", 16, [NODATA], [0]),
+        ("conv_f32_i16_nd_from_source", "float_nodata", "Float32", "Int16", "average", 16, [NODATA], "from_source"),
+    ]
+    written = set()
+    for name, pname, stype, otype, alg, w, src_nd, dst_nd in cases:
+        src = mem_bands(CONVERT_PATTERNS[pname](), ALL_TYPES[stype], None)
+        for b, nd in enumerate(src_nd or []):
+            src.GetRasterBand(b + 1).SetNoDataValue(nd)
+        # Store the source as GDAL holds it (after conversion to its type).
+        key = f"src_{pname}_{stype.lower()}"
+        if key not in written:
+            vals = [array.array("d", src.GetRasterBand(b + 1).ReadRaster(buf_type=gdal.GDT_Float64))
+                    for b in range(src.RasterCount)]
+            write_bands(os.path.join(HERE, f"{key}.txt"), [f"gdal {gdal.__version__}"], N, N, vals)
+            written.add(key)
+        kw = {}
+        if isinstance(dst_nd, list):
+            kw["dstNodata"] = " ".join(str(v) for v in dst_nd)
+        out = gdal.Warp("", src, format="MEM", outputBounds=[0, 0, N, N], width=w, height=w,
+                        resampleAlg=alg, errorThreshold=0, outputType=ALL_TYPES[otype], **kw)
+        res = [array.array("d", out.GetRasterBand(b + 1).ReadRaster(buf_type=gdal.GDT_Float64))
+               for b in range(out.RasterCount)]
+        out_nd = [out.GetRasterBand(b + 1).GetNoDataValue() for b in range(out.RasterCount)]
+        write_bands(os.path.join(HERE, f"{name}.txt"),
+                    [f"gdal {gdal.__version__}", f"alg {alg}", f"src {key}", f"src_type {stype}",
+                     f"out_type {otype}",
+                     "src_nodata " + ("-" if src_nd is None else " ".join(repr(float(v)) for v in src_nd)),
+                     "dst_nodata " + ("-" if dst_nd is None else dst_nd if isinstance(dst_nd, str)
+                                      else " ".join(repr(float(v)) for v in dst_nd)),
+                     "gdal_dst_nodata " + " ".join("-" if v is None else repr(v) for v in out_nd),
+                     "wo -",
+                     "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
+                    w, w, res)
+    print(len(cases), "conversion cases")
 
 
 if __name__ == "__main__":

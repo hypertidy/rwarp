@@ -289,7 +289,7 @@ pub enum ModeTies {
 
 /// How nodata works across bands: GDAL's `UNIFIED_SRC_NODATA` warp option
 /// (gdalwarper.cpp ~L1331, gdalwarpoperation.cpp ~L2262). A source pixel is
-/// "nodata in a band" when that band equals [`WarpOptions::nodata`] or is
+/// "nodata in a band" when that band equals [`WarpOptions::src_nodata`] or is
 /// NaN. With one band, all four are the same. A zero in
 /// [`WarpOptions::mask_band`] makes the whole pixel invalid under every rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -344,9 +344,48 @@ impl AverageThresholds {
     }
 }
 
-/// Options for [`warp`].
+/// Source nodata: none, one value for every band, or one per band (GDAL
+/// `-srcnodata`). Values are `f64`, as in GDAL; a band matches when its
+/// value equals the band's nodata, and NaN is always nodata. If no band's
+/// value is representable in the source type, all are ignored, as GDAL
+/// does.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Nodata {
+    #[default]
+    None,
+    Value(f64),
+    PerBand(Vec<f64>),
+}
+
+impl Nodata {
+    fn per_band(&self, nb: usize) -> Vec<Option<f64>> {
+        match self {
+            Nodata::None => vec![None; nb],
+            Nodata::Value(v) => vec![Some(*v); nb],
+            Nodata::PerBand(v) => {
+                assert_eq!(v.len(), nb, "one nodata value per band");
+                v.iter().map(|&x| Some(x)).collect()
+            }
+        }
+    }
+}
+
+/// Destination nodata (GDAL `-dstnodata`): the fill for destination pixels
+/// with no value, and the value resampled results are moved off.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum DstNodata {
+    /// The source nodata, as gdalwarp does when `-dstnodata` is not given.
+    #[default]
+    FromSource,
+    /// No destination nodata: fill with zero.
+    None,
+    Value(f64),
+    PerBand(Vec<f64>),
+}
+
+/// Options for [`warp`] and [`warp_to`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct WarpOptions<T> {
+pub struct WarpOptions {
     pub alg: ResampleAlg,
     pub scaling: KernelScaling,
     /// Footprint for [`ResampleAlg::Average`] and [`ResampleAlg::Mode`];
@@ -360,10 +399,10 @@ pub struct WarpOptions<T> {
     pub average: AverageThresholds,
     /// How nodata works across bands.
     pub band_nodata: BandNodata,
-    /// Source pixels where any band equals this are nodata, and it is the
-    /// fill for destination pixels with no value. `None` fills with
-    /// [`Sample::zero`].
-    pub nodata: Option<T>,
+    /// Source nodata; see [`Nodata`] and [`BandNodata`].
+    pub src_nodata: Nodata,
+    /// Destination nodata; see [`DstNodata`].
+    pub dst_nodata: DstNodata,
     /// Band whose zero values mark source pixels as nodata (an alpha band).
     pub mask_band: Option<usize>,
     /// Offset of the destination window in the grid the transformer maps
@@ -372,7 +411,7 @@ pub struct WarpOptions<T> {
     pub dst_row_off: usize,
 }
 
-impl<T: Sample> Default for WarpOptions<T> {
+impl Default for WarpOptions {
     fn default() -> Self {
         WarpOptions {
             alg: ResampleAlg::NearestNeighbour,
@@ -381,7 +420,8 @@ impl<T: Sample> Default for WarpOptions<T> {
             mode_ties: ModeTies::First,
             average: AverageThresholds::default(),
             band_nodata: BandNodata::Partial,
-            nodata: None,
+            src_nodata: Nodata::None,
+            dst_nodata: DstNodata::FromSource,
             mask_band: None,
             dst_col_off: 0,
             dst_row_off: 0,
@@ -619,7 +659,7 @@ pub fn warp_resample(
                 data: src_pixels, ncol: src_ncol, nrow: src_nrow, nbands: 1,
                 col_off: src_col_off, row_off: src_row_off,
             };
-            let opts = WarpOptions { alg, nodata: Some(nodata), ..Default::default() };
+            let opts = WarpOptions { alg, src_nodata: Nodata::Value(nodata as f64), ..Default::default() };
             warp(transformer, &src, dst_ncol, dst_nrow, &opts)
         }
     }
@@ -965,6 +1005,278 @@ fn lanczos_sample(
 }
 
 // =========================================================================
+// Data types, the working type, and conversion to the output type
+// =========================================================================
+
+/// GDAL data types for which rwarp implements [`Sample`] (no complex types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataType {
+    UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64, Float16, Float32, Float64,
+}
+
+impl DataType {
+    fn bits(self) -> u32 {
+        use DataType::*;
+        match self {
+            UInt8 | Int8 => 8,
+            UInt16 | Int16 | Float16 => 16,
+            UInt32 | Int32 | Float32 => 32,
+            UInt64 | Int64 | Float64 => 64,
+        }
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, DataType::Float16 | DataType::Float32 | DataType::Float64)
+    }
+
+    fn is_signed(self) -> bool {
+        !matches!(self, DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+    }
+
+    /// Range of an integer type.
+    fn int_range(self) -> (i128, i128) {
+        use DataType::*;
+        match self {
+            UInt8 => (0, u8::MAX as i128),
+            Int8 => (i8::MIN as i128, i8::MAX as i128),
+            UInt16 => (0, u16::MAX as i128),
+            Int16 => (i16::MIN as i128, i16::MAX as i128),
+            UInt32 => (0, u32::MAX as i128),
+            Int32 => (i32::MIN as i128, i32::MAX as i128),
+            UInt64 => (0, u64::MAX as i128),
+            Int64 => (i64::MIN as i128, i64::MAX as i128),
+            Float16 | Float32 | Float64 => unreachable!("not an integer type"),
+        }
+    }
+
+    /// `v` rounded to this floating type, as f64.
+    fn round_float(self, v: f64) -> f64 {
+        match self {
+            DataType::Float32 => v as f32 as f64,
+            DataType::Float16 => f16_round(v),
+            _ => v,
+        }
+    }
+
+    /// GDAL's `GDALIsValueExactAs`.
+    fn is_exact(self, v: f64) -> bool {
+        if self.is_float() {
+            v.is_nan() || self.round_float(v) == v
+        } else {
+            let (lo, hi) = self.int_range();
+            v.fract() == 0.0 && v >= lo as f64 && v <= hi as f64
+        }
+    }
+
+    /// GDAL's `GDALFindDataType` (no complex; never Float16).
+    fn find(bits: u32, signed: bool, floating: bool) -> DataType {
+        use DataType::*;
+        if floating {
+            return if bits <= 32 { Float32 } else { Float64 };
+        }
+        match (signed, bits) {
+            (false, 0..=8) => UInt8,
+            (false, 9..=16) => UInt16,
+            (false, 17..=32) => UInt32,
+            (false, 33..=64) => UInt64,
+            (true, 0..=8) => Int8,
+            (true, 9..=16) => Int16,
+            (true, 17..=32) => Int32,
+            (true, 33..=64) => Int64,
+            _ => Float64,
+        }
+    }
+
+    /// GDAL's `GDALDataTypeUnion` (gdal_misc.cpp ~L136).
+    fn union(a: Option<DataType>, b: DataType) -> DataType {
+        let Some(a) = a else { return b };
+        let (bits, signed, floating) = ([a.bits(), b.bits()], [a.is_signed(), b.is_signed()], [a.is_float(), b.is_float()]);
+        // GetMinBitsForPair.
+        let n = if floating[0] != floating[1] {
+            let (f, i) = if floating[0] { (0, 1) } else { (1, 0) };
+            bits[f].max(2 * bits[i])
+        } else if signed[0] != signed[1] {
+            if !signed[0] && bits[0] < bits[1] {
+                bits[1]
+            } else if !signed[1] && bits[1] < bits[0] {
+                bits[0]
+            } else {
+                let (u, s) = if signed[0] { (1, 0) } else { (0, 1) };
+                bits[s].max(2 * bits[u])
+            }
+        } else {
+            bits[0].max(bits[1])
+        };
+        DataType::find(n, signed[0] || signed[1], floating[0] || floating[1])
+    }
+
+    /// GDAL's `GDALDataTypeUnionWithValue` (gdal_misc.cpp ~L178).
+    fn union_with_value(a: DataType, v: f64) -> DataType {
+        // GDAL does not return Float16 here.
+        let a = if a == DataType::Float16 { DataType::Float32 } else { a };
+        if a.is_exact(v) {
+            return a;
+        }
+        // GDALFindDataTypeForValue / GetMinBitsForValue.
+        let floating = v.round() != v || v > u64::MAX as f64 || v < i64::MIN as f64;
+        let signed = floating || v < 0.0;
+        let bits = if v.round() == v {
+            if (0.0..=255.0).contains(&v) || (-128.0..=127.0).contains(&v) {
+                8
+            } else if (-32768.0..=32767.0).contains(&v) || (0.0..=65535.0).contains(&v) {
+                16
+            } else if (i32::MIN as f64..=i32::MAX as f64).contains(&v) || (0.0..=u32::MAX as f64).contains(&v) {
+                32
+            } else {
+                64
+            }
+        } else if v as f32 as f64 == v {
+            32
+        } else {
+            64
+        };
+        DataType::union(Some(a), DataType::find(bits, signed, floating))
+    }
+
+    /// The warp's working type: GDAL's `GDALWarpResolveWorkingDataType`
+    /// (gdalwarper.cpp ~L1764), the union of the output and source types
+    /// and every source and destination nodata value.
+    pub fn working(src: DataType, dst: DataType, src_nodata: &[Option<f64>], dst_nodata: &[Option<f64>]) -> DataType {
+        let mut w = None;
+        for b in 0..src_nodata.len().max(1) {
+            let mut t = DataType::union(w, dst);
+            t = DataType::union(Some(t), src);
+            if let Some(Some(v)) = src_nodata.get(b) { t = DataType::union_with_value(t, *v); }
+            if let Some(Some(v)) = dst_nodata.get(b) { t = DataType::union_with_value(t, *v); }
+            w = Some(t);
+        }
+        w.unwrap()
+    }
+}
+
+/// Round to the nearest half-precision value (as GDAL's `GFloat16`).
+fn f16_round(v: f64) -> f64 {
+    #[cfg(feature = "f16")]
+    { half::f16::from_f64(v).to_f64() }
+    #[cfg(not(feature = "f16"))]
+    { v }
+}
+
+/// A value held in the working type: integers exactly, floats as f64
+/// rounded to the working type's precision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Wv {
+    I(i128),
+    F(f64),
+}
+
+fn to_wv<S: Sample>(v: S) -> Wv {
+    match v.to_i128() {
+        Some(i) => Wv::I(i),
+        None => Wv::F(v.to_f64()),
+    }
+}
+
+/// The working type and the operations GDAL does in it.
+#[derive(Debug, Clone, Copy)]
+struct Working {
+    dt: DataType,
+}
+
+impl Working {
+    /// A computed value stored into the working type: integers clamp and
+    /// round half up (`ClampRoundAndAvoidNoData`, gdalwarpkernel.cpp
+    /// ~L1856); floats round to the type.
+    fn store(&self, r: f64) -> Wv {
+        if self.dt.is_float() {
+            return Wv::F(self.dt.round_float(r));
+        }
+        let (lo, hi) = self.dt.int_range();
+        let v = if r < lo as f64 {
+            lo
+        } else if r > hi as f64 {
+            hi
+        } else {
+            let x = if self.dt.is_signed() { (r + 0.5).floor() } else { r + 0.5 };
+            (x as i128).clamp(lo, hi)
+        };
+        Wv::I(v)
+    }
+
+    /// A source value copied into the working type (which contains the
+    /// source type, so this is exact).
+    fn copy(&self, w: Wv) -> Wv {
+        match (w, self.dt.is_float()) {
+            (Wv::I(i), true) => Wv::F(self.dt.round_float(i as f64)),
+            (Wv::F(f), false) => self.store(f),
+            (w, _) => w,
+        }
+    }
+
+    fn equals(&self, w: Wv, nd: f64) -> bool {
+        match w {
+            Wv::I(i) => i as f64 == nd,
+            Wv::F(f) => f == nd,
+        }
+    }
+
+    /// The neighbouring working-type value (`AvoidNoData`, ~L1613).
+    fn step_off(&self, w: Wv) -> Wv {
+        match w {
+            Wv::I(i) => {
+                let (lo, _) = self.dt.int_range();
+                Wv::I(if i == lo { lo + 1 } else { i - 1 })
+            }
+            Wv::F(f) => Wv::F(match self.dt {
+                DataType::Float32 => {
+                    let x = f as f32;
+                    (if x == f32::MAX { x.next_down() } else { x.next_up() }) as f64
+                }
+                #[cfg(feature = "f16")]
+                DataType::Float16 => half::f16::from_f64(f).step_off().to_f64(),
+                _ => if f == f64::MAX { f.next_down() } else { f.next_up() },
+            }),
+        }
+    }
+}
+
+/// A working-type value written to the output type: GDAL's
+/// `GDALCopyWords` (gcore/gdal_priv_templates.hpp). Integers clamp; floats
+/// into integers make NaN 0, round half away from zero (signed) or add 0.5
+/// and truncate (unsigned), in the working type's precision, and clamp.
+fn from_wv<D: Sample>(w: Wv, from: DataType) -> D {
+    let to = D::DATA_TYPE;
+    match w {
+        Wv::I(i) => {
+            if to.is_float() {
+                D::from_i128(i)
+            } else {
+                let (lo, hi) = to.int_range();
+                D::from_i128(i.clamp(lo, hi))
+            }
+        }
+        Wv::F(f) => {
+            if to.is_float() {
+                return D::from_f64(f);
+            }
+            if f.is_nan() {
+                return D::from_i128(0);
+            }
+            let (lo, hi) = to.int_range();
+            let r = if from == DataType::Float32 {
+                let x = f as f32;
+                let x = if to.is_signed() && x < 0.0 { x - 0.5 } else { x + 0.5 };
+                x.clamp(lo as f32, hi as f32) as i128
+            } else {
+                let x = if to.is_signed() && f < 0.0 { f - 0.5 } else { f + 0.5 };
+                x.clamp(lo as f64, hi as f64) as i128
+            };
+            D::from_i128(r.clamp(lo, hi))
+        }
+    }
+}
+
+// =========================================================================
 // Generic interleaved kernel (any Sample type, multi-band, one pass)
 // =========================================================================
 
@@ -1007,12 +1319,23 @@ pub trait Sample: Copy + PartialOrd + 'static {
     /// magnitudes.
     #[doc(hidden)]
     const GDAL_FAST_BILINEAR: bool = false;
+    /// The GDAL data type.
+    const DATA_TYPE: DataType;
+    /// The value as an exact integer (integer types only).
+    #[doc(hidden)]
+    fn to_i128(self) -> Option<i128> { None }
+    /// From an integer in range (rounding to nearest for floats).
+    #[doc(hidden)]
+    fn from_i128(v: i128) -> Self;
 }
 
 macro_rules! int_sample {
-    ($($t:ty => $fast:expr),*) => {$(
+    ($($t:ty => $fast:expr, $dt:ident),*) => {$(
         impl Sample for $t {
             const GDAL_FAST_BILINEAR: bool = $fast;
+            const DATA_TYPE: DataType = DataType::$dt;
+            #[inline] fn to_i128(self) -> Option<i128> { Some(self as i128) }
+            #[inline] fn from_i128(v: i128) -> Self { v as $t }
             #[inline] fn to_f64(self) -> f64 { self as f64 }
             #[inline] fn from_f64(v: f64) -> Self {
                 // Clamping after the floor gives the same result as GDAL's
@@ -1026,10 +1349,15 @@ macro_rules! int_sample {
         }
     )*};
 }
-int_sample!(u8 => true, i8 => false, u16 => true, i16 => true, u32 => false, i32 => false, u64 => false, i64 => false);
+int_sample!(
+    u8 => true, UInt8, i8 => false, Int8, u16 => true, UInt16, i16 => true, Int16,
+    u32 => false, UInt32, i32 => false, Int32, u64 => false, UInt64, i64 => false, Int64
+);
 
 impl Sample for f32 {
     const GDAL_FAST_BILINEAR: bool = true;
+    const DATA_TYPE: DataType = DataType::Float32;
+    #[inline] fn from_i128(v: i128) -> Self { v as f32 }
     #[inline] fn to_f64(self) -> f64 { self as f64 }
     #[inline] fn from_f64(v: f64) -> Self { v as f32 }
     #[inline] fn step_off(self) -> Self { if self == f32::MAX { self.next_down() } else { self.next_up() } }
@@ -1038,6 +1366,8 @@ impl Sample for f32 {
 }
 impl Sample for f64 {
     const GDAL_FAST_BILINEAR: bool = true;
+    const DATA_TYPE: DataType = DataType::Float64;
+    #[inline] fn from_i128(v: i128) -> Self { v as f64 }
     #[inline] fn to_f64(self) -> f64 { self }
     #[inline] fn from_f64(v: f64) -> Self { v }
     #[inline] fn step_off(self) -> Self { if self == f64::MAX { self.next_down() } else { self.next_up() } }
@@ -1049,6 +1379,8 @@ impl Sample for f64 {
 /// and rounded to the nearest half-precision value.
 #[cfg(feature = "f16")]
 impl Sample for half::f16 {
+    const DATA_TYPE: DataType = DataType::Float16;
+    #[inline] fn from_i128(v: i128) -> Self { half::f16::from_f32(v as f32) }
     #[inline] fn to_f64(self) -> f64 { self.to_f64() }
     #[inline] fn from_f64(v: f64) -> Self { half::f16::from_f64(v) }
     #[inline] fn step_off(self) -> Self {
@@ -1095,41 +1427,55 @@ fn settle<T: Sample>(v: T, nodata: Option<T>) -> T {
     }
 }
 
-/// Warp a pixel-interleaved image of any [`Sample`] type in a single pass.
-///
-/// Each destination pixel is transformed once and the kernel weights are
-/// computed once, then applied to every band from contiguous memory. With
-/// [`KernelScaling::Point`] (or at scales where GDAL does not widen) the
-/// weights, edge fallbacks (lanczos -> cubic -> bilinear) and rounding are
-/// those of [`warp_resample`], so single-band integer output is identical
-/// to it.
-///
-/// Validity is per pixel. A source pixel is nodata if any of:
-/// - `opts.mask_band` is given and the pixel's value in that band is zero
-///   (an alpha band);
-/// - `opts.nodata` is given and any band of the pixel equals it;
-/// - any band is NaN (floating types).
-///
-/// Destination pixels that are unmapped or land on nodata are written as
-/// `opts.nodata` if given, else [`Sample::zero`]. With a mask band, the mask
-/// band of the output is itself resampled like any other band, so an alpha
-/// channel survives the warp.
-///
-/// Returns `dst_ncol * dst_nrow * src.nbands` values, interleaved.
+/// Warp a pixel-interleaved image of any [`Sample`] type in a single pass,
+/// to the same type. See [`warp_to`].
 pub fn warp<T: Sample>(
     transformer: &impl Transformer,
     src: &SourceBuffer<'_, T>,
     dst_ncol: usize,
     dst_nrow: usize,
-    opts: &WarpOptions<T>,
+    opts: &WarpOptions,
 ) -> Vec<T> {
+    warp_to::<T, T>(transformer, src, dst_ncol, dst_nrow, opts)
+}
+
+/// Warp a pixel-interleaved image of type `S` to type `D` in a single pass.
+///
+/// Each destination pixel is transformed once and the kernel weights are
+/// computed once, then applied to every band from contiguous memory.
+///
+/// Types follow gdalwarp: the warp works in the union of `S`, `D` and the
+/// nodata values ([`DataType::working`]). Resampled values are stored into
+/// that type (integers clamp and round half up), moved off the destination
+/// nodata, and converted to `D` as `GDALCopyWords` does (integers clamp;
+/// floats into integers round half away from zero, NaN becomes 0). Nearest
+/// and the selecting area methods copy source values exactly. So with
+/// `S = D` and nodata representable in it, the working type is `S` and
+/// nothing is converted.
+///
+/// Validity is per band; see [`BandNodata`]. A source pixel is nodata in a
+/// band if the band equals its [`Nodata`] value or is NaN; a zero in
+/// `opts.mask_band` invalidates the whole pixel.
+///
+/// Destination pixels with no value are the destination nodata (see
+/// [`DstNodata`]) converted to `D`, or zero.
+///
+/// Returns `dst_ncol * dst_nrow * src.nbands` values, interleaved.
+pub fn warp_to<S: Sample, D: Sample>(
+    transformer: &impl Transformer,
+    src: &SourceBuffer<'_, S>,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions,
+) -> Vec<D> {
     let nbands = src.nbands;
     assert_eq!(src.data.len(), src.ncol * src.nrow * nbands, "source buffer size mismatch");
     assert!(opts.mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
 
+    let out_spec = Output::<D>::new(S::DATA_TYPE, nbands, opts);
     let img = Interleaved {
         src: src.data, ncol: src.ncol, nrow: src.nrow, nb: nbands,
-        mask: opts.mask_band, nodata: opts.nodata, rule: opts.band_nodata,
+        mask: opts.mask_band, nodata: out_spec.src_nodata::<S>(), rule: opts.band_nodata,
     };
     let alg = opts.alg;
     let (sx, sy) = match opts.scaling {
@@ -1140,12 +1486,11 @@ pub fn warp<T: Sample>(
         KernelScaling::Fixed { x, y } => (x, y),
     };
     if alg.is_area() {
-        return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy));
+        return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy), &out_spec);
     }
     let widened = Widened::new(alg, sx, sy);
 
-    let fill = opts.nodata.unwrap_or_else(T::zero);
-    let mut out = vec![fill; dst_ncol * dst_nrow * nbands];
+    let mut out = out_spec.filled(dst_ncol * dst_nrow);
     let mut sc = Scratch::new(nbands);
 
     for dst_row in 0..dst_nrow {
@@ -1168,7 +1513,7 @@ pub fn warp<T: Sample>(
                 let pix = img.px(br as usize * src.ncol + bc as usize);
                 if !img.pixel_ok(pix) { continue; }
                 for b in 0..nbands {
-                    if img.band_ok(pix, b) { out[o + b] = pix[b]; }
+                    if img.band_ok(pix, b) { out[o + b] = out_spec.copied(pix[b], b); }
                 }
                 continue;
             }
@@ -1192,12 +1537,89 @@ pub fn warp<T: Sample>(
             };
             if any {
                 for b in 0..nbands {
-                    if sc.hit[b] { out[o + b] = settle(T::from_f64(sc.acc[b]), opts.nodata); }
+                    if sc.hit[b] { out[o + b] = out_spec.computed(sc.acc[b], b); }
                 }
             }
         }
     }
     out
+}
+
+/// Writing results: the working type, the destination nodata per band, and
+/// the fill.
+struct Output<D> {
+    working: Working,
+    src_nd: Vec<Option<f64>>,
+    dst_nd: Vec<Option<f64>>,
+    fill: Vec<D>,
+}
+
+impl<D: Sample> Output<D> {
+    fn new(src_dt: DataType, nb: usize, opts: &WarpOptions) -> Self {
+        let mut src_nd = opts.src_nodata.per_band(nb);
+        let dst_nd = match &opts.dst_nodata {
+            DstNodata::FromSource => src_nd.clone(),
+            DstNodata::None => vec![None; nb],
+            DstNodata::Value(v) => vec![Some(*v); nb],
+            DstNodata::PerBand(v) => {
+                assert_eq!(v.len(), nb, "one destination nodata value per band");
+                v.iter().map(|&x| Some(x)).collect()
+            }
+        };
+        // GDAL ignores the source nodata if no band's value is
+        // representable in the source type (GDALWarpResolveWorkingDataType).
+        if src_nd.iter().all(|v| v.map_or(true, |v| !src_dt.is_exact(v))) {
+            src_nd = vec![None; nb];
+        }
+        let working = Working { dt: DataType::working(src_dt, D::DATA_TYPE, &src_nd, &dst_nd) };
+        let fill = dst_nd.iter()
+            .map(|v| v.map_or_else(D::zero, |v| from_wv::<D>(Wv::F(v), DataType::Float64)))
+            .collect();
+        Output { working, src_nd, dst_nd, fill }
+    }
+
+    /// The source nodata as `S`, per band, where representable.
+    fn src_nodata<S: Sample>(&self) -> Vec<Option<S>> {
+        self.src_nd.iter()
+            .map(|v| v.filter(|&v| S::DATA_TYPE.is_exact(v)).map(S::from_f64))
+            .collect()
+    }
+
+    fn filled(&self, npix: usize) -> Vec<D> {
+        let nb = self.fill.len();
+        (0..npix * nb).map(|i| self.fill[i % nb]).collect()
+    }
+
+    #[inline]
+    fn put(&self, w: Wv, b: usize) -> D {
+        let w = match self.dst_nd[b] {
+            Some(nd) if self.working.equals(w, nd) => self.working.step_off(w),
+            _ => w,
+        };
+        from_wv::<D>(w, self.working.dt)
+    }
+
+    /// A computed value for band `b`.
+    #[inline]
+    fn computed(&self, r: f64, b: usize) -> D {
+        self.put(self.working.store(r), b)
+    }
+
+    /// A source value copied into band `b`.
+    #[inline]
+    fn copied<S: Sample>(&self, v: S, b: usize) -> D {
+        self.put(self.working.copy(to_wv(v)), b)
+    }
+
+    /// A reducer's result for band `b`, if any.
+    #[inline]
+    fn result<S: Sample>(&self, r: Res<S>, b: usize) -> Option<D> {
+        match r {
+            Res::None => None,
+            Res::Computed(v) => Some(self.computed(v, b)),
+            Res::Copied(v) => Some(self.copied(v, b)),
+        }
+    }
 }
 
 /// The 0.1 entry point: [`warp`] with point kernels
@@ -1219,7 +1641,8 @@ pub fn warp_resample_t<T: Sample>(
     alg: ResampleAlg,
 ) -> Vec<T> {
     let buf = SourceBuffer { data: src, ncol: src_ncol, nrow: src_nrow, nbands, col_off: src_col_off, row_off: src_row_off };
-    let opts = WarpOptions { alg, scaling: KernelScaling::Point, nodata, mask_band, ..Default::default() };
+    let src_nodata = nodata.map_or(Nodata::None, |v| Nodata::Value(v.to_f64()));
+    let opts = WarpOptions { alg, scaling: KernelScaling::Point, src_nodata, mask_band, ..Default::default() };
     warp(transformer, &buf, dst_ncol, dst_nrow, &opts)
 }
 
@@ -1254,7 +1677,8 @@ struct Interleaved<'a, T: Sample> {
     nrow: usize,
     nb: usize,
     mask: Option<usize>,
-    nodata: Option<T>,
+    /// Source nodata per band, where representable in `T`.
+    nodata: Vec<Option<T>>,
     rule: BandNodata,
 }
 
@@ -1293,8 +1717,18 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     }
 
     #[inline]
-    fn is_nd(&self, v: T) -> bool {
-        v.is_nan() || self.nodata == Some(v)
+    fn is_nd(&self, v: T, b: usize) -> bool {
+        v.is_nan() || self.nodata[b] == Some(v)
+    }
+
+    #[inline]
+    fn any_valid(&self, pix: &[T]) -> bool {
+        pix.iter().enumerate().any(|(b, &v)| !self.is_nd(v, b))
+    }
+
+    #[inline]
+    fn all_valid(&self, pix: &[T]) -> bool {
+        pix.iter().enumerate().all(|(b, &v)| !self.is_nd(v, b))
     }
 
     /// Whether the source pixel takes part at all: GDAL's unified validity
@@ -1306,9 +1740,9 @@ impl<'a, T: Sample> Interleaved<'a, T> {
             if pix[a] == T::zero() { return false; }
         }
         match self.rule {
-            BandNodata::Partial | BandNodata::Unified => pix.iter().any(|&v| !self.is_nd(v)),
+            BandNodata::Partial | BandNodata::Unified => self.any_valid(pix),
             BandNodata::PerBand => true,
-            BandNodata::AnyBand => pix.iter().all(|&v| !self.is_nd(v)),
+            BandNodata::AnyBand => self.all_valid(pix),
         }
     }
 
@@ -1317,7 +1751,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     fn band_ok(&self, pix: &[T], b: usize) -> bool {
         match self.rule {
             BandNodata::Partial | BandNodata::PerBand => {
-                !self.is_nd(pix[b]) && self.mask.map_or(true, |a| pix[a] != T::zero())
+                !self.is_nd(pix[b], b) && self.mask.map_or(true, |a| pix[a] != T::zero())
             }
             BandNodata::Unified | BandNodata::AnyBand => self.pixel_ok(pix),
         }
@@ -1329,7 +1763,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     fn all_ok(&self, pix: &[T]) -> bool {
         match self.rule {
             BandNodata::Partial | BandNodata::PerBand => {
-                self.mask.map_or(true, |a| pix[a] != T::zero()) && pix.iter().all(|&v| !self.is_nd(v))
+                self.mask.map_or(true, |a| pix[a] != T::zero()) && self.all_valid(pix)
             }
             BandNodata::Unified | BandNodata::AnyBand => self.pixel_ok(pix),
         }
@@ -1384,7 +1818,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 
         // GDAL's factored formula only for its fast-path types with no
         // validity masks; otherwise the general accumulation below.
-        let fast = T::GDAL_FAST_BILINEAR && self.nodata.is_none() && self.mask.is_none();
+        let fast = T::GDAL_FAST_BILINEAR && self.nodata.iter().all(Option::is_none) && self.mask.is_none();
         if fast && ix >= 0 && ix + 1 < ncol && iy >= 0 && iy + 1 < nrow {
             let p00 = iy as usize * self.ncol + ix as usize;
             let (a, b, c, d) = (self.px(p00), self.px(p00 + 1), self.px(p00 + self.ncol), self.px(p00 + self.ncol + 1));
@@ -1540,9 +1974,18 @@ trait AreaReducer<T: Sample> {
     /// A source pixel with weight `w > 0`: `pixel_ok` is the whole-pixel
     /// validity, `band_ok` the per-band validity (see [`BandNodata`]).
     fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], w: f64);
-    /// Write the result for one destination pixel, band by band; false if
-    /// no band has one. Bands without a value are left as they are.
-    fn write(&self, out: &mut [T]) -> bool;
+    /// The result for one destination pixel, band by band.
+    fn write(&self, out: &mut [Res<T>]);
+}
+
+/// An area method's result for one band: a computed value (stored into the
+/// working type like any resampled value), a source value (copied
+/// exactly), or none.
+#[derive(Debug, Clone, Copy)]
+enum Res<T> {
+    None,
+    Computed(f64),
+    Copied(T),
 }
 
 /// Running weighted mean per band over its valid pixels (West's weighted
@@ -1569,15 +2012,10 @@ impl<T: Sample> AreaReducer<T> for AreaMean {
         }
     }
 
-    fn write(&self, out: &mut [T]) -> bool {
-        let mut any = false;
+    fn write(&self, out: &mut [Res<T>]) {
         for b in 0..out.len() {
-            if self.total[b] > 0.0 {
-                out[b] = T::from_f64(self.mean[b]);
-                any = true;
-            }
+            out[b] = if self.total[b] > 0.0 { Res::Computed(self.mean[b]) } else { Res::None };
         }
-        any
     }
 }
 
@@ -1619,10 +2057,11 @@ impl<T: Sample> AreaReducer<T> for AreaMeanThresholds<'_> {
         }
     }
 
-    fn write(&self, out: &mut [T]) -> bool {
+    fn write(&self, out: &mut [Res<T>]) {
+        out.fill(Res::None);
         let total = self.invalid + self.excluded + self.regular;
         if self.invalid > 0.0 && self.invalid >= self.th.nodata_pct_threshold / 100.0 * total {
-            return false;
+            return;
         }
         if self.excluded > 0.0 && self.excluded >= self.th.excluded_pct_threshold / 100.0 * total {
             // The most frequent excluded tuple, the first on a tie.
@@ -1630,14 +2069,12 @@ impl<T: Sample> AreaReducer<T> for AreaMeanThresholds<'_> {
             for (i, &c) in self.excluded_counts.iter().enumerate() {
                 if c > count { best = i; count = c; }
             }
-            for (o, &v) in out.iter_mut().zip(&self.th.excluded_values[best]) { *o = T::from_f64(v); }
-            return true;
+            for (o, &v) in out.iter_mut().zip(&self.th.excluded_values[best]) { *o = Res::Computed(v); }
+            return;
         }
         if self.regular > 0.0 {
-            for (o, &m) in out.iter_mut().zip(&self.mean) { *o = T::from_f64(m); }
-            return true;
+            for (o, &m) in out.iter_mut().zip(&self.mean) { *o = Res::Computed(m); }
         }
-        false
     }
 }
 
@@ -1666,12 +2103,10 @@ impl<T: Sample> AreaReducer<T> for AreaExtreme<T> {
         }
     }
 
-    fn write(&self, out: &mut [T]) -> bool {
-        let mut any = false;
+    fn write(&self, out: &mut [Res<T>]) {
         for (o, b) in out.iter_mut().zip(&self.best) {
-            if let Some(b) = b { *o = *b; any = true; }
+            *o = b.map_or(Res::None, Res::Copied);
         }
-        any
     }
 }
 
@@ -1695,17 +2130,14 @@ impl<T: Sample> AreaReducer<T> for AreaQuantile<T> {
         }
     }
 
-    fn write(&self, out: &mut [T]) -> bool {
-        let mut any = false;
+    fn write(&self, out: &mut [Res<T>]) {
         for (o, vals) in out.iter_mut().zip(&self.vals) {
-            if vals.is_empty() { continue; }
+            if vals.is_empty() { *o = Res::None; continue; }
             let mut sorted = vals.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let i = (self.q * sorted.len() as f32 - 1.0).ceil() as usize;
-            *o = sorted[i.min(sorted.len() - 1)];
-            any = true;
+            *o = Res::Copied(sorted[i.min(sorted.len() - 1)]);
         }
-        any
     }
 }
 
@@ -1733,15 +2165,10 @@ impl<T: Sample> AreaReducer<T> for AreaRms {
         }
     }
 
-    fn write(&self, out: &mut [T]) -> bool {
-        let mut any = false;
+    fn write(&self, out: &mut [Res<T>]) {
         for b in 0..out.len() {
-            if self.total[b] > 0.0 {
-                out[b] = T::from_f64((self.sumsq[b] / self.total[b]).sqrt());
-                any = true;
-            }
+            out[b] = if self.total[b] > 0.0 { Res::Computed((self.sumsq[b] / self.total[b]).sqrt()) } else { Res::None };
         }
-        any
     }
 }
 
@@ -1787,15 +2214,10 @@ impl<T: Sample> AreaReducer<T> for AreaMode<T> {
         }
     }
 
-    fn write(&self, out: &mut [T]) -> bool {
-        let mut any = false;
+    fn write(&self, out: &mut [Res<T>]) {
         for ((o, bins), m) in out.iter_mut().zip(&self.bins).zip(&self.mode) {
-            if let Some(m) = m {
-                *o = bins[*m].0;
-                any = true;
-            }
+            *o = m.map_or(Res::None, |m| Res::Copied(bins[m].0));
         }
-        any
     }
 }
 
@@ -1834,67 +2256,74 @@ impl SrcBox {
 }
 
 /// Warp with an area method, row by row.
-fn warp_area<T: Sample>(
+#[allow(clippy::too_many_arguments)]
+fn warp_area<T: Sample, D: Sample>(
     transformer: &impl Transformer,
     img: &Interleaved<'_, T>,
     src_off: (f64, f64),
     dst_ncol: usize,
     dst_nrow: usize,
-    opts: &WarpOptions<T>,
+    opts: &WarpOptions,
     scale: (f64, f64),
-) -> Vec<T> {
+    out_spec: &Output<D>,
+) -> Vec<D> {
     let nb = img.nb;
     match opts.alg {
         ResampleAlg::Min | ResampleAlg::Max => {
             let red = AreaExtreme { max: opts.alg == ResampleAlg::Max, best: vec![None; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
         }
         ResampleAlg::Med | ResampleAlg::Q1 | ResampleAlg::Q3 => {
             let q = match opts.alg { ResampleAlg::Q1 => 0.25, ResampleAlg::Q3 => 0.75, _ => 0.5 };
             let red = AreaQuantile { q, vals: vec![Vec::new(); nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
         }
         ResampleAlg::Rms => {
             let red = AreaRms { sumsq: vec![0.0; nb], total: vec![0.0; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
         }
         ResampleAlg::Mode => {
             let red = AreaMode { ties: opts.mode_ties, bins: vec![Vec::new(); nb], mode: vec![None; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
         }
         _ if opts.average.active() => {
             let red = AreaMeanThresholds {
                 th: &opts.average, invalid: 0.0, excluded: 0.0, regular: 0.0,
                 excluded_counts: vec![0; opts.average.excluded_values.len()], mean: vec![0.0; nb],
             };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
         }
         _ => {
             let red = AreaMean { mean: vec![0.0; nb], total: vec![0.0; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn warp_area_with<T: Sample, R: AreaReducer<T>>(
+fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
     transformer: &impl Transformer,
     img: &Interleaved<'_, T>,
     src_off: (f64, f64),
     dst_ncol: usize,
     dst_nrow: usize,
-    opts: &WarpOptions<T>,
+    opts: &WarpOptions,
     scale: (f64, f64),
     mut red: R,
-) -> Vec<T> {
+    out_spec: &Output<D>,
+) -> Vec<D> {
     let nb = img.nb;
-    let fill = opts.nodata.unwrap_or_else(T::zero);
-    let mut out = vec![fill; dst_ncol * dst_nrow * nb];
+    let mut out = out_spec.filled(dst_ncol * dst_nrow);
+    let mut row_res: Vec<Res<T>> = vec![Res::None; dst_ncol * nb];
     for dst_row in 0..dst_nrow {
-        let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
+        row_res.fill(Res::None);
         match opts.footprint {
-            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, row_out),
-            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut red, row_out),
+            Footprint::GdalBox => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, &mut row_res),
+            Footprint::Exact { densify } => area_row_exact(transformer, img, src_off, dst_row, dst_ncol, opts, densify.max(1), &mut red, &mut row_res),
+        }
+        let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
+        for (i, (o, &r)) in row_out.iter_mut().zip(row_res.iter()).enumerate() {
+            if let Some(v) = out_spec.result(r, i % nb) { *o = v; }
         }
     }
     out
@@ -1910,10 +2339,10 @@ fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
     (col_off, row_off): (f64, f64),
     dst_row: usize,
     dst_ncol: usize,
-    opts: &WarpOptions<T>,
+    opts: &WarpOptions,
     (sx, sy): (f64, f64),
     red: &mut R,
-    row_out: &mut [T],
+    row_out: &mut [Res<T>],
 ) {
     let band_ok = &mut vec![false; img.nb];
     let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
@@ -1984,10 +2413,7 @@ fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
                 if w > 0.0 { img.reduce(red, (iy * ncol + col) as usize, w, band_ok); }
             }
         }
-        let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
-        if red.write(px) {
-            for v in px.iter_mut() { *v = settle(*v, opts.nodata); }
-        }
+        red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
     }
 }
 
@@ -2001,10 +2427,10 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
     (col_off, row_off): (f64, f64),
     dst_row: usize,
     dst_ncol: usize,
-    opts: &WarpOptions<T>,
+    opts: &WarpOptions,
     densify: usize,
     red: &mut R,
-    row_out: &mut [T],
+    row_out: &mut [Res<T>],
 ) {
     let band_ok = &mut vec![false; img.nb];
     use controlledburn::{burn, BurnOptions, Coord, Geometry, GridSpec, Polygon};
@@ -2070,10 +2496,7 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
         for e in &res.edges {
             if e.fraction > 0.0 { img.reduce(red, at(e.row, e.col as i64), e.fraction as f64, band_ok); }
         }
-        let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
-        if red.write(px) {
-            for v in px.iter_mut() { *v = settle(*v, opts.nodata); }
-        }
+        red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
     }
 }
 
@@ -2141,7 +2564,8 @@ mod tests {
         dw: usize, dh: usize, nodata: Option<T>, mask_band: Option<usize>, alg: ResampleAlg,
     ) -> Vec<T> {
         let buf = SourceBuffer { data: src, ncol: w, nrow: h, nbands, col_off: 0, row_off: 0 };
-        let opts = WarpOptions { alg, scaling: KernelScaling::Point, nodata, mask_band, ..Default::default() };
+        let src_nodata = nodata.map_or(Nodata::None, |v| Nodata::Value(v.to_f64()));
+        let opts = WarpOptions { alg, scaling: KernelScaling::Point, src_nodata, mask_band, ..Default::default() };
         warp(t, &buf, dw, dh, &opts)
     }
 

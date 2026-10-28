@@ -16,7 +16,7 @@ use rwarp::CrsTransform;
 use wasm_bindgen::JsCast;
 use rwarp::source_window::{compute_source_window, SourceWindow};
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::warp::{warp, KernelScaling, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{warp, KernelScaling, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 use wasm_bindgen::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ impl WarperCore {
         }
         let buf = SourceBuffer { data: src, ncol: src_w, nrow: src_h, nbands: 1, col_off: src_xoff, row_off: src_yoff };
         let opts = WarpOptions {
-            alg, scaling: KernelScaling::Point, nodata: Some(nodata.unwrap_or(f32::NAN)), ..Default::default()
+            alg, scaling: KernelScaling::Point, src_nodata: Nodata::Value(nodata.map_or(f64::NAN, f64::from)), ..Default::default()
         };
         Ok(warp(&self.approx, &buf, dst_w, dst_h, &opts))
     }
