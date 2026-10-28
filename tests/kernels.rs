@@ -7,7 +7,10 @@
 
 use std::path::PathBuf;
 
-use rwarp::warp::{estimate_scale, warp, Footprint, KernelScaling, ModeTies, ResampleAlg, Sample, SourceBuffer, WarpOptions};
+use rwarp::warp::{
+    estimate_scale, warp, AverageThresholds, BandNodata, Footprint, KernelScaling, ModeTies, ResampleAlg, Sample,
+    SourceBuffer, WarpOptions,
+};
 use rwarp::Transformer;
 
 const N: usize = 64;
@@ -21,11 +24,23 @@ struct Grid {
 }
 
 impl Grid {
+    fn header_opt(&self, key: &str) -> Option<&str> {
+        self.header.iter().find_map(|l| l.strip_prefix(key)?.strip_prefix(' ').map(str::trim))
+    }
+
     fn header(&self, key: &str) -> &str {
-        self.header
-            .iter()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ').map(str::trim))
-            .unwrap_or_else(|| panic!("no '{key}' in fixture header"))
+        self.header_opt(key).unwrap_or_else(|| panic!("no '{key}' in fixture header"))
+    }
+
+    /// Bands in the fixture (written band after band).
+    fn nbands(&self) -> usize {
+        self.header_opt("bands").map_or(1, |v| v.parse().unwrap())
+    }
+
+    /// Values pixel-interleaved, as `warp` takes and returns them.
+    fn interleaved(&self) -> Vec<f32> {
+        let (n, nb) = (self.ncol * self.nrow, self.nbands());
+        (0..n * nb).map(|i| self.vals[(i % nb) * n + i / nb]).collect()
     }
 }
 
@@ -49,8 +64,9 @@ fn read_grid(name: &str) -> Grid {
         .flat_map(|l| l.split_whitespace())
         .map(|v| v.parse::<f64>().unwrap() as f32)
         .collect();
-    assert_eq!(vals.len(), ncol * nrow, "{name}: value count");
-    Grid { header, ncol, nrow, vals }
+    let g = Grid { header, ncol, nrow, vals };
+    assert_eq!(g.vals.len(), ncol * nrow * g.nbands(), "{name}: value count");
+    g
 }
 
 /// Destination pixel -> source pixel through the geotransforms gdalwarp
@@ -91,6 +107,8 @@ fn alg_of(name: &str) -> ResampleAlg {
         "cubic" => ResampleAlg::Cubic,
         "lanczos" => ResampleAlg::Lanczos,
         "average" => ResampleAlg::Average,
+        "mode" => ResampleAlg::Mode,
+        "near" => ResampleAlg::NearestNeighbour,
         _ => panic!("unknown alg {name}"),
     }
 }
@@ -449,4 +467,144 @@ fn rounding_clamping_avoidance_and_bounds_match_gdal() {
         };
         assert_same(&name, &g.vals, &got);
     }
+}
+
+// ---- nodata: point kernels, multiple bands, average thresholds ------------
+
+/// `WarpOptions` from a fixture's `wo` header, the way GDAL reads the warp
+/// options.
+fn options_from_wo(g: &Grid, nbands: usize) -> WarpOptions<f32> {
+    let mut o = WarpOptions {
+        alg: alg_of(g.header("alg")),
+        nodata: match g.header("nodata") { "-" => None, v => Some(v.parse().unwrap()) },
+        ..Default::default()
+    };
+    let wo = g.header("wo");
+    if wo == "-" { return o; }
+    for kv in wo.split(' ') {
+        let (k, v) = kv.split_once('=').unwrap();
+        match k {
+            "XSCALE" | "YSCALE" => o.scaling = KernelScaling::Point,
+            "UNIFIED_SRC_NODATA" => o.band_nodata = match v {
+                "YES" => BandNodata::Unified,
+                "NO" => BandNodata::PerBand,
+                _ => BandNodata::Partial,
+            },
+            "NODATA_VALUES_PCT_THRESHOLD" => o.average.nodata_pct_threshold = v.parse().unwrap(),
+            "EXCLUDED_VALUES_PCT_THRESHOLD" => o.average.excluded_pct_threshold = v.parse().unwrap(),
+            "EXCLUDED_VALUES" => {
+                // GDAL tokenizes on "(,)" and groups by band count.
+                let vals: Vec<f64> = v.split(['(', ',', ')']).filter(|t| !t.is_empty())
+                    .map(|t| t.parse().unwrap()).collect();
+                o.average.excluded_values = vals.chunks(nbands).map(<[f64]>::to_vec).collect();
+            }
+            _ => panic!("unhandled warp option {k}"),
+        }
+    }
+    o
+}
+
+fn run_nodata_case(name: &str) {
+    let g = read_grid(name);
+    let src = read_grid(g.header("src"));
+    let nb = src.nbands();
+    let data = src.interleaved();
+    let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: nb, col_off: 0, row_off: 0 };
+    let opts = options_from_wo(&g, nb);
+    let got = warp(&Affine::of(&g), &buf, g.ncol, g.nrow, &opts);
+    let expect = g.interleaved();
+    let mut worst = (0.0f64, 0usize);
+    for (i, (&e, &v)) in expect.iter().zip(&got).enumerate() {
+        let d = (e as f64 - v as f64).abs() / (e.abs() as f64).max(1.0);
+        if d > worst.0 { worst = (d, i); }
+    }
+    let (d, i) = worst;
+    let px = i / nb;
+    assert!(d <= TOL, "{name}: pixel ({}, {}) band {} gdal {} rwarp {} (relative {d:e})",
+        px % g.ncol, px / g.ncol, i % nb, expect[i], got[i]);
+}
+
+/// Single-band point kernels next to nodata, average thresholds and
+/// excluded values, and three bands under each of GDAL's
+/// UNIFIED_SRC_NODATA modes (unset, YES, NO) for near, point bilinear and
+/// cubic, widened bilinear and lanczos, average and mode: all match
+/// gdalwarp.
+#[test]
+fn nodata_cases_match_gdal() {
+    let names: Vec<String> = ["nd1_", "thr_", "mb_"].iter().flat_map(|p| mode_fixtures(p)).collect();
+    assert_eq!(names.len(), 30);
+    let mut failures = Vec::new();
+    for name in &names {
+        if let Err(e) = std::panic::catch_unwind(|| run_nodata_case(name)) {
+            failures.push(e.downcast_ref::<String>().cloned().unwrap_or_default());
+        }
+    }
+    assert!(failures.is_empty(), "{} of {} cases differ:\n{}", failures.len(), names.len(), failures.join("\n"));
+}
+
+#[test]
+fn any_band_rule_is_the_0_1_behaviour() {
+    // A pixel with one band at nodata: AnyBand drops it entirely, Partial
+    // keeps its other bands.
+    let src = read_grid("src_mb");
+    let data = src.interleaved();
+    let buf = SourceBuffer { data: &data[..], ncol: N, nrow: N, nbands: 3, col_off: 0, row_off: 0 };
+    let run = |band_nodata| {
+        let o = WarpOptions { alg: ResampleAlg::NearestNeighbour, nodata: Some(NODATA), band_nodata, ..Default::default() };
+        warp(&Affine::new(N, N), &buf, N, N, &o)
+    };
+    let (partial, any) = (run(BandNodata::Partial), run(BandNodata::AnyBand));
+    assert_eq!(partial, data, "nearest at 1:1 copies every band");
+    for p in 0..N * N {
+        let pix = &data[p * 3..p * 3 + 3];
+        if pix.contains(&NODATA) {
+            assert_eq!(&any[p * 3..p * 3 + 3], &[NODATA; 3]);
+        }
+    }
+}
+
+/// The fixtures separate the rules: each multi-band case fails under a rule
+/// other than the one it was generated with.
+#[test]
+fn nodata_fixtures_distinguish_the_rules() {
+    for name in ["mb_unset_bilinear_point", "mb_yes_average_4x", "mb_no_cubic_point"] {
+        let g = read_grid(name);
+        let src = read_grid(g.header("src"));
+        let nb = src.nbands();
+        let data = src.interleaved();
+        let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: nb, col_off: 0, row_off: 0 };
+        let right = options_from_wo(&g, nb);
+        let wrong = WarpOptions {
+            band_nodata: if right.band_nodata == BandNodata::AnyBand { BandNodata::Partial } else { BandNodata::AnyBand },
+            ..right.clone()
+        };
+        let expect = g.interleaved();
+        let got = warp(&Affine::of(&g), &buf, g.ncol, g.nrow, &wrong);
+        let differ = expect.iter().zip(&got).filter(|(e, v)| (**e as f64 - **v as f64).abs() > 1e-3).count();
+        assert!(differ > 0, "{name}: the AnyBand rule should not reproduce GDAL");
+    }
+    let _ = AverageThresholds::default();
+}
+
+/// GDAL's point bilinear renormalises over valid neighbours: the
+/// single-band fixture has valid outputs whose 2x2 neighbourhood includes
+/// nodata (rwarp 0.1 gave those nodata).
+#[test]
+fn point_bilinear_fixture_has_renormalised_pixels() {
+    let g = read_grid("nd1_bilinear_point");
+    let src = read_grid("src_nodata");
+    let t = Affine::of(&g);
+    let mut renormalised = 0;
+    for r in 0..g.nrow {
+        let (mut x, mut y): (Vec<f64>, Vec<f64>) = ((0..g.ncol).map(|c| c as f64 + 0.5).collect(), vec![r as f64 + 0.5; g.ncol]);
+        t.transform(true, &mut x, &mut y);
+        for c in 0..g.ncol {
+            let (ix, iy) = ((x[c] - 0.5).floor() as i64, (y[c] - 0.5).floor() as i64);
+            if ix < 0 || iy < 0 || ix + 1 >= N as i64 || iy + 1 >= N as i64 { continue; }
+            let at = |dx: i64, dy: i64| src.vals[((iy + dy) * N as i64 + ix + dx) as usize];
+            let any_nd = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)].contains(&NODATA);
+            if any_nd && g.vals[r * g.ncol + c] != NODATA { renormalised += 1; }
+        }
+    }
+    assert!(renormalised > 0);
 }

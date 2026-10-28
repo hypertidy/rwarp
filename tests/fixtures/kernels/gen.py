@@ -154,6 +154,7 @@ def main():
 
     main_mode()
     main_round()
+    main_nodata()
 
 
 # ---- mode -----------------------------------------------------------------
@@ -325,6 +326,118 @@ def main_round():
                     "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
                    w, N, vals)
     print(len(cases), "rounding cases")
+
+
+
+# ---- nodata: point kernels, multiple bands, average thresholds ------------
+
+def write_bands(path, header, w, h, bands):
+    """Like write_grid, band after band, with a `bands` header line."""
+    with open(path, "w") as f:
+        for line in header + [f"bands {len(bands)}"]:
+            f.write(f"# {line}\n")
+        f.write(f"{w} {h}\n")
+        for vals in bands:
+            for r in range(h):
+                f.write(" ".join(repr(float(v)) for v in vals[r * w:(r + 1) * w]) + "\n")
+
+
+def multiband():
+    """Three Float32 bands with nodata holes in different places, including
+    pixels where every band is nodata."""
+    base = source(False)
+    holes = [lambda r, c: (r * 7 + c * 3) % 23 == 0,
+             lambda r, c: (r * 5 + c * 11) % 19 == 0,
+             lambda r, c: (r * 7 + c * 3) % 23 == 0 and (r + c) % 2 == 0 or (r * 3 + c) % 17 == 0]
+    bands = []
+    for b in range(3):
+        bands.append([NODATA if holes[b](i // N, i % N) else base[i] + 10 * b for i in range(N * N)])
+    # Every band nodata here.
+    for b in range(3):
+        for i in range(0, N * N, 29):
+            bands[b][i] = NODATA
+    return bands
+
+
+def multiband_categorical():
+    """Three bands of one categorical field, so tuples are (k, k, k)."""
+    cat = categorical(False)
+    return [list(cat), list(cat), list(cat)]
+
+
+def mem_bands(bands, dtype, nodata):
+    import array
+
+    ds = gdal.GetDriverByName("MEM").Create("", N, N, len(bands), dtype)
+    ds.SetGeoTransform([0, 1, 0, N, 0, -1])
+    for b, vals in enumerate(bands):
+        band = ds.GetRasterBand(b + 1)
+        band.WriteRaster(0, 0, N, N, array.array("d", vals).tobytes(), buf_type=gdal.GDT_Float64)
+        if nodata is not None:
+            # From the dataset, not -srcnodata, so gdalwarp leaves
+            # UNIFIED_SRC_NODATA unset.
+            band.SetNoDataValue(nodata)
+    return ds
+
+
+def main_nodata():
+    import array
+
+    gdal.SetConfigOption("CPL_DEBUG", None)
+    write_bands(os.path.join(HERE, "src_mb.txt"), [f"gdal {gdal.__version__}"], N, N, multiband())
+    write_bands(os.path.join(HERE, "src_mb_cat.txt"), [f"gdal {gdal.__version__}"], N, N,
+                multiband_categorical())
+    point = {"XSCALE": "1", "YSCALE": "1"}
+    # name, src, type, alg, width, nodata, warp options
+    cases = [
+        # Single band, point kernels next to nodata: bilinear renormalises
+        # over valid neighbours, cubic falls back to it, lanczos skips.
+        ("nd1_bilinear_point", "src_nodata", "Float32", "bilinear", 43, NODATA, point),
+        ("nd1_cubic_point", "src_nodata", "Float32", "cubic", 43, NODATA, point),
+        ("nd1_lanczos_point", "src_nodata", "Float32", "lanczos", 43, NODATA, point),
+        ("nd1_near", "src_nodata", "Float32", "near", 43, NODATA, {}),
+        # Average thresholds, single band.
+        ("thr_average_nodata25", "src_nodata", "Float32", "average", 16, NODATA,
+         {"NODATA_VALUES_PCT_THRESHOLD": "5"}),
+        ("thr_average_excl1", "src_cat", "Float32", "average", 16, None,
+         {"EXCLUDED_VALUES": "1"}),
+        ("thr_average_excl12_pct20", "src_cat", "Float32", "average", 16, None,
+         {"EXCLUDED_VALUES": "(1),(2)", "EXCLUDED_VALUES_PCT_THRESHOLD": "20"}),
+        # Three bands, excluded tuples.
+        ("thr_average_mb_excl", "src_mb_cat", "Float32", "average", 16, None,
+         {"EXCLUDED_VALUES": "(1,1,1),(2,2,2)", "EXCLUDED_VALUES_PCT_THRESHOLD": "20"}),
+        ("thr_average_mb_nodata25", "src_mb", "Float32", "average", 16, NODATA,
+         {"NODATA_VALUES_PCT_THRESHOLD": "25"}),
+    ]
+    for unified in ("unset", "YES", "NO"):
+        u = {} if unified == "unset" else {"UNIFIED_SRC_NODATA": unified}
+        tag = unified.lower()
+        cases += [
+            (f"mb_{tag}_near", "src_mb", "Float32", "near", 43, NODATA, dict(u)),
+            (f"mb_{tag}_bilinear_point", "src_mb", "Float32", "bilinear", 43, NODATA, {**u, **point}),
+            (f"mb_{tag}_cubic_point", "src_mb", "Float32", "cubic", 43, NODATA, {**u, **point}),
+            (f"mb_{tag}_bilinear_4x", "src_mb", "Float32", "bilinear", 16, NODATA, dict(u)),
+            (f"mb_{tag}_lanczos_4x", "src_mb", "Float32", "lanczos", 16, NODATA, dict(u)),
+            (f"mb_{tag}_average_4x", "src_mb", "Float32", "average", 16, NODATA, dict(u)),
+            (f"mb_{tag}_mode_4x", "src_mb", "Float32", "mode", 16, NODATA, dict(u)),
+        ]
+    srcs = {"src_nodata": lambda: [source(True)], "src_cat": lambda: [categorical(False)],
+            "src_mb": multiband, "src_mb_cat": multiband_categorical}
+    for name, sname, tname, alg, w, nodata, wo in cases:
+        bands = srcs[sname]()
+        src = mem_bands(bands, MODE_TYPES[tname], nodata)
+        out = gdal.Warp("", src, format="MEM", outputBounds=[0, 0, N, N], width=w, height=w,
+                        resampleAlg=alg, errorThreshold=0, warpOptions=wo,
+                        dstNodata=NODATA if nodata is not None else None)
+        res = [array.array("d", out.GetRasterBand(b + 1).ReadRaster(buf_type=gdal.GDT_Float64))
+               for b in range(out.RasterCount)]
+        opts = " ".join(f"{k}={v}" for k, v in wo.items()) or "-"
+        write_bands(os.path.join(HERE, f"{name}.txt"),
+                    [f"gdal {gdal.__version__}", f"alg {alg}", f"src {sname}", f"src_type {tname}",
+                     f"nodata {'-' if nodata is None else nodata}", f"wo {opts}",
+                     "dst_gt " + " ".join(repr(v) for v in out.GetGeoTransform())],
+                    w, w, res)
+    print(len(cases), "nodata cases")
 
 
 if __name__ == "__main__":

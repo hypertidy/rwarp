@@ -106,24 +106,34 @@
 //! the exact transformer when an approximate one is in use; rwarp uses the
 //! transformer it is given.
 //!
-//! ## Nodata handling (point kernels)
+//! ## Nodata handling
 //!
-//! **Nearest-neighbour**: nodata pixels in source are skipped; destination
-//! retains its fill value.
+//! Validity is per band; [`BandNodata`] (GDAL's `UNIFIED_SRC_NODATA`)
+//! decides how bands combine, and a zero in the mask band invalidates the
+//! whole pixel. Per band, following gdalwarpkernel.cpp:
 //!
-//! **Bilinear**: if any of the 4 contributing source pixels is nodata, the
-//! destination pixel is set to nodata. At edges, valid pixels are weighted
-//! and renormalized (weight sum < 1e-5 → nodata).
+//! **Nearest-neighbour**: the band of the source pixel is copied if valid;
+//! otherwise the destination band keeps its fill value.
 //!
-//! **Cubic**: if any pixel in the 4×4 neighbourhood is nodata, falls back
-//! to bilinear with the same nodata rule.
+//! **Bilinear** (point): invalid and out-of-buffer neighbours are dropped
+//! and the rest renormalised; less than 1e-5 of weight left → no value
+//! (`GWKBilinearResample4Sample`).
 //!
-//! **Lanczos**: the 6×6 window is clipped to the buffer and nodata pixels
-//! are skipped, renormalising by the weight of the pixels used, as GDAL
-//! does at every scale.
+//! **Cubic** (point): near the buffer edge, or with any invalid pixel in the
+//! 4×4 window, falls back to bilinear for that band
+//! (`GWKCubicResample4Sample`).
+//!
+//! **Lanczos, and widened kernels**: the window is clipped to the buffer and
+//! invalid pixels skipped, renormalising by the weight used
+//! (`GWKResampleOptimizedLanczos`, `GWKResample`).
 //!
 //! **All interpolating kernels**: a destination pixel whose centre lands on
-//! a nodata source pixel gets no value, whatever its neighbours.
+//! a source pixel that is invalid as a whole (every band nodata, under the
+//! default rule) gets no value, whatever its neighbours.
+//!
+//! **Average, mode**: invalid pixels add neither value nor weight to that
+//! band; with [`AverageThresholds`] in use, average treats the bands
+//! together.
 
 use crate::transform::{transform_scanline, Transformer};
 
@@ -227,8 +237,65 @@ pub enum ModeTies {
     Max,
 }
 
+/// How nodata works across bands: GDAL's `UNIFIED_SRC_NODATA` warp option
+/// (gdalwarper.cpp ~L1331, gdalwarpoperation.cpp ~L2262). A source pixel is
+/// "nodata in a band" when that band equals [`WarpOptions::nodata`] or is
+/// NaN. With one band, all four are the same. A zero in
+/// [`WarpOptions::mask_band`] makes the whole pixel invalid under every rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BandNodata {
+    /// GDAL's default (option unset, or `PARTIAL`): a source pixel is
+    /// ignored only where every band is nodata, and each band is otherwise
+    /// resampled from its own valid pixels. A destination pixel whose
+    /// centre lands where every band is nodata gets no value.
+    #[default]
+    Partial,
+    /// `UNIFIED_SRC_NODATA=YES`, which gdalwarp sets when `-srcnodata` is
+    /// given explicitly: a source pixel is nodata only if every band is;
+    /// otherwise all its band values are used as they are, including a band
+    /// at its nodata value.
+    Unified,
+    /// `UNIFIED_SRC_NODATA=NO`: each band on its own; no whole-pixel test.
+    PerBand,
+    /// rwarp 0.1: a source pixel is nodata if any band is. Not a GDAL mode.
+    AnyBand,
+}
+
+/// GDAL's thresholds for [`ResampleAlg::Average`] (warp options
+/// `NODATA_VALUES_PCT_THRESHOLD`, `EXCLUDED_VALUES`,
+/// `EXCLUDED_VALUES_PCT_THRESHOLD`; gdalwarpkernel.cpp ~L7760-7930). The
+/// defaults (100, none, 50) leave average unchanged.
+///
+/// When either is in use, each footprint's weight is split into invalid
+/// (any band nodata), excluded (all bands equal one of
+/// `excluded_values`) and regular. If the invalid share is at least
+/// `nodata_pct_threshold` percent the destination pixel gets no value;
+/// otherwise if the excluded share is at least
+/// `excluded_pct_threshold` percent it gets the excluded tuple seen most
+/// often (by pixel count, the first listed on a tie); otherwise the mean of
+/// the regular pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AverageThresholds {
+    pub nodata_pct_threshold: f64,
+    /// Tuples of one value per band.
+    pub excluded_values: Vec<Vec<f64>>,
+    pub excluded_pct_threshold: f64,
+}
+
+impl Default for AverageThresholds {
+    fn default() -> Self {
+        AverageThresholds { nodata_pct_threshold: 100.0, excluded_values: Vec::new(), excluded_pct_threshold: 50.0 }
+    }
+}
+
+impl AverageThresholds {
+    fn active(&self) -> bool {
+        !self.excluded_values.is_empty() || self.nodata_pct_threshold / 100.0 < 1.0 - 1e-10
+    }
+}
+
 /// Options for [`warp`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WarpOptions<T> {
     pub alg: ResampleAlg,
     pub scaling: KernelScaling,
@@ -238,6 +305,11 @@ pub struct WarpOptions<T> {
     /// Tie-breaking for [`ResampleAlg::Mode`]; ignored by the other
     /// methods.
     pub mode_ties: ModeTies,
+    /// Thresholds for [`ResampleAlg::Average`]; ignored by the other
+    /// methods.
+    pub average: AverageThresholds,
+    /// How nodata works across bands.
+    pub band_nodata: BandNodata,
     /// Source pixels where any band equals this are nodata, and it is the
     /// fill for destination pixels with no value. `None` fills with
     /// [`Sample::zero`].
@@ -257,6 +329,8 @@ impl<T: Sample> Default for WarpOptions<T> {
             scaling: KernelScaling::WidenWhenDownsampling,
             footprint: Footprint::GdalBox,
             mode_ties: ModeTies::First,
+            average: AverageThresholds::default(),
+            band_nodata: BandNodata::Partial,
             nodata: None,
             mask_band: None,
             dst_col_off: 0,
@@ -293,10 +367,12 @@ pub struct SourceBuffer<'a, T> {
 /// Returns `(1.0, 1.0)` if nothing transforms.
 ///
 /// GDAL samples the chunk at `0..nDstXSize` without adding the chunk's
-/// offset (from reading the code; not yet checked against a multi-chunk
-/// gdalwarp run). This adds `dst_col_off` / `dst_row_off`, so the estimate
-/// is for the window actually warped. For a single-chunk warp, as in the
-/// test fixtures, the two agree.
+/// offset, so in a multi-chunk gdalwarp every chunk is estimated at the
+/// output's top-left (confirmed with GDAL 3.14.0dev: equal-sized chunks at
+/// different latitudes of a lon/lat to Mercator warp log identical
+/// scales). This adds `dst_col_off` / `dst_row_off`, so the estimate is for
+/// the window actually warped. For a single-chunk warp, as in the test
+/// fixtures, the two agree.
 pub fn estimate_scale(
     transformer: &impl Transformer,
     dst_ncol: usize,
@@ -634,19 +710,18 @@ fn bilinear_sample(
     if ix >= 0 && ix + 1 < ncol as i64 && iy >= 0 && iy + 1 < nrow as i64 {
         let off = iy as usize * ncol + ix as usize;
 
-        if src[off] == nodata || src[off + 1] == nodata
-            || src[off + ncol] == nodata || src[off + ncol + 1] == nodata
+        if src[off] != nodata && src[off + 1] != nodata
+            && src[off + ncol] != nodata && src[off + ncol + 1] != nodata
         {
-            return None;
-        }
-
-        let val = (src[off] as f64 * rx + src[off + 1] as f64 * (1.0 - rx)) * ry
+            let val = (src[off] as f64 * rx + src[off + 1] as f64 * (1.0 - rx)) * ry
                 + (src[off + ncol] as f64 * rx + src[off + ncol + 1] as f64 * (1.0 - rx))
                     * (1.0 - ry);
-        return Some(val);
+            return Some(val);
+        }
     }
 
-    // Edge path: weight only valid in-bounds pixels
+    // Nodata or edge: weight only valid in-bounds pixels and renormalise
+    // (GWKBilinearResample4Sample).
     let mut acc = 0.0;
     let mut wsum = 0.0;
 
@@ -665,7 +740,7 @@ fn bilinear_sample(
         }
     }
 
-    if wsum < 1e-5 { None } else { Some(acc / wsum) }
+    if wsum < 1e-5 { None } else if wsum == 1.0 { Some(acc) } else { Some(acc / wsum) }
 }
 
 // =========================================================================
@@ -945,7 +1020,7 @@ pub fn warp<T: Sample>(
 
     let img = Interleaved {
         src: src.data, ncol: src.ncol, nrow: src.nrow, nb: nbands,
-        mask: opts.mask_band, nodata: opts.nodata,
+        mask: opts.mask_band, nodata: opts.nodata, rule: opts.band_nodata,
     };
     let alg = opts.alg;
     let (sx, sy) = match opts.scaling {
@@ -962,9 +1037,7 @@ pub fn warp<T: Sample>(
 
     let fill = opts.nodata.unwrap_or_else(T::zero);
     let mut out = vec![fill; dst_ncol * dst_nrow * nbands];
-    let mut acc = vec![0.0f64; nbands];
-    let mut row_acc = vec![0.0f64; nbands];
-    let mut wx: Vec<f64> = Vec::new();
+    let mut sc = Scratch::new(nbands);
 
     for dst_row in 0..dst_nrow {
         let (src_x, src_y, ok) =
@@ -983,9 +1056,11 @@ pub fn warp<T: Sample>(
                 let bc = (buf_x + 1.0e-10) as i64;
                 let br = (buf_y + 1.0e-10) as i64;
                 if bc < 0 || bc >= src.ncol as i64 || br < 0 || br >= src.nrow as i64 { continue; }
-                let p = br as usize * src.ncol + bc as usize;
-                if !img.valid(p) { continue; }
-                out[o..o + nbands].copy_from_slice(img.px(p));
+                let pix = img.px(br as usize * src.ncol + bc as usize);
+                if !img.pixel_ok(pix) { continue; }
+                for b in 0..nbands {
+                    if img.band_ok(pix, b) { out[o + b] = pix[b]; }
+                }
                 continue;
             }
 
@@ -998,18 +1073,16 @@ pub fn warp<T: Sample>(
             // (GWKRealCaseThread, gdalwarpkernel.cpp ~L5680).
             if !img.valid(cy * src.ncol + cx) { continue; }
 
-            let hit = match (widened, alg) {
-                (Some(w), _) => img.widened(buf_x, buf_y, &w, &mut acc, &mut row_acc, &mut wx),
-                (None, ResampleAlg::Bilinear) => img.bilinear(buf_x, buf_y, &mut acc),
-                (None, ResampleAlg::Cubic) => img.cubic(buf_x, buf_y, &mut acc, &mut row_acc),
-                (None, ResampleAlg::Lanczos) => {
-                    img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut acc, &mut row_acc, &mut wx)
-                }
+            let any = match (widened, alg) {
+                (Some(w), _) => img.widened(buf_x, buf_y, &w, &mut sc),
+                (None, ResampleAlg::Bilinear) => img.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit),
+                (None, ResampleAlg::Cubic) => img.cubic(buf_x, buf_y, &mut sc),
+                (None, ResampleAlg::Lanczos) => img.widened(buf_x, buf_y, &LANCZOS_POINT, &mut sc),
                 (None, ResampleAlg::NearestNeighbour | ResampleAlg::Average | ResampleAlg::Mode) => unreachable!(),
             };
-            if hit {
+            if any {
                 for b in 0..nbands {
-                    out[o + b] = settle(T::from_f64(acc[b]), opts.nodata);
+                    if sc.hit[b] { out[o + b] = settle(T::from_f64(sc.acc[b]), opts.nodata); }
                 }
             }
         }
@@ -1064,7 +1137,7 @@ pub fn warp_resample_u8(
     )
 }
 
-/// View over a pixel-interleaved buffer with per-pixel validity.
+/// View over a pixel-interleaved buffer with per-band validity.
 struct Interleaved<'a, T: Sample> {
     src: &'a [T],
     ncol: usize,
@@ -1072,6 +1145,35 @@ struct Interleaved<'a, T: Sample> {
     nb: usize,
     mask: Option<usize>,
     nodata: Option<T>,
+    rule: BandNodata,
+}
+
+/// Per-call scratch for the interpolating kernels: a value and a weight per
+/// band, and whether the band got a value.
+struct Scratch {
+    acc: Vec<f64>,
+    wsum: Vec<f64>,
+    row_acc: Vec<f64>,
+    row_w: Vec<f64>,
+    hit: Vec<bool>,
+    wx: Vec<f64>,
+    fallback: Vec<f64>,
+    fallback_hit: Vec<bool>,
+}
+
+impl Scratch {
+    fn new(nb: usize) -> Self {
+        Scratch {
+            acc: vec![0.0; nb], wsum: vec![0.0; nb], row_acc: vec![0.0; nb], row_w: vec![0.0; nb],
+            hit: vec![false; nb], wx: Vec::new(), fallback: vec![0.0; nb], fallback_hit: vec![false; nb],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.acc.fill(0.0);
+        self.wsum.fill(0.0);
+        self.hit.fill(false);
+    }
 }
 
 impl<'a, T: Sample> Interleaved<'a, T> {
@@ -1081,23 +1183,89 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     }
 
     #[inline]
-    fn valid_px(&self, pix: &[T]) -> bool {
+    fn is_nd(&self, v: T) -> bool {
+        v.is_nan() || self.nodata == Some(v)
+    }
+
+    /// Whether the source pixel takes part at all: GDAL's unified validity
+    /// mask, which decides the centre check and, under
+    /// [`BandNodata::Unified`] and [`BandNodata::AnyBand`], every band.
+    #[inline]
+    fn pixel_ok(&self, pix: &[T]) -> bool {
         if let Some(a) = self.mask {
             if pix[a] == T::zero() { return false; }
         }
-        match self.nodata {
-            Some(nd) => pix.iter().all(|&v| v != nd && !v.is_nan()),
-            None => pix.iter().all(|&v| !v.is_nan()),
+        match self.rule {
+            BandNodata::Partial | BandNodata::Unified => pix.iter().any(|&v| !self.is_nd(v)),
+            BandNodata::PerBand => true,
+            BandNodata::AnyBand => pix.iter().all(|&v| !self.is_nd(v)),
+        }
+    }
+
+    /// Whether band `b` of a source pixel contributes to band `b`.
+    #[inline]
+    fn band_ok(&self, pix: &[T], b: usize) -> bool {
+        match self.rule {
+            BandNodata::Partial | BandNodata::PerBand => {
+                !self.is_nd(pix[b]) && self.mask.map_or(true, |a| pix[a] != T::zero())
+            }
+            BandNodata::Unified | BandNodata::AnyBand => self.pixel_ok(pix),
+        }
+    }
+
+    /// Every band of the pixel contributes (the common case, and the fast
+    /// path).
+    #[inline]
+    fn all_ok(&self, pix: &[T]) -> bool {
+        match self.rule {
+            BandNodata::Partial | BandNodata::PerBand => {
+                self.mask.map_or(true, |a| pix[a] != T::zero()) && pix.iter().all(|&v| !self.is_nd(v))
+            }
+            BandNodata::Unified | BandNodata::AnyBand => self.pixel_ok(pix),
         }
     }
 
     #[inline]
     fn valid(&self, p: usize) -> bool {
-        self.valid_px(self.px(p))
+        self.pixel_ok(self.px(p))
     }
 
-    /// Mirrors `bilinear_sample`. Returns false for nodata / no support.
-    fn bilinear(&self, buf_x: f64, buf_y: f64, acc: &mut [f64]) -> bool {
+    /// Hand source pixel `p` with weight `w` to an area reducer, with its
+    /// validity.
+    #[inline]
+    fn reduce<R: AreaReducer<T>>(&self, red: &mut R, p: usize, w: f64, band_ok: &mut [bool]) {
+        let pix = self.px(p);
+        let pixel_ok = self.pixel_ok(pix);
+        for (b, ok) in band_ok.iter_mut().enumerate() { *ok = pixel_ok && self.band_ok(pix, b); }
+        red.add(pix, pixel_ok, band_ok, w);
+    }
+
+    /// Add `pix` with weight `w` to the bands it contributes to. The weight
+    /// of pixels valid in every band goes to `shared`, the rest per band to
+    /// `wsum`, so the common case costs one addition.
+    #[inline]
+    fn accumulate(&self, pix: &[T], w: f64, acc: &mut [f64], shared: &mut f64, wsum: &mut [f64]) {
+        if self.all_ok(pix) {
+            for (a, &v) in acc.iter_mut().zip(pix) {
+                *a += v.to_f64() * w;
+            }
+            *shared += w;
+        } else {
+            for b in 0..self.nb {
+                if self.band_ok(pix, b) {
+                    acc[b] += pix[b].to_f64() * w;
+                    wsum[b] += w;
+                }
+            }
+        }
+    }
+
+    /// Bilinear at a sample point (GDAL's `GWKBilinearResample4Sample`,
+    /// gdalwarpkernel.cpp ~L3090, and `GWKBilinearResampleNoMasks4SampleT`).
+    /// Per band, invalid and out-of-buffer neighbours are dropped and the
+    /// rest renormalised; a band whose neighbours weigh less than 1e-5 gets
+    /// no value. Fills `out` / `hit` per band.
+    fn bilinear(&self, buf_x: f64, buf_y: f64, out: &mut [f64], hit: &mut [bool]) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
         let rx = 1.5 - (buf_x - ix as f64);
@@ -1106,67 +1274,100 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 
         if ix >= 0 && ix + 1 < ncol && iy >= 0 && iy + 1 < nrow {
             let p00 = iy as usize * self.ncol + ix as usize;
-            let (p10, p01, p11) = (p00 + 1, p00 + self.ncol, p00 + self.ncol + 1);
-            if !(self.valid(p00) && self.valid(p10) && self.valid(p01) && self.valid(p11)) {
-                return false;
+            let (a, b, c, d) = (self.px(p00), self.px(p00 + 1), self.px(p00 + self.ncol), self.px(p00 + self.ncol + 1));
+            if self.all_ok(a) && self.all_ok(b) && self.all_ok(c) && self.all_ok(d) {
+                for ((((o, &a), &b), &c), &d) in out.iter_mut().zip(a).zip(b).zip(c).zip(d) {
+                    *o = (a.to_f64() * rx + b.to_f64() * (1.0 - rx)) * ry
+                        + (c.to_f64() * rx + d.to_f64() * (1.0 - rx)) * (1.0 - ry);
+                }
+                hit.fill(true);
+                return true;
             }
-            let (a, b, c, d) = (self.px(p00), self.px(p10), self.px(p01), self.px(p11));
-            for ((((o, &a), &b), &c), &d) in acc.iter_mut().zip(a).zip(b).zip(c).zip(d) {
-                *o = (a.to_f64() * rx + b.to_f64() * (1.0 - rx)) * ry
-                    + (c.to_f64() * rx + d.to_f64() * (1.0 - rx)) * (1.0 - ry);
-            }
-            return true;
         }
 
-        for v in acc.iter_mut() { *v = 0.0; }
-        let mut wsum = 0.0;
-        for &(cx, cy, w) in &[
-            (ix,     iy,     rx * ry),
-            (ix + 1, iy,     (1.0 - rx) * ry),
-            (ix,     iy + 1, rx * (1.0 - ry)),
-            (ix + 1, iy + 1, (1.0 - rx) * (1.0 - ry)),
-        ] {
-            if cx >= 0 && cx < ncol && cy >= 0 && cy < nrow {
-                let p = cy as usize * self.ncol + cx as usize;
-                if self.valid(p) {
-                    for (o, &v) in acc.iter_mut().zip(self.px(p)) { *o += v.to_f64() * w; }
-                    wsum += w;
+        let mut any = false;
+        for band in 0..self.nb {
+            let (mut acc, mut div) = (0.0, 0.0);
+            for &(cx, cy, w) in &[
+                (ix,     iy,     rx * ry),
+                (ix + 1, iy,     (1.0 - rx) * ry),
+                (ix,     iy + 1, rx * (1.0 - ry)),
+                (ix + 1, iy + 1, (1.0 - rx) * (1.0 - ry)),
+            ] {
+                if cx >= 0 && cx < ncol && cy >= 0 && cy < nrow {
+                    let pix = self.px(cy as usize * self.ncol + cx as usize);
+                    if self.band_ok(pix, band) {
+                        acc += pix[band].to_f64() * w;
+                        div += w;
+                    }
                 }
             }
+            hit[band] = div >= 1e-5;
+            if hit[band] {
+                out[band] = if div == 1.0 { acc } else { acc / div };
+                any = true;
+            }
         }
-        if wsum < 1e-5 { return false; }
-        for v in acc.iter_mut() { *v /= wsum; }
-        true
+        any
     }
 
-    /// Mirrors `cubic_sample`, including its bilinear fallback.
-    fn cubic(&self, buf_x: f64, buf_y: f64, acc: &mut [f64], row_acc: &mut [f64]) -> bool {
+    /// Cubic at a sample point (GDAL's `GWKCubicResample4Sample`, ~L3420).
+    /// Near the buffer edge, or for a band with any invalid pixel in the
+    /// 4×4 window, falls back to [`Self::bilinear`] for that band.
+    fn cubic(&self, buf_x: f64, buf_y: f64, sc: &mut Scratch) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
         let dx = buf_x - 0.5 - ix as f64;
         let dy = buf_y - 0.5 - iy as f64;
 
         if ix - 1 < 0 || ix + 2 >= self.ncol as i64 || iy - 1 < 0 || iy + 2 >= self.nrow as i64 {
-            return self.bilinear(buf_x, buf_y, acc);
+            return self.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit);
         }
         let wx = [cubic_weight(dx + 1.0), cubic_weight(dx), cubic_weight(dx - 1.0), cubic_weight(dx - 2.0)];
         let wy = [cubic_weight(dy + 1.0), cubic_weight(dy), cubic_weight(dy - 1.0), cubic_weight(dy - 2.0)];
-        // Any nodata in the 4x4 window: fall back to bilinear (matches GDAL).
-        self.convolve(ix - 1, iy - 1, &wx, &wy, acc, row_acc) || self.bilinear(buf_x, buf_y, acc)
+
+        // Row-by-row accumulation, as the per-band reference kernel does.
+        let nb = self.nb;
+        sc.acc.fill(0.0);
+        sc.hit.fill(true);
+        for (jj, &wyj) in wy.iter().enumerate() {
+            sc.row_acc.fill(0.0);
+            let start = (((iy - 1) as usize + jj) * self.ncol + (ix - 1) as usize) * nb;
+            for (pix, &wxi) in self.src[start..start + 4 * nb].chunks_exact(nb).zip(&wx) {
+                if self.all_ok(pix) {
+                    for (r, &v) in sc.row_acc.iter_mut().zip(pix) { *r += v.to_f64() * wxi; }
+                } else {
+                    for b in 0..nb {
+                        if self.band_ok(pix, b) { sc.row_acc[b] += pix[b].to_f64() * wxi; } else { sc.hit[b] = false; }
+                    }
+                }
+            }
+            for (o, &r) in sc.acc.iter_mut().zip(sc.row_acc.iter()) { *o += r * wyj; }
+        }
+        if sc.hit.iter().all(|&h| h) { return true; }
+        // Any band with an invalid pixel in the window: bilinear for it.
+        self.bilinear(buf_x, buf_y, &mut sc.fallback, &mut sc.fallback_hit);
+        let mut any = false;
+        for b in 0..nb {
+            if !sc.hit[b] {
+                sc.hit[b] = sc.fallback_hit[b];
+                sc.acc[b] = sc.fallback[b];
+            }
+            any |= sc.hit[b];
+        }
+        any
     }
 
     /// Kernel widened by the downsampling scale (GDAL's `GWKResample`,
-    /// gdalwarpkernel.cpp ~L4027, and `GWKResampleNoMasksT` ~L4840).
+    /// gdalwarpkernel.cpp ~L4027, and `GWKResampleNoMasksT` ~L4840), and
+    /// lanczos at any scale.
     ///
     /// The window is `1 - r ..= r` around the pixel below-left of the
     /// sample point, clipped to the buffer; weights are the kernel at
-    /// `(i - delta) * scale`. Nodata pixels are skipped and the result is
-    /// normalised by the weight of the pixels used; false if that is below
-    /// 1e-6.
-    fn widened(
-        &self, buf_x: f64, buf_y: f64, w: &Widened,
-        acc: &mut [f64], row_acc: &mut [f64], wx: &mut Vec<f64>,
-    ) -> bool {
+    /// `(i - delta) * scale`. Per band, invalid pixels are skipped and the
+    /// result is normalised by the weight of the pixels used; a band whose
+    /// weight is below 1e-6 gets no value.
+    fn widened(&self, buf_x: f64, buf_y: f64, w: &Widened, sc: &mut Scratch) -> bool {
         let ix = (buf_x - 0.5).floor() as i64;
         let iy = (buf_y - 0.5).floor() as i64;
         let (ncol, nrow) = (self.ncol as i64, self.nrow as i64);
@@ -1175,60 +1376,43 @@ impl<'a, T: Sample> Interleaved<'a, T> {
         // a support wider than the buffer, and uses the 4-sample bilinear
         // formula instead (GWKResampleNoMasksT).
         if w.alg != ResampleAlg::Lanczos && (ix >= ncol || iy >= nrow || w.rx > ncol || w.ry > nrow) {
-            return self.bilinear(buf_x, buf_y, acc);
+            return self.bilinear(buf_x, buf_y, &mut sc.acc, &mut sc.hit);
         }
         let dx = buf_x - 0.5 - ix as f64;
         let dy = buf_y - 0.5 - iy as f64;
         let (i0, i1) = ((1 - w.rx).max(-ix), w.rx.min(ncol - 1 - ix));
         let (j0, j1) = ((1 - w.ry).max(-iy), w.ry.min(nrow - 1 - iy));
 
-        wx.clear();
-        wx.extend((i0..=i1).map(|i| w.alg.weight((i as f64 - dx) * w.sx)));
+        sc.wx.clear();
+        sc.wx.extend((i0..=i1).map(|i| w.alg.weight((i as f64 - dx) * w.sx)));
 
-        for v in acc.iter_mut() { *v = 0.0; }
-        let mut wsum = 0.0;
+        sc.clear();
         let nb = self.nb;
         for j in j0..=j1 {
             let wy = w.alg.weight((j as f64 - dy) * w.sy);
-            for v in row_acc.iter_mut() { *v = 0.0; }
-            let mut row_w = 0.0;
+            sc.row_acc.fill(0.0);
+            sc.row_w.fill(0.0);
+            let mut row_shared = 0.0;
             let start = (((iy + j) * ncol + ix + i0) as usize) * nb;
-            let run = &self.src[start..start + wx.len() * nb];
-            for (pix, &wxi) in run.chunks_exact(nb).zip(wx.iter()) {
-                if !self.valid_px(pix) { continue; }
-                for (r, &v) in row_acc.iter_mut().zip(pix) { *r += v.to_f64() * wxi; }
-                row_w += wxi;
+            let run = &self.src[start..start + sc.wx.len() * nb];
+            for (pix, &wxi) in run.chunks_exact(nb).zip(sc.wx.iter()) {
+                self.accumulate(pix, wxi, &mut sc.row_acc, &mut row_shared, &mut sc.row_w);
             }
-            for (o, &r) in acc.iter_mut().zip(row_acc.iter()) { *o += r * wy; }
-            wsum += row_w * wy;
-        }
-        if wsum < 1e-6 { return false; }
-        if !(0.99999..=1.00001).contains(&wsum) {
-            for v in acc.iter_mut() { *v /= wsum; }
-        }
-        true
-    }
-
-    /// Separable convolution over an in-bounds window whose top-left source
-    /// pixel is `(x0, y0)`. Returns false (with `acc` unspecified) as soon as
-    /// a nodata pixel is met, so the caller can fall back. Row-by-row
-    /// accumulation order matches the per-band kernels so results are
-    /// bit-identical.
-    #[inline]
-    fn convolve(&self, x0: i64, y0: i64, wx: &[f64], wy: &[f64], acc: &mut [f64], row_acc: &mut [f64]) -> bool {
-        for v in acc.iter_mut() { *v = 0.0; }
-        let nb = self.nb;
-        for (jj, &wyj) in wy.iter().enumerate() {
-            for v in row_acc.iter_mut() { *v = 0.0; }
-            let start = ((y0 as usize + jj) * self.ncol + x0 as usize) * nb;
-            let run = &self.src[start..start + wx.len() * nb];
-            for (pix, &wxi) in run.chunks_exact(nb).zip(wx) {
-                if !self.valid_px(pix) { return false; }
-                for (r, &v) in row_acc.iter_mut().zip(pix) { *r += v.to_f64() * wxi; }
+            for b in 0..nb {
+                sc.acc[b] += sc.row_acc[b] * wy;
+                sc.wsum[b] += (row_shared + sc.row_w[b]) * wy;
             }
-            for (o, &r) in acc.iter_mut().zip(row_acc.iter()) { *o += r * wyj; }
         }
-        true
+        let mut any = false;
+        for b in 0..nb {
+            let ws = sc.wsum[b];
+            sc.hit[b] = ws >= 1e-6;
+            if sc.hit[b] {
+                if !(0.99999..=1.00001).contains(&ws) { sc.acc[b] /= ws; }
+                any = true;
+            }
+        }
+        any
     }
 }
 
@@ -1236,41 +1420,111 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 // Area methods (average, mode)
 // =========================================================================
 
-/// What an area method does with the valid source pixels under a
-/// destination pixel's footprint and their weights.
+/// What an area method does with the source pixels under a destination
+/// pixel's footprint and their weights.
 trait AreaReducer<T: Sample> {
     fn reset(&mut self);
-    fn add(&mut self, pix: &[T], w: f64);
-    /// Write the result for one destination pixel; false if there is none.
+    /// A source pixel with weight `w > 0`: `pixel_ok` is the whole-pixel
+    /// validity, `band_ok` the per-band validity (see [`BandNodata`]).
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], w: f64);
+    /// Write the result for one destination pixel, band by band; false if
+    /// no band has one. Bands without a value are left as they are.
     fn write(&self, out: &mut [T]) -> bool;
 }
 
-/// Running weighted mean per band (West's weighted incremental algorithm,
-/// as GDAL's average uses).
+/// Running weighted mean per band over its valid pixels (West's weighted
+/// incremental algorithm, as GDAL's average uses).
 struct AreaMean {
     mean: Vec<f64>,
-    total: f64,
+    total: Vec<f64>,
 }
 
 impl<T: Sample> AreaReducer<T> for AreaMean {
     fn reset(&mut self) {
         self.mean.fill(0.0);
-        self.total = 0.0;
+        self.total.fill(0.0);
     }
 
     #[inline]
-    fn add(&mut self, pix: &[T], w: f64) {
-        self.total += w;
-        let f = w / self.total;
-        for (m, &v) in self.mean.iter_mut().zip(pix) {
-            *m += f * (v.to_f64() - *m);
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], w: f64) {
+        if !pixel_ok { return; }
+        for b in 0..pix.len() {
+            if band_ok[b] {
+                self.total[b] += w;
+                self.mean[b] += (w / self.total[b]) * (pix[b].to_f64() - self.mean[b]);
+            }
         }
     }
 
     fn write(&self, out: &mut [T]) -> bool {
-        if self.total <= 0.0 { return false; }
-        for (o, &v) in out.iter_mut().zip(&self.mean) { *o = T::from_f64(v); }
-        true
+        let mut any = false;
+        for b in 0..out.len() {
+            if self.total[b] > 0.0 {
+                out[b] = T::from_f64(self.mean[b]);
+                any = true;
+            }
+        }
+        any
+    }
+}
+
+/// Average with GDAL's nodata and excluded-value thresholds, all bands
+/// together; see [`AverageThresholds`].
+struct AreaMeanThresholds<'a> {
+    th: &'a AverageThresholds,
+    invalid: f64,
+    excluded: f64,
+    regular: f64,
+    excluded_counts: Vec<usize>,
+    mean: Vec<f64>,
+}
+
+impl<T: Sample> AreaReducer<T> for AreaMeanThresholds<'_> {
+    fn reset(&mut self) {
+        self.invalid = 0.0;
+        self.excluded = 0.0;
+        self.regular = 0.0;
+        self.excluded_counts.fill(0);
+        self.mean.fill(0.0);
+    }
+
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], w: f64) {
+        if !pixel_ok || !band_ok.iter().all(|&ok| ok) {
+            self.invalid += w;
+            return;
+        }
+        let hit = self.th.excluded_values.iter()
+            .position(|t| t.len() == pix.len() && t.iter().zip(pix).all(|(&e, &v)| e == v.to_f64()));
+        if let Some(i) = hit {
+            self.excluded_counts[i] += 1;
+            self.excluded += w;
+            return;
+        }
+        self.regular += w;
+        for (m, &v) in self.mean.iter_mut().zip(pix) {
+            *m += (w / self.regular) * (v.to_f64() - *m);
+        }
+    }
+
+    fn write(&self, out: &mut [T]) -> bool {
+        let total = self.invalid + self.excluded + self.regular;
+        if self.invalid > 0.0 && self.invalid >= self.th.nodata_pct_threshold / 100.0 * total {
+            return false;
+        }
+        if self.excluded > 0.0 && self.excluded >= self.th.excluded_pct_threshold / 100.0 * total {
+            // The most frequent excluded tuple, the first on a tie.
+            let (mut best, mut count) = (0, 0);
+            for (i, &c) in self.excluded_counts.iter().enumerate() {
+                if c > count { best = i; count = c; }
+            }
+            for (o, &v) in out.iter_mut().zip(&self.th.excluded_values[best]) { *o = T::from_f64(v); }
+            return true;
+        }
+        if self.regular > 0.0 {
+            for (o, &m) in out.iter_mut().zip(&self.mean) { *o = T::from_f64(m); }
+            return true;
+        }
+        false
     }
 }
 
@@ -1292,9 +1546,11 @@ impl<T: Sample> AreaReducer<T> for AreaMode<T> {
         self.mode.fill(None);
     }
 
-    fn add(&mut self, pix: &[T], w: f64) {
+    fn add(&mut self, pix: &[T], pixel_ok: bool, band_ok: &[bool], w: f64) {
+        if !pixel_ok { return; }
         let w = w as f32;
-        for ((&v, bins), mode) in pix.iter().zip(&mut self.bins).zip(&mut self.mode) {
+        for (((&v, bins), mode), &ok) in pix.iter().zip(&mut self.bins).zip(&mut self.mode).zip(band_ok) {
+            if !ok { continue; }
             let i = match bins.iter().position(|b| b.0 == v) {
                 Some(i) => { bins[i].1 += w; i }
                 None => { bins.push((v, w)); bins.len() - 1 }
@@ -1315,11 +1571,14 @@ impl<T: Sample> AreaReducer<T> for AreaMode<T> {
     }
 
     fn write(&self, out: &mut [T]) -> bool {
-        if self.mode.iter().any(Option::is_none) { return false; }
+        let mut any = false;
         for ((o, bins), m) in out.iter_mut().zip(&self.bins).zip(&self.mode) {
-            *o = bins[m.unwrap()].0;
+            if let Some(m) = m {
+                *o = bins[*m].0;
+                any = true;
+            }
         }
-        true
+        any
     }
 }
 
@@ -1373,8 +1632,15 @@ fn warp_area<T: Sample>(
             let red = AreaMode { ties: opts.mode_ties, bins: vec![Vec::new(); nb], mode: vec![None; nb] };
             warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
         }
+        _ if opts.average.active() => {
+            let red = AreaMeanThresholds {
+                th: &opts.average, invalid: 0.0, excluded: 0.0, regular: 0.0,
+                excluded_counts: vec![0; opts.average.excluded_values.len()], mean: vec![0.0; nb],
+            };
+            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
+        }
         _ => {
-            let red = AreaMean { mean: vec![0.0; nb], total: 0.0 };
+            let red = AreaMean { mean: vec![0.0; nb], total: vec![0.0; nb] };
             warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red)
         }
     }
@@ -1419,6 +1685,7 @@ fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
     red: &mut R,
     row_out: &mut [T],
 ) {
+    let band_ok = &mut vec![false; img.nb];
     let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
     // Top-left and bottom-right corners of every pixel in the row.
     let mut x1: Vec<f64> = (0..dst_ncol).map(|c| c as f64 + xoff).collect();
@@ -1483,10 +1750,8 @@ fn area_row_gdal_box<T: Sample, R: AreaReducer<T>>(
         for iy in b.iy0..b.iy1 {
             for ix in b.ix0..b.ix1 {
                 let col = if b.wrap { ix % ncol } else { ix };
-                let p = (iy * ncol + col) as usize;
-                if !img.valid(p) { continue; }
                 let w = b.weight(ix, iy);
-                if w > 0.0 { red.add(img.px(p), w); }
+                if w > 0.0 { img.reduce(red, (iy * ncol + col) as usize, w, band_ok); }
             }
         }
         let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
@@ -1511,6 +1776,7 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
     red: &mut R,
     row_out: &mut [T],
 ) {
+    let band_ok = &mut vec![false; img.nb];
     use controlledburn::{burn, BurnOptions, Coord, Geometry, GridSpec, Polygon};
 
     let (xoff, yoff) = (opts.dst_col_off as f64, (dst_row + opts.dst_row_off) as f64);
@@ -1568,13 +1834,11 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
         let at = |row: i32, col: i64| ((r0 + row as i64) * ncol + c0 + col) as usize;
         for run in &res.runs {
             for col in run.col_start..run.col_end {
-                let p = at(run.row, col as i64);
-                if img.valid(p) { red.add(img.px(p), 1.0); }
+                img.reduce(red, at(run.row, col as i64), 1.0, band_ok);
             }
         }
         for e in &res.edges {
-            let p = at(e.row, e.col as i64);
-            if img.valid(p) && e.fraction > 0.0 { red.add(img.px(p), e.fraction as f64); }
+            if e.fraction > 0.0 { img.reduce(red, at(e.row, e.col as i64), e.fraction as f64, band_ok); }
         }
         let px = &mut row_out[c * img.nb..(c + 1) * img.nb];
         if red.write(px) {

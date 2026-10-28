@@ -78,6 +78,7 @@
 //! | Average (GDAL box) | same, plus upsampling, overhanging and 30°-rotated destinations | within 1e-6 relative of `gdalwarp -r average` |
 //! | Average (exact footprint) | axis-aligned cases vs the GDAL box; 45° diamond vs the analytic mean | within 1e-5 (f32 coverage fractions) |
 //! | Mode, all `MODE_TIES` | synthetic categorical, Byte/Int16/Int32/Float32, 4:1 and 2.78:1, nodata, rotated | identical to `gdalwarp -r mode` (26 cases); ties at first occurrence follow GDAL's Byte path for every type |
+//! | Nodata: point kernels, `UNIFIED_SRC_NODATA` unset/YES/NO over three bands, average thresholds and excluded values | synthetic Float32 single- and three-band (near, bilinear, cubic, lanczos, average, mode) | within 1e-6 relative of `gdalwarp` (30 cases) |
 //! | Integer rounding/clamping, nodata avoidance, `[0, n)` source bounds | synthetic Byte/Int16/Int32/Float32 with .5 means, cubic overshoot, means equal to nodata, edge-straddling grids | identical to `gdalwarp` (12 cases) |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
 //! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
