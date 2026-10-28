@@ -55,6 +55,7 @@
 //! |--------|---------------|-----------------|
 //! | [`transform`] | `Transformer` trait, `GenImgProjTransformer` | `GDALGenImgProjTransform` |
 //! | [`gcp_transform`] | `GcpTransformer` (polynomial order 1–3) | `GDALGCPTransform` |
+//! | [`geoloc_transform`] | `GeolocArrays`, `GenImgGeolocTransformer` (curvilinear source and/or target) | `GDALGeoLocTransform`, `GDALGenImgProjTransform` with geolocation arrays |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `ComputeSourceWindow`, `CollectChunkList` | `GDALWarpOperation` planning |
 //! | [`warp`] | Resampling kernels (per-band `i32` reference, and a one-pass generic `Sample` kernel) | `gdalwarpkernel.cpp` |
@@ -73,6 +74,7 @@
 //! | Nearest-neighbour kernel | Sentinel-2, IBCSO Mawson | 65536/65536 identical to `gdalwarp -r near` |
 //! | Bilinear/cubic/lanczos | GEBCO at ~1:1 ratio | 65536/65536 identical to GDAL |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
+//! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
 //!
 //! **Known limitation — downsampled interpolated warps:** when the
 //! source/destination pixel ratio is significantly greater than 1 (coarser
@@ -99,7 +101,8 @@
 //! - **Curvilinear grids** (ROMS, ocean model output): pixel → geo via 2D
 //!   lookup table rather than affine + PROJ. Implements `Transformer`,
 //!   composes with `ApproxTransformer`, `compute_source_window`, and
-//!   `warp_resample` unchanged.
+//!   `warp_resample` unchanged. Implemented in [`geoloc_transform`], for a
+//!   curvilinear source, a curvilinear target, or both.
 //!
 //! - **Displacement-field transformers**: pixel offsets from a vector field
 //!   (DEM orthorectification, InSAR pixel offsets) applied on top of a base
@@ -128,6 +131,7 @@
 //! |-------|-----------------|-------|
 //! | `transform.rs` | `gdaltransformer.cpp` | ~L2800, ~L3100, ~L3500 |
 //! | `gcp_transform.rs` | `alg/gdal_crs.c` | GCP polynomial fit |
+//! | `geoloc_transform.rs` | `alg/gdalgeoloc.cpp` | `PixelLineToXY`, `Transform`, `GDALInverseBilinearInterpolation` |
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
 //! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510 |
@@ -135,6 +139,7 @@
 pub mod crs;
 pub mod transform;
 pub mod gcp_transform;
+pub mod geoloc_transform;
 pub mod approx;
 pub mod source_window;
 pub mod warp;
