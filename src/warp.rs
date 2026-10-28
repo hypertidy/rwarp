@@ -152,7 +152,12 @@ pub fn warp_nearest(
         for dst_col in 0..dst_ncol {
             if !ok[dst_col] { continue; }
 
-            // GDAL line 5304: truncation with epsilon
+            // GDAL GWKCheckAndComputeSrcOffsets: reject coordinates left of
+            // or above the source before casting, so that (-1, 0) is not
+            // truncated to pixel 0; then truncate with epsilon.
+            if src_x[dst_col] < src_col_off as f64 || src_y[dst_col] < src_row_off as f64 {
+                continue;
+            }
             let buf_col = (src_x[dst_col] + 1.0e-10) as i64 - src_col_off as i64;
             let buf_row = (src_y[dst_col] + 1.0e-10) as i64 - src_row_off as i64;
 
@@ -563,6 +568,9 @@ pub fn warp_resample_t<T: Sample>(
             let o = (dst_row * dst_ncol + dst_col) * nbands;
 
             if alg == ResampleAlg::NearestNeighbour {
+                // Test before casting, as GDAL does, so (-1, 0) is not
+                // truncated to pixel 0.
+                if buf_x < 0.0 || buf_y < 0.0 { continue; }
                 let bc = (buf_x + 1.0e-10) as i64;
                 let br = (buf_y + 1.0e-10) as i64;
                 if bc < 0 || bc >= src_ncol as i64 || br < 0 || br >= src_nrow as i64 { continue; }
