@@ -125,9 +125,12 @@
 //!
 //! Sample points outside `[0, n)` of the source buffer are off the source
 //! for every method but the area ones, which use footprints
-//! (`GWKCheckAndComputeSrcOffsets`, ~L5251). GDAL retries such points with
-//! the exact transformer when an approximate one is in use; rwarp uses the
-//! transformer it is given.
+//! (`GWKCheckAndComputeSrcOffsets`, ~L5251). As in GDAL, a point that misses
+//! the buffer by less than one pixel is transformed again on its own, which
+//! through an approximate transformer is exact (one point is too few to
+//! interpolate), and tested again: interpolation error alone does not drop a
+//! pixel at the edge of a chunk's source window. With an exact transformer
+//! the retry changes nothing.
 //!
 //! ## Nodata handling
 //!
@@ -597,7 +600,8 @@ pub struct SourceBuffer<'a, T> {
 /// different latitudes of a lon/lat to Mercator warp log identical
 /// scales). This adds `dst_col_off` / `dst_row_off`, so the estimate is for
 /// the window actually warped. For a single-chunk warp, as in the test
-/// fixtures, the two agree.
+/// fixtures, the two agree; offsets of zero give GDAL's estimate for any
+/// chunk (see [`crate::plan::ScaleOrigin`]).
 pub fn estimate_scale(
     transformer: &impl Transformer,
     dst_ncol: usize,
@@ -1553,6 +1557,52 @@ fn centre_pixel(buf_x: f64, buf_y: f64, ncol: usize, nrow: usize) -> Option<(usi
     Some((cx, cy))
 }
 
+/// Whether GDAL would transform this sample point again on its own: the
+/// first bound it fails (left, top, right, bottom, in GDAL's order) it
+/// misses by less than one source pixel (`GWKCheckAndComputeSrcOffsets`,
+/// gdalwarpkernel.cpp ~L5251). `x`, `y` are in full-source pixels.
+#[inline]
+fn slightly_off<T>(x: f64, y: f64, src: &SourceBuffer<'_, T>) -> bool {
+    let (x0, y0) = (src.col_off as f64, src.row_off as f64);
+    let (x1, y1) = (x0 + src.ncol as f64, y0 + src.nrow as f64);
+    if x < x0 {
+        return x > x0 - 1.0;
+    }
+    if y < y0 {
+        return y > y0 - 1.0;
+    }
+    if x + 1.0e-10 > x1 {
+        return x < x1 + 1.0;
+    }
+    if y + 1.0e-10 > y1 {
+        return y < y1 + 1.0;
+    }
+    false
+}
+
+/// GDAL's retry of a point just off the source: transform the destination
+/// pixel centre again, alone. A one-point call is exact through an
+/// approximate transformer ([`crate::approx::ApproxTransformer`] and GDAL's
+/// both transform five points or fewer exactly), so this undoes the
+/// interpolation error that put the point outside; an exact transformer
+/// gives the same point back.
+#[inline]
+fn retry_alone(
+    transformer: &impl Transformer,
+    dst_col: usize,
+    dst_row: usize,
+    opts: &WarpOptions,
+    src_x: &mut [f64],
+    src_y: &mut [f64],
+    ok: &mut [bool],
+) {
+    let mut x = [(dst_col + opts.dst_col_off) as f64 + 0.5];
+    let mut y = [(dst_row + opts.dst_row_off) as f64 + 0.5];
+    ok[dst_col] = transformer.transform(true, &mut x, &mut y)[0];
+    src_x[dst_col] = x[0];
+    src_y[dst_col] = y[0];
+}
+
 /// A resampled value that lands on the nodata value is moved off it, so it
 /// does not read back as missing (GDAL's `AvoidNoData`, which also warns).
 #[inline]
@@ -1650,11 +1700,15 @@ pub fn warp_to<S: Sample, D: Sample>(
     let mut sc = Scratch::new(nbands);
 
     for dst_row in 0..dst_nrow {
-        let (src_x, src_y, ok) =
+        let (mut src_x, mut src_y, mut ok) =
             transform_scanline(transformer, dst_row, dst_ncol, opts.dst_col_off, opts.dst_row_off);
 
         for dst_col in 0..dst_ncol {
             if !ok[dst_col] { continue; }
+            if slightly_off(src_x[dst_col], src_y[dst_col], src) {
+                retry_alone(transformer, dst_col, dst_row, opts, &mut src_x, &mut src_y, &mut ok);
+                if !ok[dst_col] { continue; }
+            }
             let buf_x = src_x[dst_col] - src.col_off as f64;
             let buf_y = src_y[dst_col] - src.row_off as f64;
             let o = (dst_row * dst_ncol + dst_col) * nbands;

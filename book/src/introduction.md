@@ -20,8 +20,8 @@ will be read before any pixel is touched:
 target grid
     |
     v
-[plan]  compute_source_window / collect_chunk_list
-    |     which source pixels does each target chunk need?
+[plan]  plan_chunks / compute_source_window
+    |     which chunks, and which source pixels does each need?
     |     inspectable, serialisable, resumable
     v
 [read]  the caller fetches bytes: COG tiles, Zarr chunks, byte-reference stores
@@ -41,7 +41,7 @@ and planners that need to know the I/O cost of a reprojection up front.
 | `ApproxTransformer`: adaptive interpolation | `GDALApproxTransform` |
 | `GcpTransformer`: polynomial order 1-3 | `GDALGCPTransform` |
 | `GeolocArrays`, `GenImgGeolocTransformer`: curvilinear source or target | geolocation arrays (`alg/gdalgeoloc.cpp`) |
-| `compute_source_window`, `collect_chunk_list` | `GDALWarpOperation` planning |
+| `plan_chunks`, `compute_source_window` | `GDALWarpOperation` planning (`CollectChunkList`, `ComputeSourceWindow`) |
 | `warp()`: resampling kernels, kernel widening, nodata rules | `gdalwarpkernel.cpp` |
 
 CRS transforms go through a small trait with two backends: libproj (the
