@@ -4,11 +4,10 @@
 
 ```toml
 [dependencies]
-rwarp = "0.1"
+rwarp = "0.3"
 ```
 
-The latest release on crates.io is older than this documentation; to use the
-current API, depend on the repository:
+For unreleased changes on `main`, depend on the repository:
 
 ```toml
 [dependencies]
