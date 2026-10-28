@@ -2,6 +2,33 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## Unreleased
+
+### Added
+
+- Longitude wrapping of a geographic source, GDAL's `CENTER_LONG`:
+  `GenImgProjTransformer::with_source_size` lets the transformer wrap
+  source longitudes around the source raster's centre as gdalwarp does
+  (`InsertCenterLong`, `OGRProjCT`), so a source stored as 170..190,
+  -190..-170 or 0..360 is found by a target crossing 180 degrees.
+  `CenterLong` (`Auto`, the default; `Off`; `At(lon)`, `#[non_exhaustive]`)
+  with `with_center_long`, `with_target_extent` for gdalwarp's `-te`,
+  `center_long()`, `source_center_long` for GDAL's centre, and
+  `crs::is_geographic_degrees`. A transformer built without
+  `with_source_size` wraps nothing, as before. Checked against GDAL
+  3.14.0dev on 11 cases across 180 degrees (LAEA, Mercator, polar
+  stereographic, lon/lat targets; chunked and whole): centres, exact
+  transformer points, chunk lists and every output pixel, with both CRS
+  backends. The LAEA chunk fixtures are back across 180 degrees.
+  The `proj` feature now also depends on `proj-sys` (already a dependency
+  of `proj`), to ask PROJ whether a CRS is geographic.
+
+### Changed
+
+- The chunk fixtures' special points are computed as GDAL computes them for
+  a geographic source (not reprojected; see `ChunkOptions::special_points`).
+  No chunk list changes.
+
 ## 0.3.0 (2026-10-28)
 
 This release changes the API: options types are `#[non_exhaustive]`.

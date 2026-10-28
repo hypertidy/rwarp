@@ -30,6 +30,12 @@ struct Case {
     nodata: bool,
     block: Option<[usize; 2]>,
     special: Vec<[f64; 2]>,
+    /// gdalwarp's -te, in target CRS units
+    te: [f64; 4],
+    /// the longitude GDAL wraps the source around (CENTER_LONG)
+    center_long: Option<f64>,
+    /// GDAL's exact transformer: (dst_to_src, x, y, ok, out x, out y)
+    points: Vec<(bool, f64, f64, bool, f64, f64)>,
     /// src off, src size, dst off, dst size, GDAL's scale
     chunks: Vec<([usize; 2], [usize; 2], [usize; 2], [usize; 2], [f64; 2])>,
     vals: Vec<f64>,
@@ -59,6 +65,9 @@ fn read_case(name: &str) -> Case {
         nodata: false,
         block: None,
         special: vec![],
+        te: [0.0; 4],
+        center_long: None,
+        points: vec![],
         chunks: vec![],
         vals: vec![],
     };
@@ -88,6 +97,12 @@ fn read_case(name: &str) -> Case {
             "nodata" => c.nodata = v == "True",
             "block" => c.block = (v != "-").then(|| nums::<usize>(v).try_into().unwrap()),
             "special" => c.special.push(nums::<f64>(v).try_into().unwrap()),
+            "te" => c.te = nums::<f64>(v).try_into().unwrap(),
+            "center_long" => c.center_long = (v != "-").then(|| v.parse().unwrap()),
+            "point" => {
+                let f: Vec<f64> = nums(v);
+                c.points.push((f[0] == 1.0, f[1], f[2], f[3] == 1.0, f[4], f[5]));
+            }
             "chunk" => {
                 let f: Vec<f64> = nums(v);
                 let u = |i: usize| [f[i] as usize, f[i + 1] as usize];
@@ -108,7 +123,7 @@ mod gdal {
     use rwarp::transform::GenImgProjTransformer;
 
     const NODATA: f64 = -9999.0;
-    const CASES: [&str; 7] = [
+    const CASES: [&str; 16] = [
         "merc_lanczos",
         "merc_bilinear",
         "merc_bilinear_tiled",
@@ -116,11 +131,29 @@ mod gdal {
         "stere_cubic",
         "laea_near",
         "laea_bilinear",
+        // sources across 180 degrees, wrapped around their centre
+        "am_e170_laea_bilinear",
+        "am_w190_laea_bilinear",
+        "am_e170_laea_cubic_whole",
+        "am_e170_merc_near",
+        "am_south_stere_bilinear",
+        "am_g360_merc_bilinear",
+        "am_g360_stere_near",
+        "am_g360_geog_near_whole",
+        "am_g361_geog_te_near",
     ];
 
+    /// The exact transformer as gdalwarp builds it: the source size (and
+    /// -te) give GDAL's CENTER_LONG.
+    fn exact(c: &Case) -> GenImgProjTransformer {
+        GenImgProjTransformer::new("EPSG:4326", c.src_gt, &c.dst_crs, c.dst_gt)
+            .unwrap()
+            .with_source_size(c.src_size)
+            .with_target_extent(c.te)
+    }
+
     fn transformer(c: &Case) -> ApproxTransformer<GenImgProjTransformer> {
-        let exact = GenImgProjTransformer::new("EPSG:4326", c.src_gt, &c.dst_crs, c.dst_gt).unwrap();
-        ApproxTransformer::new(exact, 0.125)
+        ApproxTransformer::new(exact(c), 0.125)
     }
 
     fn options(c: &Case) -> ChunkOptions {
@@ -175,7 +208,7 @@ mod gdal {
             let got: Vec<_> = plan.live().map(|k| (k.src_off, k.src_size, k.dst_off, k.dst_size)).collect();
             let want: Vec<_> = c.chunks.iter().map(|k| (k.0, k.1, k.2, k.3)).collect();
             assert_eq!(got, want, "{name}: chunks");
-            assert!(want.len() > 4, "{name}: {} chunks, want many", want.len());
+            assert!(!want.is_empty(), "{name}: no chunks");
             // GDAL logs scales with %f
             for (k, w) in plan.live().zip(&c.chunks) {
                 for i in 0..2 {
@@ -198,6 +231,69 @@ mod gdal {
             report.push(format!("{name}: {n} of {} differ (max {max:e}), {} chunks", c.vals.len(), plan.live().count()));
             eprintln!("{}", report.last().unwrap());
             assert_eq!(n, 0, "{}", report.last().unwrap());
+        }
+    }
+
+    #[test]
+    fn center_long_matches_gdal() {
+        for name in CASES {
+            let c = read_case(name);
+            assert_eq!(exact(&c).center_long(), c.center_long, "{name}");
+        }
+    }
+
+    /// Target to source and source to target through the exact
+    /// transformer, against GDAL's GenImgProjTransformer on the same
+    /// source and output datasets.
+    #[test]
+    fn exact_transformer_matches_gdal() {
+        let mut worst = 0.0f64;
+        let mut bad = Vec::new();
+        let mut poles = 0;
+        for name in CASES {
+            let c = read_case(name);
+            let t = exact(&c);
+            for &(d2s, x, y, ok, ox, oy) in &c.points {
+                let (mut px, mut py) = ([x], [y]);
+                let got = t.transform(d2s, &mut px, &mut py)[0];
+                let dir = if d2s { "d2s" } else { "s2d" };
+                // proj4rs fails at the poles where PROJ returns a point
+                // (Mercator, the far pole of a polar stereographic): a
+                // backend difference, not one of rwarp's
+                let lat = c.src_gt[3] + x * c.src_gt[4] + y * c.src_gt[5];
+                if !cfg!(feature = "proj") && !d2s && lat.abs() == 90.0 && !got && ok {
+                    poles += 1;
+                    continue;
+                }
+                if got != ok {
+                    bad.push(format!("{name}: {dir} ({x}, {y}) success {got}, GDAL {ok} ({ox}, {oy})"));
+                } else if ok {
+                    let d = (px[0] - ox).abs().max((py[0] - oy).abs());
+                    worst = worst.max(d);
+                    if d >= 1e-6 {
+                        bad.push(format!("{name}: {dir} ({x}, {y}) -> ({}, {}), GDAL ({ox}, {oy})", px[0], py[0]));
+                    }
+                }
+            }
+        }
+        eprintln!("exact transformer: worst difference from GDAL {worst:e} px, {poles} pole points skipped");
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// Without the wrap the sources across 180 degrees are half lost.
+    #[test]
+    fn without_center_long_targets_across_180_lose_the_source() {
+        use rwarp::transform::CenterLong;
+        for name in CASES.iter().filter(|n| n.starts_with("am_") || n.starts_with("laea_")) {
+            let c = read_case(name);
+            let off = ApproxTransformer::new(exact(&c).with_center_long(CenterLong::Off), 0.125);
+            let plan = plan_chunks(&off, c.src_size, c.dst_size, &options(&c));
+            let data = source(&c);
+            let [w, h] = c.src_size;
+            let buf = SourceBuffer { data: &data, ncol: w, nrow: h, nbands: 1, col_off: 0, row_off: 0 };
+            let (n, _) = compare(&warp_chunks(&off, &plan, &buf, &warp_opts(&c)), &c.vals);
+            eprintln!("{name} without CENTER_LONG: {n} of {} differ from gdalwarp", c.vals.len());
+            assert!(n > c.vals.len() / 10, "{name}: {n}");
         }
     }
 
