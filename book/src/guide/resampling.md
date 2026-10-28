@@ -5,12 +5,24 @@
 pixel-interleaved bands, in one pass:
 
 ```rust,ignore
-let out = warp(&transformer, &SourceBuffer { .. }, dst_ncol, dst_nrow, &WarpOptions { .. });
+let out = warp(&transformer, &SourceBuffer { .. }, dst_ncol, dst_nrow, &opts);
 ```
 
 `SourceBuffer` is the window you read, laid out `(row, col, band)`, with
 its offset in the full source image. `WarpOptions` holds everything else;
-`WarpOptions::default()` is nearest neighbour with GDAL's defaults.
+`WarpOptions::default()` is nearest neighbour with GDAL's defaults. Build
+it with `WarpOptions::new(alg)` and the `with_` methods, one per option:
+
+```rust,ignore
+let opts = WarpOptions::new(ResampleAlg::Average)
+    .with_footprint(Footprint::Exact { densify: 1 })
+    .with_src_nodata(Nodata::Value(-9999.0));
+```
+
+`WarpOptions` and the option enums are `#[non_exhaustive]`, so new options
+can arrive in minor releases. Outside rwarp this means no struct literals
+for `WarpOptions`, `GeolocOptions` or `AverageThresholds`, and a `_` arm
+when matching on the enums.
 
 | Option | Choices | GDAL equivalent |
 |---|---|---|

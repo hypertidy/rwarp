@@ -132,12 +132,9 @@ fn run_case(name: &str) -> (Grid, Vec<f32>) {
         other => panic!("unhandled warp options {other}"),
     };
     let buf = SourceBuffer { data: &src.vals[..], ncol: src.ncol, nrow: src.nrow, nbands: 1, col_off: 0, row_off: 0 };
-    let opts = WarpOptions {
-        alg: alg_of(expect.header("alg")),
-        scaling,
-        src_nodata: Nodata::Value(NODATA as f64),
-        ..Default::default()
-    };
+    let opts = WarpOptions::new(alg_of(expect.header("alg")))
+        .with_scaling(scaling)
+        .with_src_nodata(Nodata::Value(NODATA as f64));
     let got = warp(&Affine::of(&expect), &buf, expect.ncol, expect.nrow, &opts);
     (expect, got)
 }
@@ -205,7 +202,9 @@ fn fixed_scale_equals_estimated_when_they_agree() {
     let buf = SourceBuffer { data: &src.vals[..], ncol: N, nrow: N, nbands: 1, col_off: 0, row_off: 0 };
     let t = Affine::new(expect.ncol, expect.nrow);
     let (sx, sy) = estimate_scale(&t, expect.ncol, expect.nrow, 0, 0);
-    let opts = |scaling| WarpOptions { alg: ResampleAlg::Cubic, scaling, src_nodata: Nodata::Value(NODATA as f64), ..Default::default() };
+    let opts = |scaling| WarpOptions::new(ResampleAlg::Cubic)
+        .with_scaling(scaling)
+        .with_src_nodata(Nodata::Value(NODATA as f64));
     let auto = warp(&t, &buf, expect.ncol, expect.nrow, &opts(KernelScaling::WidenWhenDownsampling));
     let fixed = warp(&t, &buf, expect.ncol, expect.nrow, &opts(KernelScaling::Fixed { x: sx, y: sy }));
     assert_eq!(auto, fixed);
@@ -216,7 +215,9 @@ fn widening_changes_output_and_point_does_not_widen() {
     let src = read_grid("src");
     let buf = SourceBuffer { data: &src.vals[..], ncol: N, nrow: N, nbands: 1, col_off: 0, row_off: 0 };
     let t = Affine::new(16, 16);
-    let opts = |scaling| WarpOptions { alg: ResampleAlg::Bilinear, scaling, src_nodata: Nodata::Value(NODATA as f64), ..Default::default() };
+    let opts = |scaling| WarpOptions::new(ResampleAlg::Bilinear)
+        .with_scaling(scaling)
+        .with_src_nodata(Nodata::Value(NODATA as f64));
     let point = warp(&t, &buf, 16, 16, &opts(KernelScaling::Point));
     let fixed_one = warp(&t, &buf, 16, 16, &opts(KernelScaling::Fixed { x: 1.0, y: 1.0 }));
     let widened = warp(&t, &buf, 16, 16, &opts(KernelScaling::WidenWhenDownsampling));
@@ -228,7 +229,9 @@ fn widening_changes_output_and_point_does_not_widen() {
 
 fn average(t: &impl Transformer, src: &Grid, dw: usize, dh: usize, footprint: Footprint) -> Vec<f32> {
     let buf = SourceBuffer { data: &src.vals[..], ncol: src.ncol, nrow: src.nrow, nbands: 1, col_off: 0, row_off: 0 };
-    let opts = WarpOptions { alg: ResampleAlg::Average, footprint, src_nodata: Nodata::Value(NODATA as f64), ..Default::default() };
+    let opts = WarpOptions::new(ResampleAlg::Average)
+        .with_footprint(footprint)
+        .with_src_nodata(Nodata::Value(NODATA as f64));
     warp(t, &buf, dw, dh, &opts)
 }
 
@@ -305,7 +308,7 @@ fn timing_average_footprints() {
         }
     }
     for footprint in [Footprint::GdalBox, Footprint::Exact { densify: 1 }, Footprint::Exact { densify: 4 }] {
-        let opts = WarpOptions { alg: ResampleAlg::Average, footprint, ..Default::default() };
+        let opts = WarpOptions::new(ResampleAlg::Average).with_footprint(footprint);
         let t = std::time::Instant::now();
         let _ = warp(&Rot, &buf, 256, 256, &opts);
         eprintln!("{footprint:?}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
@@ -329,13 +332,10 @@ fn mode_as<T: Sample>(g: &Grid, footprint: Footprint, ties: ModeTies) -> Vec<f64
     let src = read_grid(g.header("src"));
     let data: Vec<T> = src.vals.iter().map(|&v| T::from_f64(v as f64)).collect();
     let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: 1, col_off: 0, row_off: 0 };
-    let opts = WarpOptions {
-        alg: ResampleAlg::Mode,
-        footprint,
-        mode_ties: ties,
-        src_nodata: if holes { Nodata::Value(0.0) } else { Nodata::None },
-        ..Default::default()
-    };
+    let opts = WarpOptions::new(ResampleAlg::Mode)
+        .with_footprint(footprint)
+        .with_mode_ties(ties)
+        .with_src_nodata(if holes { Nodata::Value(0.0) } else { Nodata::None });
     warp(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
 }
 
@@ -434,7 +434,7 @@ fn mode_first_is_first_to_reach_the_count() {
         }
     }
     let run = |ties| {
-        let opts = WarpOptions { alg: ResampleAlg::Mode, mode_ties: ties, ..Default::default() };
+        let opts = WarpOptions::new(ResampleAlg::Mode).with_mode_ties(ties);
         warp(&Half, &buf, 1, 1, &opts)[0]
     };
     assert_eq!((run(ModeTies::First), run(ModeTies::Min), run(ModeTies::Max)), (3, 3, 5));
@@ -455,7 +455,9 @@ fn run_typed<T: Sample>(g: &Grid) -> Vec<f64> {
         "XSCALE=1 YSCALE=1" => KernelScaling::Point,
         other => panic!("unhandled warp options {other}"),
     };
-    let opts = WarpOptions { alg: alg_of(g.header("alg")), scaling, src_nodata, ..Default::default() };
+    let opts = WarpOptions::new(alg_of(g.header("alg")))
+        .with_scaling(scaling)
+        .with_src_nodata(src_nodata);
     warp(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
 }
 
@@ -488,11 +490,8 @@ fn rounding_clamping_avoidance_and_bounds_match_gdal() {
 /// `WarpOptions` from a fixture's `wo` header, the way GDAL reads the warp
 /// options.
 fn options_from_wo(g: &Grid, nbands: usize) -> WarpOptions {
-    let mut o = WarpOptions {
-        alg: alg_of(g.header("alg")),
-        src_nodata: match g.header("nodata") { "-" => Nodata::None, v => Nodata::Value(v.parse().unwrap()) },
-        ..Default::default()
-    };
+    let mut o = WarpOptions::new(alg_of(g.header("alg")))
+        .with_src_nodata(match g.header("nodata") { "-" => Nodata::None, v => Nodata::Value(v.parse().unwrap()) });
     let wo = g.header("wo");
     if wo == "-" { return o; }
     for kv in wo.split(' ') {
@@ -564,7 +563,9 @@ fn any_band_rule_is_the_0_1_behaviour() {
     let data = src.interleaved();
     let buf = SourceBuffer { data: &data[..], ncol: N, nrow: N, nbands: 3, col_off: 0, row_off: 0 };
     let run = |band_nodata| {
-        let o = WarpOptions { alg: ResampleAlg::NearestNeighbour, src_nodata: Nodata::Value(NODATA as f64), band_nodata, ..Default::default() };
+        let o = WarpOptions::new(ResampleAlg::NearestNeighbour)
+            .with_src_nodata(Nodata::Value(NODATA as f64))
+            .with_band_nodata(band_nodata);
         warp(&Affine::new(N, N), &buf, N, N, &o)
     };
     let (partial, any) = (run(BandNodata::Partial), run(BandNodata::AnyBand));
@@ -588,10 +589,7 @@ fn nodata_fixtures_distinguish_the_rules() {
         let data = src.interleaved();
         let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: nb, col_off: 0, row_off: 0 };
         let right = options_from_wo(&g, nb);
-        let wrong = WarpOptions {
-            band_nodata: if right.band_nodata == BandNodata::AnyBand { BandNodata::Partial } else { BandNodata::AnyBand },
-            ..right.clone()
-        };
+        let wrong = right.clone().with_band_nodata(if right.band_nodata == BandNodata::AnyBand { BandNodata::Partial } else { BandNodata::AnyBand });
         let expect = g.interleaved();
         let got = warp(&Affine::of(&g), &buf, g.ncol, g.nrow, &wrong);
         let differ = expect.iter().zip(&got).filter(|(e, v)| (**e as f64 - **v as f64).abs() > 1e-3).count();
@@ -634,11 +632,10 @@ fn run_bands<T: Sample>(g: &Grid) -> Vec<f64> {
     let data: Vec<T> = exact_values(g.header("src"), &src).iter().map(|&v| T::from_f64(v)).collect();
     let buf = SourceBuffer { data: &data[..], ncol: src.ncol, nrow: src.nrow, nbands: nb, col_off: 0, row_off: 0 };
     let o = options_from_wo(g, nb);
-    let opts = WarpOptions {
-        alg: o.alg, scaling: o.scaling, band_nodata: o.band_nodata,
-        src_nodata: o.src_nodata.clone(),
-        ..Default::default()
-    };
+    let opts = WarpOptions::new(o.alg)
+        .with_scaling(o.scaling)
+        .with_band_nodata(o.band_nodata)
+        .with_src_nodata(o.src_nodata.clone());
     warp(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
 }
 
@@ -714,7 +711,9 @@ fn run_conv<S: Sample, D: Sample>(g: &Grid) -> Vec<f64> {
             if v.len() == 1 { DstNodata::Value(v[0]) } else { DstNodata::PerBand(v) }
         }
     };
-    let opts = WarpOptions { alg: alg_of(g.header("alg")), src_nodata, dst_nodata, ..Default::default() };
+    let opts = WarpOptions::new(alg_of(g.header("alg")))
+        .with_src_nodata(src_nodata)
+        .with_dst_nodata(dst_nodata);
     warp_to::<S, D>(&Affine::of(g), &buf, g.ncol, g.nrow, &opts).iter().map(|v| v.to_f64()).collect()
 }
 

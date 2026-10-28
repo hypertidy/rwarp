@@ -71,6 +71,7 @@ use vaster::inv_geotransform;
 ///
 /// Maps GDAL's `GEOREFERENCING_CONVENTION` metadata item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum GeolocConvention {
     /// Samples are top-left pixel corners. GDAL's default.
     #[default]
@@ -94,6 +95,7 @@ impl GeolocConvention {
 /// The defaults match GDAL's defaults: offsets 0, steps 1,
 /// [`GeolocConvention::TopLeftCorner`], no nodata, no longitude wrapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct GeolocOptions {
     /// `PIXEL_OFFSET`: raster pixel of geolocation column 0.
     pub pixel_offset: f64,
@@ -124,6 +126,37 @@ impl Default for GeolocOptions {
             nodata_x: None,
             lon_wrap: false,
         }
+    }
+}
+
+impl GeolocOptions {
+    /// `PIXEL_OFFSET` and `PIXEL_STEP`.
+    pub fn with_pixel(mut self, offset: f64, step: f64) -> Self {
+        self.pixel_offset = offset;
+        self.pixel_step = step;
+        self
+    }
+
+    /// `LINE_OFFSET` and `LINE_STEP`.
+    pub fn with_line(mut self, offset: f64, step: f64) -> Self {
+        self.line_offset = offset;
+        self.line_step = step;
+        self
+    }
+
+    pub fn with_convention(mut self, convention: GeolocConvention) -> Self {
+        self.convention = convention;
+        self
+    }
+
+    pub fn with_nodata_x(mut self, nodata_x: Option<f64>) -> Self {
+        self.nodata_x = nodata_x;
+        self
+    }
+
+    pub fn with_lon_wrap(mut self, lon_wrap: bool) -> Self {
+        self.lon_wrap = lon_wrap;
+        self
     }
 }
 

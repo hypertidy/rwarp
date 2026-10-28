@@ -162,6 +162,7 @@ use crate::transform::{transform_scanline, Transformer};
 
 /// Resampling algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResampleAlg {
     NearestNeighbour,  // 1 pixel,  radius 0
     Bilinear,          // 2×2,      radius 1
@@ -237,6 +238,7 @@ impl ResampleAlg {
 /// How the interpolating kernels respond to downsampling. See the module
 /// documentation.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum KernelScaling {
     /// Fixed kernel support at every ratio (gdalwarp `-wo XSCALE=1
     /// -wo YSCALE=1`).
@@ -255,6 +257,7 @@ pub enum KernelScaling {
 /// is planar area in the source CRS for an affine source; neither is area
 /// in the target CRS or on the ellipsoid.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Footprint {
     /// GDAL's footprint (`GWKAverageOrModeThread`, gdalwarpkernel.cpp
     /// ~L7577): the axis-aligned box between the transformed top-left and
@@ -298,6 +301,7 @@ pub enum ModeTies {
 /// NaN. With one band, all four are the same. A zero in
 /// [`WarpOptions::mask_band`] makes the whole pixel invalid under every rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BandNodata {
     /// GDAL's default (option unset, or `PARTIAL`): a source pixel is
     /// ignored only where every band is nodata, and each band is otherwise
@@ -330,6 +334,7 @@ pub enum BandNodata {
 /// often (by pixel count, the first listed on a tie); otherwise the mean of
 /// the regular pixels.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AverageThresholds {
     pub nodata_pct_threshold: f64,
     /// Tuples of one value per band.
@@ -344,6 +349,19 @@ impl Default for AverageThresholds {
 }
 
 impl AverageThresholds {
+    /// `NODATA_VALUES_PCT_THRESHOLD`: percent.
+    pub fn with_nodata_pct_threshold(mut self, pct: f64) -> Self {
+        self.nodata_pct_threshold = pct;
+        self
+    }
+
+    /// `EXCLUDED_VALUES` and `EXCLUDED_VALUES_PCT_THRESHOLD` (percent).
+    pub fn with_excluded(mut self, values: Vec<Vec<f64>>, pct: f64) -> Self {
+        self.excluded_values = values;
+        self.excluded_pct_threshold = pct;
+        self
+    }
+
     fn active(&self) -> bool {
         !self.excluded_values.is_empty() || self.nodata_pct_threshold / 100.0 < 1.0 - 1e-10
     }
@@ -355,6 +373,7 @@ impl AverageThresholds {
 /// value is representable in the source type, all are ignored, as GDAL
 /// does.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub enum Nodata {
     #[default]
     None,
@@ -378,6 +397,7 @@ impl Nodata {
 /// Destination nodata (GDAL `-dstnodata`): the fill for destination pixels
 /// with no value, and the value resampled results are moved off.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub enum DstNodata {
     /// The source nodata, as gdalwarp does when `-dstnodata` is not given.
     #[default]
@@ -390,6 +410,7 @@ pub enum DstNodata {
 
 /// Options for [`warp`] and [`warp_to`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct WarpOptions {
     pub alg: ResampleAlg,
     pub scaling: KernelScaling,
@@ -431,6 +452,67 @@ impl Default for WarpOptions {
             dst_col_off: 0,
             dst_row_off: 0,
         }
+    }
+}
+
+impl WarpOptions {
+    /// Default options with the given resampling method. Chain the `with_`
+    /// methods to set others; `WarpOptions` is `#[non_exhaustive]`, so it
+    /// can't be built with a struct literal outside this crate.
+    pub fn new(alg: ResampleAlg) -> Self {
+        WarpOptions { alg, ..Default::default() }
+    }
+
+    pub fn with_alg(mut self, alg: ResampleAlg) -> Self {
+        self.alg = alg;
+        self
+    }
+
+    pub fn with_scaling(mut self, scaling: KernelScaling) -> Self {
+        self.scaling = scaling;
+        self
+    }
+
+    pub fn with_footprint(mut self, footprint: Footprint) -> Self {
+        self.footprint = footprint;
+        self
+    }
+
+    pub fn with_mode_ties(mut self, mode_ties: ModeTies) -> Self {
+        self.mode_ties = mode_ties;
+        self
+    }
+
+    pub fn with_average(mut self, average: AverageThresholds) -> Self {
+        self.average = average;
+        self
+    }
+
+    pub fn with_band_nodata(mut self, band_nodata: BandNodata) -> Self {
+        self.band_nodata = band_nodata;
+        self
+    }
+
+    pub fn with_src_nodata(mut self, src_nodata: Nodata) -> Self {
+        self.src_nodata = src_nodata;
+        self
+    }
+
+    pub fn with_dst_nodata(mut self, dst_nodata: DstNodata) -> Self {
+        self.dst_nodata = dst_nodata;
+        self
+    }
+
+    pub fn with_mask_band(mut self, mask_band: Option<usize>) -> Self {
+        self.mask_band = mask_band;
+        self
+    }
+
+    /// Offset of the destination window; see [`WarpOptions::dst_col_off`].
+    pub fn with_dst_offset(mut self, col_off: usize, row_off: usize) -> Self {
+        self.dst_col_off = col_off;
+        self.dst_row_off = row_off;
+        self
     }
 }
 
@@ -1015,6 +1097,7 @@ fn lanczos_sample(
 
 /// GDAL data types for which rwarp implements [`Sample`] (no complex types).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DataType {
     UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64, Float16, Float32, Float64,
 }

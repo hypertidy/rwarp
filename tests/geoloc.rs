@@ -41,12 +41,8 @@ fn well_inside(px: f64, py: f64, ncol: usize, nrow: usize) -> bool {
 }
 
 fn transformer(convention: GeolocConvention) -> GenImgGeolocTransformer {
-    let opts = GeolocOptions {
-        convention,
-        // GDAL sets this for a geographic SRS with longitudes in [-180, 180].
-        lon_wrap: true,
-        ..Default::default()
-    };
+    // GDAL sets this for a geographic SRS with longitudes in [-180, 180].
+    let opts = GeolocOptions::default().with_convention(convention).with_lon_wrap(true);
     let g = GeolocArrays::new(fx::LON.to_vec(), fx::LAT.to_vec(), fx::NCOL, fx::NROW, opts)
         .expect("geolocation arrays");
     GenImgGeolocTransformer::new(
@@ -107,12 +103,9 @@ fn check_nearest(convention: GeolocConvention, gdal_near: &[i32]) {
         .flat_map(|r| (0..fx::NCOL).map(move |c| (c + 1000 * r) as i32))
         .collect();
     let buf = SourceBuffer { data: &src[..], ncol: fx::NCOL, nrow: fx::NROW, nbands: 1, col_off: 0, row_off: 0 };
-    let opts = WarpOptions {
-        alg: ResampleAlg::NearestNeighbour,
-        scaling: KernelScaling::Point,
-        src_nodata: Nodata::Value(fx::NODATA as f64),
-        ..Default::default()
-    };
+    let opts = WarpOptions::new(ResampleAlg::NearestNeighbour)
+        .with_scaling(KernelScaling::Point)
+        .with_src_nodata(Nodata::Value(fx::NODATA as f64));
     let out = warp(&t, &buf, fx::DST_NCOL, fx::DST_NROW, &opts);
     let diffs: Vec<(usize, i32, i32)> = out
         .iter()
@@ -156,11 +149,9 @@ fn top_left_corner_nearest_matches_gdalwarp() {
 // ---------------------------------------------------------------------------
 
 fn dst_geoloc_transformer() -> GenImgGeolocTransformer {
-    let opts = GeolocOptions {
-        convention: GeolocConvention::PixelCenter,
-        lon_wrap: true,
-        ..Default::default()
-    };
+    let opts = GeolocOptions::default()
+        .with_convention(GeolocConvention::PixelCenter)
+        .with_lon_wrap(true);
     let g = GeolocArrays::new(fx::LON.to_vec(), fx::LAT.to_vec(), fx::NCOL, fx::NROW, opts)
         .expect("geolocation arrays");
     GenImgGeolocTransformer::new(
@@ -231,12 +222,9 @@ fn curvilinear_target_nearest_matches_gdalwarp() {
         .flat_map(|r| (0..fx::DST_NCOL).map(move |c| (c + 1000 * r) as i32))
         .collect();
     let buf = SourceBuffer { data: &src[..], ncol: fx::DST_NCOL, nrow: fx::DST_NROW, nbands: 1, col_off: 0, row_off: 0 };
-    let opts = WarpOptions {
-        alg: ResampleAlg::NearestNeighbour,
-        scaling: KernelScaling::Point,
-        src_nodata: Nodata::Value(fx::NODATA as f64),
-        ..Default::default()
-    };
+    let opts = WarpOptions::new(ResampleAlg::NearestNeighbour)
+        .with_scaling(KernelScaling::Point)
+        .with_src_nodata(Nodata::Value(fx::NODATA as f64));
     let out = warp(&t, &buf, fx::NCOL, fx::NROW, &opts);
     let diffs: Vec<(usize, i32, i32)> = out
         .iter()
