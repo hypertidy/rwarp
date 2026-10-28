@@ -66,6 +66,10 @@ gains variants.
 ### Fixed
 
 - Nearest neighbour mapped source coordinates in (-1, 0) to pixel 0.
+- `ApproxTransformer` left one point untransformed and reported it failed
+  when subdivision reached a left half of two points, which happens on
+  strongly curved transforms or with a small error threshold (whole
+  columns of a polar warp came out as nodata). GDAL transforms it.
 
 ## 0.1.2 (2026-03-11, not on crates.io)
 
