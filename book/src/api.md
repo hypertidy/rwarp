@@ -18,3 +18,4 @@ references.
 | `source_window` | `compute_source_window` |
 | `plan` | `plan_chunks`, `ChunkPlanner`, `ChunkOptions`, `WarpPlan`, `Chunk`, `warp_chunks` |
 | `warp` | `warp`, `WarpOptions`, `SourceBuffer`, `Sample`, kernels |
+| `weights` | `exact_weights`, `exact_weights_with`, `Weights`, `WeightOptions`, `Normalization`, `ApplyOptions`, `GridWindow` |

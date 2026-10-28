@@ -62,6 +62,7 @@
 //! | [`source_window`] | `compute_source_window` (one window, quick) | `ComputeSourceWindow` |
 //! | [`plan`] | `plan_chunks`, `ChunkPlanner`, `warp_chunks`: gdalwarp's chunk list, source windows and per-chunk kernel scale as values | `GDALWarpOperation::CollectChunkList`, `ComputeSourceWindow` |
 //! | [`cutline`] | `Cutline`: polygon limiting the source pixels used, as a per-pixel density | `GDALWarpCutlineMaskerEx`, `TransformCutlineToSource` |
+//! | [`weights`] | `exact_weights`, `Weights`: conservative remapping weights from the exact footprint as values (ESMF `conserve`), normalised (`FracArea`, `DestArea`) and applied | none (ESMF `ESMF_RegridWeightGen`, SCRIP) |
 //! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, area-weighted average and mode, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
 //!
 //! ## Validation status
@@ -81,6 +82,7 @@
 //! | Point kernels at any ratio | same, against `gdalwarp -wo XSCALE=1 -wo YSCALE=1` | within 1e-6 relative |
 //! | Average (GDAL box) | same, plus upsampling, overhanging and 30°-rotated destinations | within 1e-6 relative of `gdalwarp -r average` |
 //! | Average (exact footprint) | axis-aligned cases vs the GDAL box; 45° diamond vs the analytic mean | within 1e-5 (f32 coverage fractions) |
+//! | Conservative weights (`exact_weights`) | regular to rotated, lon/lat to EPSG:3031 and to LAEA (`tests/weights.rs`) | source-cell sums of `frac` within 6e-14 of 1 (or of the covered fraction at the grid's edge); `DestArea` integral within 4e-15 relative; `apply(FracArea)` with warp-compatible weights identical to `warp()` |
 //! | Mode, all `MODE_TIES` | synthetic categorical, Byte/Int16/Int32/Float32, 4:1 and 2.78:1, nodata, rotated | identical to `gdalwarp -r mode` (26 cases); ties at first occurrence follow GDAL's Byte path for every type |
 //! | Nodata: point kernels, `UNIFIED_SRC_NODATA` unset/YES/NO over three bands, average thresholds and excluded values | synthetic Float32 single- and three-band (near, bilinear, cubic, lanczos, average, mode) | within 1e-6 relative of `gdalwarp` (30 cases) |
 //! | Cubic spline; min, max, med, q1, q3, rms; Int64, UInt64, Float16 | synthetic Float32/Int16/Int64/UInt64/Float16, point and widened, nodata, rotated, three bands | within 1e-6 relative (integers exact, Float16 within one step) of `gdalwarp` (50 cases, plus 18 more mode cases) |
@@ -163,6 +165,7 @@ pub mod source_window;
 pub mod plan;
 pub mod cutline;
 pub mod warp;
+pub mod weights;
 
 // Re-export the Transformer trait at the crate root so modules can
 // `use crate::Transformer` without reaching into transform::

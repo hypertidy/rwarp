@@ -9,6 +9,7 @@
 - [Transformers](guide/transformers.md)
 - [Planning reads](guide/planning.md)
 - [Resampling](guide/resampling.md)
+- [Conservative weights](guide/weights.md)
 - [Curvilinear grids](guide/curvilinear.md)
 - [Cutlines](guide/cutline.md)
 
