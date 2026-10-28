@@ -10,6 +10,7 @@
 - [Planning reads](guide/planning.md)
 - [Resampling](guide/resampling.md)
 - [Curvilinear grids](guide/curvilinear.md)
+- [Cutlines](guide/cutline.md)
 
 # Reference
 

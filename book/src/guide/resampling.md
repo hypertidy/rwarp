@@ -34,6 +34,7 @@ when matching on the enums.
 | `band_nodata` | `Partial` (default), `Unified`, `PerBand`, `AnyBand` | `-wo UNIFIED_SRC_NODATA=` |
 | `nodata`, `mask_band` | a nodata value; an alpha band | `-srcnodata`, `-dstnodata`, alpha |
 | `dst_col_off`, `dst_row_off` | offset of this tile in a larger target | the chunk's destination offset |
+| `cutline` | a `Cutline` (see [Cutlines](cutline.md)) | `-cutline`, `-cblend`, `-wo CUTLINE_ALL_TOUCHED=` |
 
 ## Kernel widening when downsampling
 
