@@ -21,3 +21,8 @@ js-sys = "0.3"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# controlledburn 0.2.2 (CoverageWindow) is not on crates.io yet: build from
+# hypertidy/controlledburn-rs#13. Remove once 0.2.2 is published.
+[patch.crates-io]
+controlledburn = { git = "https://github.com/hypertidy/controlledburn-rs", branch = "window/coverage" }
