@@ -2,7 +2,7 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
-## Unreleased (0.2.0)
+## 0.2.0 (2026-10-28)
 
 This release changes the API: `warp()` with `WarpOptions` and
 `SourceBuffer` replaces the warp entry points of 0.1, and `ResampleAlg`
