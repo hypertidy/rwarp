@@ -177,7 +177,12 @@ pub struct ChunkOptions {
     /// one falls in the target (`0 <= x <= width`, `0 <= y <= height`).
     /// GDAL uses longitude 0 at latitudes -89.9999 and 89.9999 of the
     /// source's geographic CRS, transformed to target pixels; the caller
-    /// computes them, as they need the CRS.
+    /// computes them, as they need the CRS. For a source CRS that is
+    /// itself geographic in degrees, GDAL 3.6 and later skip the
+    /// reprojection (`GDALTransformLonLatToDestGenImgProjTransformer`) and
+    /// apply the target's inverse geotransform to `(0, -89.9999)` and
+    /// `(0, 89.9999)` as if they were target coordinates; to match
+    /// gdalwarp, do the same.
     pub special_points: Vec<[f64; 2]>,
     /// Sample a grid over each chunk from the start (`SAMPLE_GRID=YES`).
     pub sample_grid: bool,

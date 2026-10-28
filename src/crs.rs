@@ -75,6 +75,127 @@ pub fn crs_pair(
     }
 }
 
+/// Whether `crs` is geographic with degrees as its angular unit, with the
+/// backend compiled in: the test GDAL makes before wrapping a source's
+/// longitudes around its centre (`IsGeographic()` and `GetAngularUnits()`
+/// within 1e-9 of a degree, in `InsertCenterLong`, gdaltransformer.cpp).
+///
+/// With libproj, a bound CRS counts by its base CRS and a compound CRS by
+/// its horizontal part, as in GDAL. With proj4rs, `+proj=longlat` (and
+/// `latlong`, `lonlat`, `latlon`) is geographic, always in degrees.
+pub fn is_geographic_degrees(crs: &str) -> Result<bool, String> {
+    #[cfg(feature = "proj")]
+    {
+        return proj_geographic_degrees(crs);
+    }
+    #[cfg(all(not(feature = "proj"), feature = "proj4rs"))]
+    {
+        let p = proj4rs::proj::Proj::from_user_string(crs)
+            .map_err(|e| format!("proj4rs cannot parse {crs:?}: {e}"))?;
+        return Ok(p.is_latlong());
+    }
+    #[cfg(not(any(feature = "proj", feature = "proj4rs")))]
+    {
+        let _ = crs;
+        Err("rwarp built without a CRS backend".to_string())
+    }
+}
+
+/// GDAL's `SRS_UA_DEGREE_CONV`.
+#[cfg_attr(not(feature = "proj"), allow(dead_code))]
+const DEGREE_TO_RADIAN: f64 = 0.0174532925199433;
+
+#[cfg(feature = "proj")]
+fn proj_geographic_degrees(crs: &str) -> Result<bool, String> {
+    use proj_sys::*;
+    use std::ffi::CString;
+
+    let def = CString::new(ensure_crs(crs).as_ref()).map_err(|e| format!("{crs:?}: {e}"))?;
+    // SAFETY: every object created here is destroyed before return, with
+    // the context last; the pointers are checked for null before use.
+    unsafe {
+        let ctx = proj_context_create();
+        if ctx.is_null() {
+            return Err("proj_context_create failed".to_string());
+        }
+        let mut owned: Vec<*mut PJ> = Vec::new();
+        let result = (|| {
+            let pj = proj_create(ctx, def.as_ptr());
+            if pj.is_null() {
+                return Err(format!("PROJ cannot parse {crs:?}"));
+            }
+            owned.push(pj);
+            // OGRSpatialReference::IsGeographic: a bound CRS by its base, a
+            // compound CRS by its first (horizontal) component, itself
+            // perhaps bound.
+            let mut crs_pj = pj;
+            if proj_get_type(crs_pj) == PJ_TYPE_PJ_TYPE_BOUND_CRS {
+                let base = proj_get_source_crs(ctx, crs_pj);
+                if base.is_null() {
+                    return Ok(false);
+                }
+                owned.push(base);
+                crs_pj = base;
+            }
+            if proj_get_type(crs_pj) == PJ_TYPE_PJ_TYPE_COMPOUND_CRS {
+                let horiz = proj_crs_get_sub_crs(ctx, crs_pj, 0);
+                if horiz.is_null() {
+                    return Ok(false);
+                }
+                owned.push(horiz);
+                crs_pj = horiz;
+                if proj_get_type(crs_pj) == PJ_TYPE_PJ_TYPE_BOUND_CRS {
+                    let base = proj_get_source_crs(ctx, crs_pj);
+                    if base.is_null() {
+                        return Ok(false);
+                    }
+                    owned.push(base);
+                    crs_pj = base;
+                }
+            }
+            let t = proj_get_type(crs_pj);
+            if t != PJ_TYPE_PJ_TYPE_GEOGRAPHIC_2D_CRS && t != PJ_TYPE_PJ_TYPE_GEOGRAPHIC_3D_CRS {
+                return Ok(false);
+            }
+            // OGRSpatialReference::GetAngularUnits: the first axis of the
+            // geodetic CRS's ellipsoidal coordinate system, else degrees.
+            let mut factor = DEGREE_TO_RADIAN;
+            let geod = proj_crs_get_geodetic_crs(ctx, crs_pj);
+            if !geod.is_null() {
+                owned.push(geod);
+                let cs = proj_crs_get_coordinate_system(ctx, geod);
+                if !cs.is_null() {
+                    owned.push(cs);
+                    if proj_cs_get_type(ctx, cs) == PJ_COORDINATE_SYSTEM_TYPE_PJ_CS_TYPE_ELLIPSOIDAL {
+                        let mut f = 0.0;
+                        let ok = proj_cs_get_axis_info(
+                            ctx,
+                            cs,
+                            0,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            &mut f,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        );
+                        if ok != 0 {
+                            factor = f;
+                        }
+                    }
+                }
+            }
+            Ok((factor - DEGREE_TO_RADIAN).abs() <= 1e-9)
+        })();
+        for p in owned.into_iter().rev() {
+            proj_destroy(p);
+        }
+        proj_context_destroy(ctx);
+        result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // proj (libproj) backend
 // ---------------------------------------------------------------------------

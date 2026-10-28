@@ -60,7 +60,7 @@
 //! negligible for tile-serving use cases where the transformer is created
 //! once and reused across tiles.
 
-use crate::crs::{crs_pair, CrsTransform};
+use crate::crs::{crs_pair, is_geographic_degrees, CrsTransform};
 use vaster::inv_geotransform;
 // ---------------------------------------------------------------------------
 // Transformer trait
@@ -151,6 +151,30 @@ pub trait Transformer {
 ///
 /// The ApproxTransformer wraps this entire struct from outside (in lib.rs),
 /// matching gdalwarp's default architecture.
+///
+/// ## Longitude wrapping (`CENTER_LONG`)
+///
+/// For a source CRS that is geographic in degrees, GDAL wraps source
+/// longitudes into the 360 degrees around the source raster's centre, so a
+/// target reaching across 180 degrees from a source near it still finds it
+/// (a source stored as 170..190, or in 0..360). rwarp does the same once it
+/// knows the source raster's size, which GDAL takes from the dataset:
+///
+/// ```
+/// # use rwarp::transform::GenImgProjTransformer;
+/// let src_gt = [170.0, 0.25, 0.0, -10.0, 0.0, -0.25]; // 170E to 190E
+/// let t = GenImgProjTransformer::new(
+///     "EPSG:4326", src_gt,
+///     "+proj=laea +lat_0=-20 +lon_0=180", [-1e6, 1e4, 0.0, 1e6, 0.0, -1e4],
+/// )?
+/// .with_source_size([80, 40]);
+/// assert_eq!(t.center_long(), Some(180.0));
+/// # Ok::<(), String>(())
+/// ```
+///
+/// See [`CenterLong`] for the rule and the alternatives. Without
+/// [`with_source_size`](Self::with_source_size) nothing is wrapped, as
+/// in rwarp 0.3.0.
 pub struct GenImgProjTransformer {
     // Source grid
     src_gt: [f64; 6],
@@ -163,6 +187,108 @@ pub struct GenImgProjTransformer {
     // CRS coordinate transforms
     crs_dst_to_src: Box<dyn CrsTransform>,
     crs_src_to_dst: Box<dyn CrsTransform>,
+
+    // CENTER_LONG: what is known of the CRSs (None with `with_backend`),
+    // the inputs to GDAL's rule, and the longitude wrapped around.
+    src_geographic: Option<bool>,
+    dst_geographic: Option<bool>,
+    src_size: Option<[usize; 2]>,
+    target_extent: Option<[f64; 4]>,
+    center_mode: CenterLong,
+    center: Option<f64>,
+}
+
+/// How [`GenImgProjTransformer`] wraps the longitudes of a geographic
+/// source: GDAL's `CENTER_LONG`.
+///
+/// With a centre `c`, a source longitude below `c - 180` gets 360 added
+/// and one above `c + 180` gets 360 taken away (once; the bounds stay as
+/// they are). Target to source, the wrap is applied to the longitude the
+/// CRS step returns; source to target, to the longitude given to it. GDAL
+/// does this in `OGRProjCT` (ogr/ogrct.cpp, `dfSourceWrapLong`, applied to
+/// the source CRS and, through `GetInverse`, to the target CRS of the
+/// reverse transform the warper uses).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
+pub enum CenterLong {
+    /// GDAL's default (`InsertCenterLong` in gdaltransformer.cpp, used by
+    /// `GDALCreateGenImgProjTransformer2` and so by gdalwarp): when the
+    /// source CRS is geographic in degrees, wrap around the middle of the
+    /// smallest and largest longitudes of the source raster's four
+    /// corners, rounded to six significant digits as GDAL passes it
+    /// through `%g`. Nothing is wrapped if the corners span more than 360
+    /// degrees, unless the target is geographic too and its extent
+    /// (gdalwarp's `-te`, see
+    /// [`GenImgProjTransformer::with_target_extent`]) crosses 180 degrees.
+    ///
+    /// Needs the source raster's size
+    /// ([`GenImgProjTransformer::with_source_size`]), and a transformer
+    /// made with [`GenImgProjTransformer::new`] (one made with
+    /// [`GenImgProjTransformer::with_backend`] does not know its CRSs; use
+    /// [`CenterLong::At`] with [`source_center_long`]).
+    #[default]
+    Auto,
+    /// No wrapping (GDAL's `INSERT_CENTER_LONG=FALSE`, which gdalwarp uses
+    /// to bring a cutline into source pixels).
+    Off,
+    /// Wrap around this longitude: a `CENTER_LONG` given in the source
+    /// CRS's WKT (`EXTENSION["CENTER_LONG", ...]`) or to
+    /// `GDALCreateReprojectionTransformerEx`. Ignored, as by GDAL, for a
+    /// source known not to be geographic; applied for a transformer made
+    /// with [`GenImgProjTransformer::with_backend`].
+    At(f64),
+}
+
+/// GDAL's centre longitude for a geographic source raster
+/// (`InsertCenterLong`, gdaltransformer.cpp): the middle of the smallest
+/// and largest x of the four corners of the raster, `src_size` = `[width,
+/// height]` pixels, rounded to six significant digits (GDAL formats it
+/// with `%g`).
+///
+/// `None` when the corners span more than 360 degrees, unless
+/// `geographic_target_extent` (`[xmin, ymin, xmax, ymax]` of a target in a
+/// geographic CRS in degrees, gdalwarp's `-te`) crosses 180 degrees: xmin
+/// in `[-179, 180)` with xmax above 180, or xmin below -180 with xmax in
+/// `(-180, 179]`.
+pub fn source_center_long(
+    src_gt: &[f64; 6],
+    src_size: [usize; 2],
+    geographic_target_extent: Option<[f64; 4]>,
+) -> Option<f64> {
+    let (w, h) = (src_size[0] as f64, src_size[1] as f64);
+    let corner = |p: f64, l: f64| src_gt[0] + p * src_gt[1] + l * src_gt[2];
+    let xs = [corner(0.0, 0.0), corner(w, 0.0), corner(0.0, h), corner(w, h)];
+    let min = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !(min.is_finite() && max.is_finite()) {
+        return None;
+    }
+    if max - min > 360.0 {
+        let crosses = geographic_target_extent.is_some_and(|te| {
+            (te[0] >= -179.0 && te[0] < 180.0 && te[2] > 180.0) || (te[0] < -180.0 && te[2] > -180.0 && te[2] <= 179.0)
+        });
+        if !crosses {
+            return None;
+        }
+    }
+    Some(printf_g((max + min) / 2.0))
+}
+
+/// `CPLAtof(CPLSPrintf("%g", v))`: `v` to six significant digits.
+fn printf_g(v: f64) -> f64 {
+    format!("{v:.5e}").parse().unwrap_or(v)
+}
+
+/// GDAL's source longitude wrap (`OGRProjCT`, ogr/ogrct.cpp).
+#[inline]
+fn wrap_long(x: f64, center: f64) -> f64 {
+    if x < center - 180.0 {
+        x + 360.0
+    } else if x > center + 180.0 {
+        x - 360.0
+    } else {
+        x
+    }
 }
 
 impl GenImgProjTransformer {
@@ -174,7 +300,57 @@ impl GenImgProjTransformer {
         dst_gt: [f64; 6],
     ) -> Result<Self, String> {
         let (crs_dst_to_src, crs_src_to_dst) = crs_pair(src_crs, dst_crs)?;
-        Self::with_backend(src_gt, dst_gt, crs_dst_to_src, crs_src_to_dst)
+        let mut t = Self::with_backend(src_gt, dst_gt, crs_dst_to_src, crs_src_to_dst)?;
+        t.src_geographic = is_geographic_degrees(src_crs).ok();
+        t.dst_geographic = is_geographic_degrees(dst_crs).ok();
+        t.resolve_center_long();
+        Ok(t)
+    }
+
+    /// Give the source raster's size, `[width, height]` in pixels, so the
+    /// source longitudes can be wrapped as GDAL does by default
+    /// ([`CenterLong::Auto`]).
+    pub fn with_source_size(mut self, size: [usize; 2]) -> Self {
+        self.src_size = Some(size);
+        self.resolve_center_long();
+        self
+    }
+
+    /// Give the target extent `[xmin, ymin, xmax, ymax]` in target CRS
+    /// units, gdalwarp's `-te` (GDAL's `TARGET_EXTENT` transformer option).
+    /// It only matters to [`CenterLong::Auto`] for a source wider than 360
+    /// degrees and a geographic target.
+    pub fn with_target_extent(mut self, extent: [f64; 4]) -> Self {
+        self.target_extent = Some(extent);
+        self.resolve_center_long();
+        self
+    }
+
+    /// Choose how source longitudes are wrapped (default
+    /// [`CenterLong::Auto`]).
+    pub fn with_center_long(mut self, center: CenterLong) -> Self {
+        self.center_mode = center;
+        self.resolve_center_long();
+        self
+    }
+
+    /// The longitude source longitudes are wrapped around, if any.
+    pub fn center_long(&self) -> Option<f64> {
+        self.center
+    }
+
+    fn resolve_center_long(&mut self) {
+        self.center = match self.center_mode {
+            CenterLong::Off => None,
+            CenterLong::At(c) => (self.src_geographic != Some(false)).then_some(c),
+            CenterLong::Auto => match (self.src_geographic, self.src_size) {
+                (Some(true), Some(size)) => {
+                    let te = self.target_extent.filter(|_| self.dst_geographic == Some(true));
+                    source_center_long(&self.src_gt, size, te)
+                }
+                _ => None,
+            },
+        };
     }
 
     /// Build a transformer from caller-supplied CRS transforms.
@@ -201,6 +377,12 @@ impl GenImgProjTransformer {
             dst_inv_gt,
             crs_dst_to_src,
             crs_src_to_dst,
+            src_geographic: None,
+            dst_geographic: None,
+            src_size: None,
+            target_extent: None,
+            center_mode: CenterLong::Auto,
+            center: None,
         })
     }
 }
@@ -234,7 +416,12 @@ impl Transformer for GenImgProjTransformer {
             for i in 0..n {
                 match self.crs_dst_to_src.convert(x[i], y[i]) {
                     Some((rx, ry)) => {
-                        x[i] = rx;
+                        // CENTER_LONG: the reverse OGRProjCT wraps its
+                        // target (our source) longitude on the way out
+                        x[i] = match self.center {
+                            Some(c) => wrap_long(rx, c),
+                            None => rx,
+                        };
                         y[i] = ry;
                     }
                     None => {
@@ -267,6 +454,12 @@ impl Transformer for GenImgProjTransformer {
                 let line = y[i];
                 x[i] = self.src_gt[0] + pixel * self.src_gt[1] + line * self.src_gt[2];
                 y[i] = self.src_gt[3] + pixel * self.src_gt[4] + line * self.src_gt[5];
+            }
+
+            // CENTER_LONG: the forward OGRProjCT wraps its source longitude
+            // on the way in
+            if let Some(c) = self.center {
+                x.iter_mut().for_each(|v| *v = wrap_long(*v, c));
             }
 
             let mut success = vec![true; n];
@@ -356,6 +549,125 @@ pub fn transform_grid(
     }
 
     (all_x, all_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Identity CRS step: what a geographic source to the same CRS does.
+    struct Same;
+    impl CrsTransform for Same {
+        fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+            Some((x, y))
+        }
+    }
+
+    const G360: [f64; 6] = [0.0, 1.0, 0.0, 90.0, 0.0, -1.0];
+    const G180: [f64; 6] = [-180.0, 1.0, 0.0, 90.0, 0.0, -1.0];
+
+    #[test]
+    fn center_is_gdal_percent_g() {
+        // GDAL: "OGRCT: Wrap source at 147.128." for this raster
+        let gt = [147.1234567, 0.001, 0.0, 0.0, 0.0, -0.001];
+        assert_eq!(source_center_long(&gt, [10, 10], None), Some(147.128));
+        assert_eq!(source_center_long(&[170.0, 0.25, 0.0, -10.0, 0.0, -0.25], [80, 40], None), Some(180.0));
+        assert_eq!(source_center_long(&G360, [360, 180], None), Some(180.0));
+        // rotated: the four corners count
+        assert_eq!(source_center_long(&[10.0, 1.0, 1.0, 0.0, 0.0, -1.0], [20, 10], None), Some(25.0));
+    }
+
+    #[test]
+    fn wider_than_360_wraps_only_for_a_geographic_target_across_180() {
+        let gt = [-180.5, 1.0, 0.0, 90.0, 0.0, -1.0];
+        assert_eq!(source_center_long(&gt, [361, 180], None), None);
+        assert_eq!(source_center_long(&gt, [361, 180], Some([-180.0, -90.0, 180.0, 90.0])), None);
+        assert_eq!(source_center_long(&gt, [361, 180], Some([90.0, -90.0, 270.0, 90.0])), Some(0.0));
+        assert_eq!(source_center_long(&gt, [361, 180], Some([-270.0, -90.0, -90.0, 90.0])), Some(0.0));
+        // GDAL's bounds: xmin from -179, xmax up to 179
+        assert_eq!(source_center_long(&gt, [361, 180], Some([-179.5, -90.0, 181.0, 90.0])), None);
+        assert_eq!(source_center_long(&gt, [361, 180], Some([-181.0, -90.0, 179.5, 90.0])), None);
+    }
+
+    #[test]
+    fn wrap_keeps_both_bounds() {
+        assert_eq!(wrap_long(0.0, 180.0), 0.0);
+        assert_eq!(wrap_long(360.0, 180.0), 360.0);
+        assert_eq!(wrap_long(-0.5, 180.0), 359.5);
+        assert_eq!(wrap_long(-170.0, 180.0), 190.0);
+        assert_eq!(wrap_long(190.0, -180.0), -170.0);
+        assert_eq!(wrap_long(400.0, 0.0), 40.0);
+        assert_eq!(wrap_long(-540.0, 0.0), -180.0); // once only
+    }
+
+    fn same(src_gt: [f64; 6], dst_gt: [f64; 6]) -> GenImgProjTransformer {
+        GenImgProjTransformer::with_backend(src_gt, dst_gt, Box::new(Same), Box::new(Same)).unwrap()
+    }
+
+    #[test]
+    fn explicit_center_wraps_both_ways() {
+        // a 0..360 source and a -180..180 target, as GDAL with EPSG:4326 on
+        // both sides: target lon -169.5 is source column 190.5
+        let t = same(G360, G180).with_center_long(CenterLong::At(180.0));
+        let (mut x, mut y) = ([10.5], [10.5]);
+        assert!(t.transform(true, &mut x, &mut y)[0]);
+        assert_eq!((x[0], y[0]), (190.5, 10.5));
+        // source to target: lon 10.5 is in 0..360 already, so it stays
+        let (mut x, mut y) = ([10.5], [10.5]);
+        assert!(t.transform(false, &mut x, &mut y)[0]);
+        assert_eq!(x[0], 190.5);
+        // a source longitude outside 0..360 is brought in
+        let (mut x, mut y) = ([-20.0], [0.0]);
+        t.transform(false, &mut x, &mut y);
+        assert_eq!(x[0], 180.0 + 340.0);
+    }
+
+    #[test]
+    fn auto_needs_known_crs_and_size() {
+        // with_backend does not know the CRSs: Auto does nothing
+        let t = same(G360, G180).with_source_size([360, 180]);
+        assert_eq!(t.center_long(), None);
+        let t = t.with_center_long(CenterLong::At(180.0));
+        assert_eq!(t.center_long(), Some(180.0));
+        assert_eq!(t.with_center_long(CenterLong::Off).center_long(), None);
+    }
+
+    #[cfg(any(feature = "proj", feature = "proj4rs"))]
+    #[test]
+    fn auto_follows_gdal_for_crs_strings() {
+        let t = GenImgProjTransformer::new("EPSG:4326", G360, "EPSG:4326", G180).unwrap();
+        assert_eq!(t.center_long(), None, "no size, no wrap");
+        let t = t.with_source_size([360, 180]);
+        assert_eq!(t.center_long(), Some(180.0));
+        let (mut x, mut y) = ([10.5], [10.5]);
+        assert!(t.transform(true, &mut x, &mut y)[0]);
+        assert!((x[0] - 190.5).abs() < 1e-9, "{}", x[0]);
+        // a projected source is never wrapped, even when asked
+        let merc = [-2e7, 1e5, 0.0, 2e7, 0.0, -1e5];
+        let t = GenImgProjTransformer::new("EPSG:3857", merc, "EPSG:4326", G180)
+            .unwrap()
+            .with_source_size([400, 400]);
+        assert_eq!(t.center_long(), None);
+        assert_eq!(t.with_center_long(CenterLong::At(0.0)).center_long(), None);
+        let t = GenImgProjTransformer::new("+proj=longlat +datum=WGS84 +no_defs", G360, "EPSG:3857", merc)
+            .unwrap()
+            .with_source_size([360, 180]);
+        assert_eq!(t.center_long(), Some(180.0));
+    }
+
+    #[cfg(feature = "proj")]
+    #[test]
+    fn geographic_degrees_as_gdal_sees_it() {
+        use crate::crs::is_geographic_degrees as g;
+        assert!(g("EPSG:4326").unwrap());
+        assert!(g("EPSG:4979").unwrap()); // 3D
+        assert!(g("+proj=longlat +ellps=GRS80 +towgs84=0,0,0 +no_defs").unwrap()); // bound
+        assert!(g("EPSG:4326+5773").unwrap()); // compound
+        assert!(!g("EPSG:4807").unwrap()); // NTF (Paris), grads
+        assert!(!g("EPSG:3857").unwrap());
+        assert!(!g("EPSG:4978").unwrap()); // geocentric
+        assert!(g("not a crs").is_err());
+    }
 }
 
 

@@ -11,8 +11,9 @@ build, and the tests compare rwarp's results to them.
 | `GenImgProjTransformer` | Sentinel-2 B04 | 65536 of 65536 pixels identical to `pixel_extract` |
 | `ApproxTransformer` | same | bit-identical to `GDALApproxTransform` |
 | `compute_source_window` | GEBCO global, Fiji LCC | matches GDAL's source windows |
-| `plan_chunks` (with `ChunkOptions::gdalwarp`) | whole lon/lat sources to Mercator, south polar stereographic (pole in the target) and an overhanging LAEA, `-wm 100000`, MEM and 32x32-tiled targets (7 cases, 6 to 13 chunks) | chunk list (target and source windows) identical; kernel scale per chunk within GDAL's logged precision |
+| `plan_chunks` (with `ChunkOptions::gdalwarp`) | whole lon/lat sources to Mercator, south polar stereographic (pole in the target) and an overhanging LAEA across 180 degrees, `-wm 100000` or the default, MEM and 32x32-tiled targets (16 cases, 1 to 28 chunks) | chunk list (target and source windows) identical; kernel scale per chunk within GDAL's logged precision |
 | Whole-raster chunked warp (`warp_chunks`) | same, near, bilinear, cubic, lanczos, nodata outside the source | identical to gdalwarp, every pixel, with both CRS backends |
+| Longitude wrapping (`CENTER_LONG`), `GenImgProjTransformer::with_source_size` | regional lon/lat sources across 180 degrees stored as 170..190, -190..-170 and 140..200, a global source in 0..360 and one 361 degrees wide under a `-te` of 90..270; to LAEA centred on 170 and 180, Mercator windows across 180 and whole-world, south polar stereographic and lon/lat targets (11 cases, near, bilinear, cubic; chunked and in one chunk) | centre longitude as GDAL's (`%g`); 162 target-to-source and source-to-target points per case through the exact transformer within 7e-13 px of GDAL's (libproj; proj4rs the same away from the poles, where it fails and PROJ returns a point); chunk lists and every output pixel identical to gdalwarp with both CRS backends. Without the wrap, 17% to 61% of each target differs |
 | Retry of points just off the source window | same (LAEA, near) | 2 pixels per 10000 differ without it |
 | Nearest neighbour | Sentinel-2, IBCSO Mawson | 65536 of 65536 identical to `gdalwarp -r near` |
 | Bilinear, cubic, lanczos | GEBCO at about 1:1 | 65536 of 65536 identical |
@@ -31,6 +32,30 @@ build, and the tests compare rwarp's results to them.
 The kernel, chunk and cutline fixtures use GDAL 3.14.0dev (`739fcf03bf`);
 the geolocation fixtures use GDAL 3.8.4.
 
+## Longitude wrapping (`CENTER_LONG`)
+
+For a source CRS that is geographic in degrees and has a geotransform,
+`GDALCreateGenImgProjTransformer2` (and so gdalwarp) wraps source
+longitudes around the source raster's centre: `InsertCenterLong` takes the
+middle of the smallest and largest x of the raster's four corners, writes
+it with `%g` (six significant digits: a raster centred on 147.1284567 is
+wrapped at 147.128), and gives it to the coordinate transformation as its
+source centre. `OGRProjCT` then adds 360 to a source longitude below
+`centre - 180` and takes 360 from one above `centre + 180`, once, on the
+way into the forward transform and on the way out of the reverse one that
+the warper uses. A raster wider than 360 degrees gets no centre, unless the
+target is geographic too and gdalwarp's `-te` crosses 180 degrees. gdalwarp
+turns it off (`INSERT_CENTER_LONG=FALSE`) only to bring a cutline into
+source pixels.
+
+rwarp does the same in `GenImgProjTransformer` once it knows the source
+raster's size (`with_source_size`; `with_target_extent` for `-te`).
+`CenterLong::Off` and `CenterLong::At` choose otherwise, and
+`source_center_long` gives GDAL's value for a transformer built with
+`with_backend`, which does not know its CRSs. Whether a CRS is geographic
+in degrees is decided as GDAL does: with libproj, a bound CRS by its base
+and a compound CRS by its horizontal part; NTF (Paris), in grads, is not.
+
 ## Where rwarp deliberately differs
 
 | Behaviour | GDAL | rwarp | Why |
@@ -42,13 +67,13 @@ the geolocation fixtures use GDAL 3.8.4.
 | Cutline all touched | centre rule plus each boundary line walked pixel to pixel, with tolerances | pixels with any covered area (above 1e-9) | GDAL also burns pixels touched only at a corner (below-right of it), skips edges within 1e-4 of a pixel wall, and burns one column for an edge within 0.01 px of vertical even where the polygon is in the column to its left |
 | Cutline centre ties on diagonals | intercept rounding | intercept rounding, computed differently | GDAL keeps 23 and drops 5 of the 28 centres on one 45 degree edge; neither is a rule |
 | `Cutline::from_transformer` densification | skipped when `-cblend` is given (unless `GDALWARP_DENSIFY_CUTLINE=YES`) | always | the helper does not know about blending; densifying only makes the transformed cutline more accurate |
+| Longitude wrapping of a geographic source | on whenever the source has a geotransform (the dataset gives its size) | on once `GenImgProjTransformer::with_source_size` is given | `GenImgProjTransformer::new` takes no source size; a transformer built as in 0.3.0 wraps nothing, as before |
 
 ## Not modelled
 
-- GDAL's `CENTER_LONG`: for a geographic source, gdalwarp wraps source
-  longitudes around the source's centre, so a target reaching past 180
-  degrees from a regional source still finds it. rwarp's
-  `GenImgProjTransformer` does not wrap.
+- The `CENTER_LONG` configuration option (`--config CENTER_LONG`), which
+  GDAL applies to the target CRS as well as the source; `CenterLong::At`
+  wraps the source only, as a `CENTER_LONG` in the source CRS does.
 - `CHECK_WITH_INVERT_PROJ`, `STREAMABLE_OUTPUT`, and GDAL's shortcut for a
   translation by whole pixels in chunk planning.
 
@@ -66,6 +91,13 @@ target pixel overhangs the source, destination nodata avoidance with a float
 working type, and two different rounding rules into integer outputs. They
 are written up with repros in
 [mdsumner/osgeo-upstream](https://github.com/mdsumner/osgeo-upstream/blob/main/notes/2026-10-28-gdalwarp-kernel-findings.md).
+
+The `CENTER_LONG` work found that GDAL computes its special points (the
+poles, which force grid sampling of a chunk that contains one) without
+reprojecting them when the source CRS is geographic:
+`GDALTransformLonLatToDestGenImgProjTransformer` takes `(0, +-89.9999)` as
+target coordinates, so for a projected target they land at its false
+origin. On the chunk fixtures this changes no chunk list.
 
 The cutline work found more, not yet in that write-up: all-touched burns
 pixels the boundary touches only at a corner, and a whole column along an
