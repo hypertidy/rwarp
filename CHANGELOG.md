@@ -27,6 +27,15 @@ gains variants.
 - `ResampleAlg::Mode` with `ModeTies` (`MODE_TIES`). (2026-10-28)
 - `BandNodata` (`UNIFIED_SRC_NODATA`) and `AverageThresholds`
   (`NODATA_VALUES_PCT_THRESHOLD`, `EXCLUDED_VALUES`). (2026-10-28)
+- `ResampleAlg::CubicSpline`, `Min`, `Max`, `Med`, `Q1`, `Q3` and `Rms`,
+  and `ResampleAlg::is_area()`. (2026-10-28)
+- `Sample` for `i64`, `u64`, and `half::f16` behind a new `f16` feature.
+  (2026-10-28)
+- `warp_to::<S, D>`: a different output type from the source's, through
+  GDAL's working type (`DataType::working`) and `GDALCopyWords`
+  conversion. (2026-10-28)
+- `Nodata` and `DstNodata`: source and destination nodata per band, as
+  gdalwarp's `-srcnodata` and `-dstnodata`. (2026-10-28)
 - Examples: `tile_laea`, `curvilinear_swath`.
 - A documentation site, with the browser demo under `/demo/`.
 
@@ -43,6 +52,11 @@ gains variants.
 - Multi-band nodata follows GDAL's default (a pixel is nodata only where
   every band is); the 0.1 rule is `BandNodata::AnyBand`.
 - `Sample` requires `PartialOrd`.
+- `WarpOptions` is not generic: `nodata: Option<T>` is replaced by
+  `src_nodata: Nodata` and `dst_nodata: DstNodata`.
+- Bilinear uses GDAL's general formula for types and cases where GDAL
+  does, which can change the last bit (and so integer rounding near 2^40
+  for 64-bit values).
 
 ### Deprecated
 

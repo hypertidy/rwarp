@@ -289,7 +289,7 @@ pub enum ModeTies {
 
 /// How nodata works across bands: GDAL's `UNIFIED_SRC_NODATA` warp option
 /// (gdalwarper.cpp ~L1331, gdalwarpoperation.cpp ~L2262). A source pixel is
-/// "nodata in a band" when that band equals [`WarpOptions::nodata`] or is
+/// "nodata in a band" when that band equals [`WarpOptions::src_nodata`] or is
 /// NaN. With one band, all four are the same. A zero in
 /// [`WarpOptions::mask_band`] makes the whole pixel invalid under every rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
