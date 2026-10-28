@@ -22,6 +22,8 @@ proj = ["dep:proj"]
 # Pure-Rust backend via `proj4rs`: proj-string / EPSG-code parametric only,
 # no C dependencies, builds for wasm32-unknown-unknown.
 proj4rs = ["dep:proj4rs"]
+# `Sample` for half-precision floats (`half::f16`), GDAL's Float16.
+f16 = ["dep:half"]
 
 [dependencies]
 proj = { version = "0.31.0", features = ["pkg_config"], optional = true }
@@ -31,6 +33,7 @@ vaster = { version = "0.2.0" }
 # Exact coverage fractions for the exact-overlap area footprint. Pure Rust,
 # no dependencies, builds for wasm.
 controlledburn = "0.2.1"
+half = { version = "2", optional = true }
 
 [workspace]
 exclude = ["rwarp-wasm"]
