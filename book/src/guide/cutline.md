@@ -49,8 +49,8 @@ the boundary the density ramps from 1 inside to 0 outside, 0.5 on the line.
 **Centre ties.** A pixel centre exactly on the boundary follows GDAL: on a
 left edge it is out, on a right edge in, on a top edge in, on a bottom
 edge out, and a hole whose top edge runs along a line of centres does not
-cut that line. On a diagonal edge through centres the answer is a rounding
-error in GDAL too, and the two can disagree.
+cut that line. Ties are decided exactly, and match GDAL on diagonal edges
+through centres too.
 
 **All touched** counts a pixel the polygon covers by more than 1e-9 of its
 area. GDAL walks each boundary line instead, which differs in three

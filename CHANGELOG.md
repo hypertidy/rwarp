@@ -58,6 +58,11 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   variant for alpha and cutline densities is not reproduced. (2026-10-28)
 - The geolocation swath fixture is regenerated with GDAL 3.14.0dev (was
   3.8.4): positions moved by up to 3e-8 pixels (PROJ), nothing else.
+- controlledburn 0.2.3 (corner passes, near-coincident edges, exact centre
+  ties). The cutline centre rule now matches gdalwarp on centres exactly on
+  diagonal edges: 5 pixels of the `mask_diamond_tie` fixture that differed
+  now agree. They came from controlledburn 0.2.2's rounded intercepts; the
+  parity page had put them down to GDAL.
 
 ## 0.3.0 (2026-10-28)
 

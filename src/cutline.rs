@@ -25,8 +25,8 @@
 //!   runs along a line of centres does not cut that line. The burn is
 //!   `controlledburn`'s centre rule ([`controlledburn::BurnMode::Approx`])
 //!   on the window turned through 180 degrees, plus one pass for horizontal
-//!   edges along centre lines. On a diagonal edge through centres GDAL's
-//!   answer is a rounding error and the two can differ.
+//!   edges along centre lines. Ties are decided exactly (controlledburn
+//!   0.2.3), which matches GDAL on diagonal edges through centres too.
 //! - [`CutlineRule::AllTouched`] (`CUTLINE_ALL_TOUCHED=YES`): a source pixel
 //!   is in when the polygon covers any of it, by more than 1e-9 of its area
 //!   (exact coverage from [`controlledburn::burn`] in coverage mode). GDAL burns
