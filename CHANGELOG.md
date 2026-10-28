@@ -22,12 +22,40 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   backends. The LAEA chunk fixtures are back across 180 degrees.
   The `proj` feature now also depends on `proj-sys` (already a dependency
   of `proj`), to ask PROJ whether a CRS is geographic.
+- GDAL's backmap geolocation inverse, as an option beside the quad index:
+  `GeolocOptions::with_inverse(GeolocInverse::Backmap)` (`GeolocInverse`:
+  `QuadIndex`, the default; `Backmap`; `BackmapEstimate` for
+  `GDAL_GEOLOC_USE_MAX_ACCURACY=NO`; `#[non_exhaustive]`), with
+  `with_backmap_oversample` (`GEOLOC_BACKMAP_OVERSAMPLE_FACTOR`) and
+  `GeolocArrays::backmap_grid`. Ported from GDAL 3.14 in its arithmetic
+  order (float32 backmap, `GDALFillNodata` hole filling, the spiral
+  search), by way of wxylib's `wxy-warp` (`geoloc.rs`, GDAL 3.12; the
+  geolocation code is unchanged since), adding `PIXEL_OFFSET` / `STEP`.
+  Checked against GDAL 3.14.0dev on 9 new cases (swath by centres and by
+  corners, lon/lat and polar stereographic targets, a polar ring and a
+  swath across the antimeridian, holes in the arrays with source nodata,
+  overlapping scans): success and position at every target pixel, the
+  backmap's estimate, and 24 warps (near, bilinear, cubic; `-et 0` and
+  `0.125`) identical to gdalwarp, every pixel, with both CRS backends.
+  Where the two inverses differ, and why, is in the curvilinear guide.
+  (2026-10-28)
 
 ### Changed
 
 - The chunk fixtures' special points are computed as GDAL computes them for
   a geographic source (not reprojected; see `ChunkOptions::special_points`).
   No chunk list changes.
+- `warp()` does GDAL's `GWKAdjustSrcOffsetOnEdge`: when a corner of the
+  source buffer fails to transform forward and a sample point lands on an
+  invalid source pixel whose corners fail too, a valid neighbour (right,
+  below, left, above) is used instead. This changes output only where the
+  transformer has holes or edges inside the source, as geolocation arrays
+  with missing samples do (12 of 4560 pixels in the holes test case,
+  now identical to gdalwarp). `warp()` therefore calls the transformer
+  source to destination too, for such pixels only. Point methods; GDAL's
+  variant for alpha and cutline densities is not reproduced. (2026-10-28)
+- The geolocation swath fixture is regenerated with GDAL 3.14.0dev (was
+  3.8.4): positions moved by up to 3e-8 pixels (PROJ), nothing else.
 
 ## 0.3.0 (2026-10-28)
 
