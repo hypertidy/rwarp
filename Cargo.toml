@@ -2,7 +2,9 @@
 name = "rwarp"
 version = "0.2.0"
 edition = "2021"
-# f32::next_up / next_down (Sample::step_off).
+# rwarp itself (f32::next_up in Sample::step_off) and the default `proj`
+# backend. The optional `proj4rs` backend needs whatever proj4rs needs,
+# which it does not declare: 1.89 for proj4rs 0.3.0.
 rust-version = "1.86"
 authors = ["Michael Sumner <mdsumner@gmail.com>"]
 license = "MIT OR Apache-2.0"
