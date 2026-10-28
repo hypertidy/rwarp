@@ -144,7 +144,9 @@ fn timing_per_band_vs_interleaved() {
         let t = std::time::Instant::now();
         for _ in 0..10 {
             let buf = SourceBuffer { data: &rgba[..], ncol: w, nrow: h, nbands: 4, col_off: xo, row_off: yo };
-            let opts = WarpOptions { alg, scaling: KernelScaling::Point, mask_band: Some(3), ..Default::default() };
+            let opts = WarpOptions::new(alg)
+                .with_scaling(KernelScaling::Point)
+                .with_mask_band(Some(3));
             let _ = warp(&approx, &buf, 256, 256, &opts);
         }
         let inter = t.elapsed().as_secs_f64() * 100.0;

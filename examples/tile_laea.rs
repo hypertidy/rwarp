@@ -52,7 +52,8 @@ fn main() -> Result<(), String> {
     };
 
     // 4. Warp.
-    let opts = WarpOptions { alg: ResampleAlg::Bilinear, src_nodata: Nodata::Value(f64::NAN), ..Default::default() };
+    let opts = WarpOptions::new(ResampleAlg::Bilinear)
+        .with_src_nodata(Nodata::Value(f64::NAN));
     let out = warp(&t, &src, 256, 256, &opts);
     let valid = out.iter().filter(|v| !v.is_nan()).count();
     println!("warped {} of {} target pixels", valid, out.len());

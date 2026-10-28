@@ -96,7 +96,9 @@ impl WarperCore {
             ));
         }
         let buf = SourceBuffer { data: src, ncol: src_w, nrow: src_h, nbands: 4, col_off: src_xoff, row_off: src_yoff };
-        let opts = WarpOptions { alg, scaling: KernelScaling::Point, mask_band: Some(3), ..Default::default() };
+        let opts = WarpOptions::new(alg)
+            .with_scaling(KernelScaling::Point)
+            .with_mask_band(Some(3));
         Ok(warp(&self.approx, &buf, dst_w, dst_h, &opts))
     }
 }
@@ -122,9 +124,9 @@ impl WarperCore {
             return Err(format!("source buffer is {} values, expected {}x{}", src.len(), src_w, src_h));
         }
         let buf = SourceBuffer { data: src, ncol: src_w, nrow: src_h, nbands: 1, col_off: src_xoff, row_off: src_yoff };
-        let opts = WarpOptions {
-            alg, scaling: KernelScaling::Point, src_nodata: Nodata::Value(nodata.map_or(f64::NAN, f64::from)), ..Default::default()
-        };
+        let opts = WarpOptions::new(alg)
+            .with_scaling(KernelScaling::Point)
+            .with_src_nodata(Nodata::Value(nodata.map_or(f64::NAN, f64::from)));
         Ok(warp(&self.approx, &buf, dst_w, dst_h, &opts))
     }
 }

@@ -2,6 +2,26 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## Unreleased (0.3.0)
+
+This release changes the API: options types are `#[non_exhaustive]`.
+
+### Changed
+
+- `WarpOptions`, `GeolocOptions` and `AverageThresholds` are
+  `#[non_exhaustive]`, as are `ResampleAlg`, `KernelScaling`, `Footprint`,
+  `BandNodata`, `Nodata`, `DstNodata`, `DataType` and `GeolocConvention`.
+  New options and methods can then come in minor releases. Outside rwarp,
+  build options with `WarpOptions::new(alg)` and the `with_` methods
+  (`GeolocOptions::default().with_convention(..)`, and so on) instead of
+  struct literals, and add a `_` arm when matching on the enums. Fields
+  stay public for reading and assignment.
+
+### Added
+
+- `WarpOptions::new` and `with_` builder methods on `WarpOptions`,
+  `GeolocOptions` and `AverageThresholds`.
+
 ## 0.2.0 (2026-10-28)
 
 This release changes the API: `warp()` with `WarpOptions` and

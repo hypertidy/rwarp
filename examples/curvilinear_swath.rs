@@ -25,11 +25,9 @@ fn main() -> Result<(), String> {
 
     // Coordinates are cell centres, as CF coordinate variables are. GDAL's
     // default convention is TopLeftCorner, so say so explicitly.
-    let opts = GeolocOptions {
-        convention: GeolocConvention::PixelCenter,
-        lon_wrap: true,
-        ..Default::default()
-    };
+    let opts = GeolocOptions::default()
+        .with_convention(GeolocConvention::PixelCenter)
+        .with_lon_wrap(true);
     let swath = GeolocArrays::new(lon, lat, ncol, nrow, opts)?;
 
     // Target: a 40 x 32 grid of 10 km pixels in a local LAEA.
@@ -46,7 +44,8 @@ fn main() -> Result<(), String> {
         .flat_map(|r| (0..ncol).map(move |c| (c + 1000 * r) as i32))
         .collect();
     let src = SourceBuffer { data: &data, ncol, nrow, nbands: 1, col_off: 0, row_off: 0 };
-    let wopts = WarpOptions { alg: ResampleAlg::NearestNeighbour, src_nodata: Nodata::Value(-1.0), ..Default::default() };
+    let wopts = WarpOptions::new(ResampleAlg::NearestNeighbour)
+        .with_src_nodata(Nodata::Value(-1.0));
     let out = warp(&t, &src, 40, 32, &wopts);
 
     let covered = out.iter().filter(|&&v| v != -1).count();
