@@ -36,7 +36,9 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   swath across the antimeridian, holes in the arrays with source nodata,
   overlapping scans): success and position at every target pixel, the
   backmap's estimate, and 24 warps (near, bilinear, cubic; `-et 0` and
-  `0.125`) identical to gdalwarp, every pixel, with both CRS backends.
+  `0.125`) identical to gdalwarp, every pixel, with proj4rs and the
+  fixtures' PROJ (with an older libproj, nearest identical and
+  interpolated values within 2e-8 relative).
   Where the two inverses differ, and why, is in the curvilinear guide.
   (2026-10-28)
 

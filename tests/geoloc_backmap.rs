@@ -14,8 +14,9 @@
 //!   [`GeolocInverse::BackmapEstimate`], which checks the float32 backmap
 //!   itself, hole filling included;
 //! - **warps**: nearest neighbour pixel for pixel, bilinear and cubic to
-//!   1e-9 relative (identical, measured), planned and warped in chunks as
-//!   gdalwarp does, with `-et 0` and, for some cases, through the
+//!   1e-6 relative (identical with the PROJ that made the fixtures and with
+//!   proj4rs; an older PROJ moves the CRS step enough for 2e-8 relative),
+//!   planned and warped in chunks as gdalwarp does, with `-et 0` and, for some cases, through the
 //!   approximate transformer at gdalwarp's default `-et 0.125`.
 //!
 //! The grids follow wxylib/fixtures' curvilinear set, which wxy-warp's
@@ -376,8 +377,9 @@ fn backmap_warps_match_gdalwarp() {
         for alg in ["near", "bilinear", "cubic", "near_et", "bilinear_et"] {
             let Some(want) = c.section(alg) else { continue };
             let got = c.warp(GeolocInverse::Backmap, alg);
-            // Nearest neighbour: identical. Interpolated: to rounding.
-            let (n, max) = compare(&got, want, if alg.starts_with("near") { 0.0 } else { 1e-9 });
+            // Nearest neighbour: identical. Interpolated: to the CRS step,
+            // as tests/chunks.rs.
+            let (n, max) = compare(&got, want, if alg.starts_with("near") { 0.0 } else { 1e-6 });
             let filled = want.iter().filter(|v| **v != NODATA).count();
             let line = format!("{name} {alg}: {n} of {} differ (max {max:e}), {filled} filled", want.len());
             eprintln!("{line}");
