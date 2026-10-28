@@ -55,6 +55,7 @@
 //! |--------|---------------|-----------------|
 //! | [`transform`] | `Transformer` trait, `GenImgProjTransformer` | `GDALGenImgProjTransform` |
 //! | [`gcp_transform`] | `GcpTransformer` (polynomial order 1–3) | `GDALGCPTransform` |
+//! | [`geoloc_transform`] | `GeolocArrays`, `GenImgGeolocTransformer` (curvilinear source and/or target) | `GDALGeoLocTransform`, `GDALGenImgProjTransform` with geolocation arrays |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `ComputeSourceWindow`, `CollectChunkList` | `GDALWarpOperation` planning |
 //! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, area-weighted average and mode, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
@@ -78,6 +79,7 @@
 //! | Average (exact footprint) | axis-aligned cases vs the GDAL box; 45° diamond vs the analytic mean | within 1e-5 (f32 coverage fractions) |
 //! | Mode, all `MODE_TIES` | synthetic categorical, Byte/Int16/Int32/Float32, 4:1 and 2.78:1, nodata, rotated | identical to `gdalwarp -r mode` (26 cases); ties at first occurrence follow GDAL's Byte path for every type |
 //! | Antimeridian split-read | GEBCO Fiji tile \[5,3\] | 70× source pixel reduction vs naive read |
+//! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL 3.8.4's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
 //!
 //! **Downsampled interpolated warps:** when the output is coarser than the
 //! source, GDAL widens the bilinear, cubic and lanczos kernels to cover the
@@ -104,7 +106,8 @@
 //! - **Curvilinear grids** (ROMS, ocean model output): pixel → geo via 2D
 //!   lookup table rather than affine + PROJ. Implements `Transformer`,
 //!   composes with `ApproxTransformer`, `compute_source_window`, and
-//!   `warp_resample` unchanged.
+//!   `warp_resample` unchanged. Implemented in [`geoloc_transform`], for a
+//!   curvilinear source, a curvilinear target, or both.
 //!
 //! - **Displacement-field transformers**: pixel offsets from a vector field
 //!   (DEM orthorectification, InSAR pixel offsets) applied on top of a base
@@ -134,6 +137,7 @@
 //! |-------|-----------------|-------|
 //! | `transform.rs` | `gdaltransformer.cpp` | ~L2800, ~L3100, ~L3500 |
 //! | `gcp_transform.rs` | `alg/gdal_crs.c` | GCP polynomial fit |
+//! | `geoloc_transform.rs` | `alg/gdalgeoloc.cpp` | `PixelLineToXY`, `Transform`, `GDALInverseBilinearInterpolation` |
 //! | `approx.rs` | `gdaltransformer.cpp` | ~L4113, ~L4374 |
 //! | `source_window.rs` | `gdalwarpoperation.cpp` | ~L1456, ~L2656, ~L2751 |
 //! | `warp.rs` | `gdalwarpkernel.cpp` | ~L3084, ~L3262, ~L3655, ~L5510; widening ~L1041, ~L1092-1319, ~L4027, ~L4188, ~L4840; average ~L6845-7030, ~L7577, ~L7960; mode ~L7147-7235, ~L8115-8170 (at `739fcf03bf`, 3.14.0dev) |
@@ -141,6 +145,7 @@
 pub mod crs;
 pub mod transform;
 pub mod gcp_transform;
+pub mod geoloc_transform;
 pub mod approx;
 pub mod source_window;
 pub mod warp;
