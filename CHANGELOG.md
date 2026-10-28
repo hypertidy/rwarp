@@ -2,7 +2,7 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
-## Unreleased
+## 0.3.1 (2026-10-28)
 
 ### Added
 

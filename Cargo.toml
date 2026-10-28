@@ -1,6 +1,6 @@
 [package]
 name = "rwarp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # rwarp itself (f32::next_up in Sample::step_off) and the default `proj`
 # backend. The optional `proj4rs` backend needs whatever proj4rs needs,
