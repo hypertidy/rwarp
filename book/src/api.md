@@ -15,5 +15,6 @@ references.
 | `gcp_transform` | `GcpTransformer` |
 | `geoloc_transform` | `GeolocArrays`, `GenImgGeolocTransformer`, `PixelGeo` |
 | `crs` | `CrsTransform` trait and the `proj` / `proj4rs` backends |
-| `source_window` | `compute_source_window`, `collect_chunk_list` |
+| `source_window` | `compute_source_window` |
+| `plan` | `plan_chunks`, `ChunkPlanner`, `ChunkOptions`, `WarpPlan`, `Chunk`, `warp_chunks` |
 | `warp` | `warp`, `WarpOptions`, `SourceBuffer`, `Sample`, kernels |

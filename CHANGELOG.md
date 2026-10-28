@@ -8,6 +8,13 @@ This release changes the API: options types are `#[non_exhaustive]`.
 
 ### Changed
 
+- `warp()` retries a sample point that lands less than one pixel outside
+  the source buffer by transforming it again on its own, as GDAL does
+  (`GWKCheckAndComputeSrcOffsets`). Through `ApproxTransformer` that is
+  exact, so interpolation error no longer drops pixels at the edge of a
+  chunk's source window; with an exact transformer nothing changes.
+  Point methods only (nearest, bilinear, cubic, cubic spline, lanczos), as
+  in GDAL. (2026-10-28)
 - `WarpOptions`, `GeolocOptions` and `AverageThresholds` are
   `#[non_exhaustive]`, as are `ResampleAlg`, `KernelScaling`, `Footprint`,
   `BandNodata`, `Nodata`, `DstNodata`, `DataType` and `GeolocConvention`.
@@ -21,6 +28,30 @@ This release changes the API: options types are `#[non_exhaustive]`.
 
 - `WarpOptions::new` and `with_` builder methods on `WarpOptions`,
   `GeolocOptions` and `AverageThresholds`.
+- `plan` module: `plan_chunks` and `ChunkPlanner` give gdalwarp's chunk
+  list as values (`WarpPlan` of `Chunk`s: target window, source window,
+  fill ratio, kernel scale), following GDAL 3.14's `CollectChunkList` and
+  `ComputeSourceWindow` exactly: warp memory limit (`-wm`) and per-pixel
+  cost, fill ratio splits, `OPTIMIZE_SIZE` on target blocks, special
+  points, the forward probe, `SAMPLE_GRID`, `SAMPLE_STEPS`,
+  `SOURCE_EXTRA`. `ChunkOptions` (builders, `#[non_exhaustive]`);
+  `ChunkOptions::gdalwarp` for gdalwarp's planning exactly; an optional
+  round-trip check for backends that do not fail at a projection's
+  antipode; the antimeridian split of 0.2's `collect_chunk_list` as
+  `split_antimeridian`. `warp_chunks` warps a plan from a source buffer
+  in memory. Ported from wxylib's `wxy-warp` (`chunked.rs`). (2026-10-28)
+- `serde` feature: `Serialize`/`Deserialize` for `WarpPlan` and `Chunk`.
+  (2026-10-28)
+- Parity fixtures for whole rasters warped in many chunks
+  (`tests/chunks.rs`, `tests/fixtures/chunks/`): seven gdalwarp cases,
+  chunk lists and output identical. (2026-10-28)
+
+### Removed
+
+- `source_window::collect_chunk_list` and `ChunkPlan`: use
+  `plan::plan_chunks` (with `ChunkOptions::split_antimeridian` for the
+  same split at the antimeridian). `compute_source_window` stays.
+  (2026-10-28)
 
 ## 0.2.0 (2026-10-28)
 

@@ -38,18 +38,19 @@
 //!   window to include them. Safety net for source pixels missed by the
 //!   backward probe.
 //!
-//! - `collect_chunk_list()` — recursive destination subdivision matching
-//!   GDAL's `CollectChunkListInternal()`. When the source fill ratio is
-//!   low (indicating wasteful reads, e.g. antimeridian crossing), splits
-//!   the destination window and recurses until each chunk has a compact
-//!   source window.
+//! Chunk lists are in [`crate::plan`]: [`crate::plan::plan_chunks`]
+//! replaces 0.2's `collect_chunk_list`, with GDAL's `CollectChunkList`
+//! exactly (memory limit, fill ratio, forward probe, special points,
+//! per-chunk kernel scale), and its own window computation
+//! ([`crate::plan::ChunkPlanner::source_window`]), which differs from
+//! [`compute_source_window`] as described there.
 //!
 //! ## What we skip (vs GDAL)
 //!
 //! - `CHECK_WITH_INVERT_PROJ` retry (PROJ-4 era workaround, not needed)
-//! - `aDstXYSpecialPoints` pole detection (planned, not yet implemented)
-//! - `SAMPLE_GRID` / `SAMPLE_STEPS` warp options (fixed defaults used)
-//! - Warp memory budget (not applicable — rwarp operates per-tile)
+//! - `aDstXYSpecialPoints` pole detection, `SAMPLE_GRID` / `SAMPLE_STEPS`
+//!   and the forward probe (all in [`crate::plan`])
+//! - Warp memory budget (in [`crate::plan`])
 //!
 //! ## Antimeridian handling
 //!
@@ -60,19 +61,21 @@
 //! snaps to full source width — correct but reading up to 70× more source
 //! pixels than necessary.
 //!
-//! `collect_chunk_list` resolves this by recursive subdivision: it detects
-//! the low fill ratio, calls `find_discontinuity_range` to locate the gap
+//! [`crate::plan::plan_chunks`] with
+//! [`crate::plan::ChunkOptions::split_antimeridian`] resolves this by
+//! recursive subdivision: it treats the snapped window as wasteful, calls
+//! `find_discontinuity_range` to locate the gap
 //! in source X coordinates, and splits the destination tile into
 //! left/gap/right sub-tiles each with a compact source window. On GEBCO
 //! tile \[5,3\] (Fiji LCC) this reduces source pixels from 97.9M to 1.4M —
 //! a 70× reduction. Adjacent non-straddling tiles are unaffected.
 //!
 //! This is a cogcache innovation: GDAL achieves the same result indirectly
-//! via warp memory budget subdivision, which rwarp does not implement.
+//! via warp memory budget subdivision.
 //!
 //! ## GCP transformers
 //!
-//! `compute_source_window` and `collect_chunk_list` accept any [`Transformer`],
+//! `compute_source_window` and [`crate::plan`] accept any [`Transformer`],
 //! including [`crate::gcp_transform::GcpTransformer`]. GCP-warped imagery
 //! (e.g. Sentinel-2 L1C granules with GCPs instead of a geotransform) can
 //! be planned with the same API as geotransform-based sources.
@@ -86,7 +89,7 @@ use crate::transform::Transformer;
 /// (0-based, top-left origin).
 ///
 /// A `fill_ratio` below ~0.5 suggests the destination window should be
-/// subdivided — use [`collect_chunk_list`] to do this automatically.
+/// subdivided — [`crate::plan::plan_chunks`] does this automatically.
 /// A `fill_ratio` of exactly 0.01 indicates the antimeridian snap fired.
 #[derive(Debug, Clone)]
 pub struct SourceWindow {
@@ -270,7 +273,7 @@ pub fn compute_source_window(
     // Fill ratio (GDAL lines 3360–3364)
     // When the antimeridian snap fires, the window covers the full source
     // width but only a fraction is actually needed. Force a low fill ratio
-    // to trigger subdivision in collect_chunk_list. GDAL achieves this
+    // to trigger subdivision (0.2's collect_chunk_list). GDAL achieves this
     // indirectly through memory budget limits in CollectChunkListInternal.
     let fill_ratio = if antimeridian_snap {
         // Estimate: actual needed width / full width
@@ -579,160 +582,13 @@ pub fn refine_from_source(
 }
 
 // =========================================================================
-// Recursive destination subdivision: CollectChunkListInternal
+// Discontinuity search, for crate::plan's antimeridian split
 // =========================================================================
 
-/// A chunk plan: a destination sub-window and its corresponding source window.
-#[derive(Debug, Clone)]
-pub struct ChunkPlan {
-    /// Source window for this chunk.
-    pub src_window: SourceWindow,
-    /// Destination window offset `[col_off, row_off]`.
-    pub dst_off: [i32; 2],
-    /// Destination window size `[ncol, nrow]`.
-    pub dst_size: [i32; 2],
-}
-
-/// Recursively subdivide a destination window into chunks with efficient
-/// source windows.
-///
-/// Maps GDAL's `CollectChunkListInternal()` (gdalwarpoperation.cpp lines
-/// 1456–1624). When the source fill ratio is below `min_fill_ratio` and
-/// the destination is large enough, splits along the longest dimension
-/// and recurses. Each resulting `ChunkPlan` can be warped independently.
-///
-/// This is the mechanism that handles the antimeridian: a 256×256 tile
-/// straddling 180° has a full-width source window (fill_ratio ≈ 0.01).
-/// Recursive splitting produces sub-tiles entirely on one side, each
-/// with a compact source window.
-///
-/// # Arguments
-///
-/// * `transformer` — coordinate transformer
-/// * `src_raster_size` — full source raster `[ncol, nrow]`
-/// * `dst_off` — destination window offset
-/// * `dst_size` — destination window size
-/// * `resample_padding` — kernel padding (0, 1, 2, or 3)
-/// * `min_fill_ratio` — threshold below which to subdivide (GDAL uses 0.5)
-/// * `min_dst_size` — minimum destination dimension to allow splitting
-///   (GDAL uses 100 for the fill-ratio path; we use a smaller default
-///   since we're operating on tiles, not full rasters)
-/// * `source_grid` — optional pre-computed forward grid for refinement
-///
-/// # Returns
-///
-/// A `Vec<ChunkPlan>`. For well-behaved tiles this is a single entry.
-/// For antimeridian-crossing tiles it's typically 2 entries.
-/// Empty chunks (zero source window) are omitted.
-pub fn collect_chunk_list(
-    transformer: &impl Transformer,
-    src_raster_size: [i32; 2],
-    dst_off: [i32; 2],
-    dst_size: [i32; 2],
-    resample_padding: i32,
-    min_fill_ratio: f64,
-    min_dst_size: i32,
-    source_grid: Option<&SourceGrid>,
-) -> Vec<ChunkPlan> {
-    let mut chunks = Vec::new();
-    collect_chunk_list_recursive(
-        transformer,
-        src_raster_size,
-        dst_off,
-        dst_size,
-        resample_padding,
-        min_fill_ratio,
-        min_dst_size,
-        source_grid,
-        &mut chunks,
-    );
-    chunks
-}
-
-
-
-fn collect_chunk_list_recursive(
-    transformer: &impl Transformer,
-    src_raster_size: [i32; 2],
-    dst_off: [i32; 2],
-    dst_size: [i32; 2],
-    resample_padding: i32,
-    min_fill_ratio: f64,
-    min_dst_size: i32,
-    source_grid: Option<&SourceGrid>,
-    out: &mut Vec<ChunkPlan>,
-) {
-    let sw = compute_source_window(transformer, dst_off, dst_size, src_raster_size, resample_padding);
-    let sw = match sw { Some(sw) => sw, None => return };
-    if sw.xsize == 0 || sw.ysize == 0 { return; }
-
-    let should_split = sw.fill_ratio > 0.0
-        && sw.fill_ratio < min_fill_ratio
-        && (dst_size[0] > min_dst_size || dst_size[1] > min_dst_size);
-
-    if should_split {
-        let split_range = find_discontinuity_range(transformer, dst_off, dst_size, src_raster_size);
-
-        if let Some((col_min, col_max)) = split_range {
-            let left_width = col_min - dst_off[0];
-            let mid_width = col_max - col_min;
-            let right_width = dst_size[0] - (col_max - dst_off[0]);
-
-            if left_width > 0 {
-                collect_chunk_list_recursive(
-                    transformer, src_raster_size, dst_off, [left_width, dst_size[1]],
-                    resample_padding, min_fill_ratio, min_dst_size, source_grid, out);
-            }
-            if mid_width > 0 {
-                let mid_sw = compute_source_window(
-                    transformer, [col_min, dst_off[1]], [mid_width, dst_size[1]],
-                    src_raster_size, resample_padding);
-                if let Some(msw) = mid_sw {
-                    if msw.xsize > 0 && msw.ysize > 0 {
-                        out.push(ChunkPlan {
-                            src_window: msw,
-                            dst_off: [col_min, dst_off[1]],
-                            dst_size: [mid_width, dst_size[1]],
-                        });
-                    }
-                }
-            }
-            if right_width > 0 {
-                collect_chunk_list_recursive(
-                    transformer, src_raster_size, [col_max, dst_off[1]], [right_width, dst_size[1]],
-                    resample_padding, min_fill_ratio, min_dst_size, source_grid, out);
-            }
-        } else {
-            if dst_size[0] >= dst_size[1] && dst_size[0] > 1 {
-                let chunk1 = dst_size[0] / 2;
-                let chunk2 = dst_size[0] - chunk1;
-                collect_chunk_list_recursive(
-                    transformer, src_raster_size, dst_off, [chunk1, dst_size[1]],
-                    resample_padding, min_fill_ratio, min_dst_size, source_grid, out);
-                collect_chunk_list_recursive(
-                    transformer, src_raster_size,
-                    [dst_off[0] + chunk1, dst_off[1]], [chunk2, dst_size[1]],
-                    resample_padding, min_fill_ratio, min_dst_size, source_grid, out);
-            } else if dst_size[1] > 1 {
-                let chunk1 = dst_size[1] / 2;
-                let chunk2 = dst_size[1] - chunk1;
-                collect_chunk_list_recursive(
-                    transformer, src_raster_size, dst_off, [dst_size[0], chunk1],
-                    resample_padding, min_fill_ratio, min_dst_size, source_grid, out);
-                collect_chunk_list_recursive(
-                    transformer, src_raster_size,
-                    [dst_off[0], dst_off[1] + chunk1], [dst_size[0], chunk2],
-                    resample_padding, min_fill_ratio, min_dst_size, source_grid, out);
-            } else {
-                out.push(ChunkPlan { src_window: sw, dst_off, dst_size });
-            }
-        }
-    } else {
-        out.push(ChunkPlan { src_window: sw, dst_off, dst_size });
-    }
-}
-
-fn find_discontinuity_range(
+/// Target columns `[min, max)` around the largest jump in source x (more
+/// than half the source width) along sampled rows of a target window: the
+/// antimeridian, for a global lon/lat source.
+pub(crate) fn find_discontinuity_range(
     transformer: &impl Transformer,
     dst_off: [i32; 2],
     dst_size: [i32; 2],

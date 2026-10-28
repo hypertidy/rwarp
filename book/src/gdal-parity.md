@@ -11,6 +11,9 @@ build, and the tests compare rwarp's results to them.
 | `GenImgProjTransformer` | Sentinel-2 B04 | 65536 of 65536 pixels identical to `pixel_extract` |
 | `ApproxTransformer` | same | bit-identical to `GDALApproxTransform` |
 | `compute_source_window` | GEBCO global, Fiji LCC | matches GDAL's source windows |
+| `plan_chunks` (with `ChunkOptions::gdalwarp`) | whole lon/lat sources to Mercator, south polar stereographic (pole in the target) and an overhanging LAEA, `-wm 100000`, MEM and 32x32-tiled targets (7 cases, 6 to 13 chunks) | chunk list (target and source windows) identical; kernel scale per chunk within GDAL's logged precision |
+| Whole-raster chunked warp (`warp_chunks`) | same, near, bilinear, cubic, lanczos, nodata outside the source | identical to gdalwarp, every pixel, with both CRS backends |
+| Retry of points just off the source window | same (LAEA, near) | 2 pixels per 10000 differ without it |
 | Nearest neighbour | Sentinel-2, IBCSO Mawson | 65536 of 65536 identical to `gdalwarp -r near` |
 | Bilinear, cubic, lanczos | GEBCO at about 1:1 | 65536 of 65536 identical |
 | Kernel widening, scale estimate | synthetic, 1.5:1 to 4:1, anisotropic, nodata | within 1e-6 relative of gdalwarp |
@@ -23,17 +26,31 @@ build, and the tests compare rwarp's results to them.
 | Antimeridian split read | GEBCO, Fiji tile | 70 times fewer source pixels than a naive read |
 | Geolocation arrays | synthetic swath, both conventions, curvilinear source and target | coordinates within 1e-6 px; nearest warps identical to `gdalwarp -et 0` |
 
-The kernel fixtures use GDAL 3.14.0dev (`739fcf03bf`); the geolocation
-fixtures use GDAL 3.8.4.
+The kernel and chunk fixtures use GDAL 3.14.0dev (`739fcf03bf`); the
+geolocation fixtures use GDAL 3.8.4.
 
 ## Where rwarp deliberately differs
 
 | Behaviour | GDAL | rwarp | Why |
 |---|---|---|---|
-| Kernel scale estimate in a chunked warp | taken at the top-left of the whole output for every chunk | taken over the window being warped | GDAL's sample points omit the chunk offset; chunked and single-chunk gdalwarp output differ |
+| Kernel scale estimate in a chunked warp | taken at the top-left of the whole output for every chunk | taken over the window being warped (`ScaleOrigin::Chunk`, the default; `ScaleOrigin::Output` or `ChunkOptions::gdalwarp` for GDAL's) | GDAL's sample points omit the chunk offset; chunked and single-chunk gdalwarp output differ. On the Mercator lanczos fixture, half the pixels differ |
+| Source window padding under `XSCALE`/`YSCALE` | padded for the estimated scale | padded for the smaller of the given and estimated scales (`ChunkOptions::pad_for_fixed_scale`, default on; off in `ChunkOptions::gdalwarp`) | a kernel stretched by the given scale is otherwise clipped at the window edge, so tiles warped on their own differ there |
 | `MODE_TIES` for 32/64-bit and float data | `Min`/`Max` skipped for a value's first occurrence | the 8/16-bit behaviour for every type | the same data should not give different modes by type |
 | Geolocation inverse | backmap plus local search | index of all quadrilaterals | same answer on unfolded grids; see [Curvilinear grids](guide/curvilinear.md) |
-| Approximate transformer fallback | retries points slightly off the source with the exact transformer | uses the transformer it is given | keeps the kernel independent of transformer type |
+
+## Not modelled
+
+- GDAL's `CENTER_LONG`: for a geographic source, gdalwarp wraps source
+  longitudes around the source's centre, so a target reaching past 180
+  degrees from a regional source still finds it. rwarp's
+  `GenImgProjTransformer` does not wrap.
+- `CHECK_WITH_INVERT_PROJ`, `STREAMABLE_OUTPUT`, and GDAL's shortcut for a
+  translation by whole pixels in chunk planning.
+
+GDAL's retry of a sample point just off the source window with the exact
+transformer is done: `warp()` transforms such a point again on its own,
+which through `ApproxTransformer` (exact for five points or fewer, as
+GDAL's) is exact, so the kernel stays independent of transformer type.
 
 ## GDAL issues found along the way
 
