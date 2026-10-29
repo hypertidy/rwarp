@@ -9,7 +9,8 @@
 //!   densify 1, so the weights, destination fractions and areas must agree
 //!   to rounding.
 //! - `<case>.sph.txt`: spherical, with great-circle edges. rwarp measures
-//!   planar area in source pixel space until stage 3, so they differ. The
+//!   planar area in source pixel space by default, so they differ; with
+//!   the spherical measure they still differ by the edge definition. The
 //!   differences are recorded as ceilings per case: numbers to shrink, not
 //!   failures. A change that grows one fails; one that shrinks it should
 //!   lower the ceiling.
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::weights::{exact_weights, GridWindow, Normalization, WeightOptions};
+use rwarp::weights::{exact_weights, lonlat_measure, GridWindow, Normalization, WeightOptions};
 
 struct Fixture {
     header: Vec<String>,
@@ -87,11 +88,15 @@ struct Ours {
     area_b: Vec<f64>,
 }
 
-fn ours(fx: &Fixture, densify: usize) -> Ours {
+fn ours(fx: &Fixture, densify: usize, spherical: bool) -> Ours {
     let [sw, sh] = fx.nums::<2>("src_size").map(|v| v as usize);
     let [dw, dh] = fx.nums::<2>("dst_size").map(|v| v as usize);
     let t = GenImgProjTransformer::new(fx.header("src_crs"), fx.nums("src_gt"), fx.header("dst_crs"), fx.nums("dst_gt")).unwrap();
-    let w = exact_weights(&t, &GridWindow::new(sw, sh), dw, dh, &WeightOptions::new(densify));
+    let mut opts = WeightOptions::new(densify);
+    if spherical {
+        opts = opts.with_measure(lonlat_measure(fx.nums("src_gt")).unwrap());
+    }
+    let w = exact_weights(&t, &GridWindow::new(sw, sh), dw, dh, &opts);
     assert_eq!(w.dst_size, [dw, dh]);
     let s = w.normalised(Normalization::DestArea);
     let (row, col) = w.esmf_row_col(dw, sw);
@@ -190,7 +195,7 @@ fn cartesian_esmf_matches_exactly() {
         // Ubuntu 24.04's PROJ 9.4 is 3e-8 off in S and 9e-9 in area.
         let tol = if name == "lonlat_laea" { 1e-7 } else { 1e-9 };
         let fx = read_fixture(&format!("{name}.cart.txt"));
-        let o = ours(&fx, 1);
+        let o = ours(&fx, 1, false);
         let d = diff(&fx, &o);
         let area = o.area_b.iter().zip(&fx.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         eprintln!("{name:16} cart: {d:?}, max relative area difference {area:.2e}");
@@ -229,9 +234,41 @@ fn spherical_esmf_differences_are_recorded() {
     for (name, [cs, cf, cv]) in ceilings {
         let fx = read_fixture(&format!("{name}.sph.txt"));
         for densify in [1, 8] {
-            let d = diff(&fx, &ours(&fx, densify));
+            let d = diff(&fx, &ours(&fx, densify, false));
             eprintln!("{name:16} sph densify {densify}: {d:?}");
             assert!(d.esmf_rows < 1e-9, "{name}: ESMF row sums off by {:e}", d.esmf_rows);
+            assert!(d.s <= cs, "{name} densify {densify}: S differs by {:e} > {cs:e}", d.s);
+            assert!(d.frac_b <= cf, "{name} densify {densify}: frac_b differs by {:e} > {cf:e}", d.frac_b);
+            assert!(d.field <= cv, "{name} densify {densify}: field differs by {:e} > {cv:e}", d.field);
+        }
+    }
+}
+
+/// The same comparison with rwarp's spherical measure
+/// ([`lonlat_measure`]). The measure itself is exact (tests/weights.rs,
+/// `spherical_measure_gives_exact_lonlat_box_overlaps`), so what remains is
+/// the cell definition: ESMF joins corners with great circles, rwarp's
+/// edges are straight in source pixel space (parallels and meridians for a
+/// regular lon/lat destination) or, densified, in the destination's. A
+/// great circle over a 2.5 degree cell at 40 S bows about 0.007 degrees
+/// poleward of the parallel, which is the regular cases' residual; for the
+/// 1 degree shifted grid the bows cancel to 1e-6. Ceilings as above.
+#[test]
+fn spherical_measure_against_spherical_esmf() {
+    #[rustfmt::skip]
+    let ceilings: [(&str, [f64; 3]); 6] = [
+        ("regular_coarser",  [1.7e-3, 1e-12,  1.6e-4]),
+        ("regular_finer",    [7.5e-3, 1e-12,  4.0e-4]),
+        ("regular_overhang", [1.2e-6, 1.6e-6, 4.0e-8]),
+        ("rotated_pole",     [1.6e-3, 1e-12,  7.1e-5]),
+        ("lonlat_3031",      [1.9e-3, 1e-12,  1.3e-5]),
+        ("lonlat_laea",      [9.0e-4, 1e-12,  4.6e-6]),
+    ];
+    for (name, [cs, cf, cv]) in ceilings {
+        let fx = read_fixture(&format!("{name}.sph.txt"));
+        for densify in [1, 8] {
+            let d = diff(&fx, &ours(&fx, densify, true));
+            eprintln!("{name:16} sph measure densify {densify}: {d:?}");
             assert!(d.s <= cs, "{name} densify {densify}: S differs by {:e} > {cs:e}", d.s);
             assert!(d.frac_b <= cf, "{name} densify {densify}: frac_b differs by {:e} > {cf:e}", d.frac_b);
             assert!(d.field <= cv, "{name} densify {densify}: field differs by {:e} > {cv:e}", d.field);

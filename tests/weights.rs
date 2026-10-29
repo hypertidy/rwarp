@@ -558,3 +558,78 @@ fn timing_weights_vs_warp() {
         }
     }
 }
+
+// ---- the spherical measure ---------------------------------------------------
+
+/// Destination pixel -> source pixel between two regular lon/lat grids.
+struct LonLat {
+    src_gt: [f64; 6],
+    dst_gt: [f64; 6],
+}
+
+impl Transformer for LonLat {
+    fn transform(&self, _: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+        let (s, d) = (&self.src_gt, &self.dst_gt);
+        for (x, y) in x.iter_mut().zip(y.iter_mut()) {
+            let (lon, lat) = (d[0] + *x * d[1], d[3] + *y * d[5]);
+            *x = (lon - s[0]) / s[1];
+            *y = (lat - s[3]) / s[5];
+        }
+        vec![true; x.len()]
+    }
+}
+
+/// Exact area on the unit sphere of the lon/lat box [lon0, lon1] x [lat0, lat1]
+/// (degrees, either order), 0 when empty.
+fn sphere_box(lon0: f64, lon1: f64, lat0: f64, lat1: f64) -> f64 {
+    let dl = (lon1 - lon0).max(0.0).to_radians();
+    let (a, b) = (lat0.min(lat1).to_radians(), lat0.max(lat1).to_radians());
+    if b <= a { 0.0 } else { dl * (b.sin() - a.sin()) }
+}
+
+/// Between regular lon/lat grids every cell is a lon/lat box, so on the
+/// sphere each overlap is a box too, with a closed-form area. The weights
+/// under `lonlat_measure` must be those ratios, and a source window at an
+/// offset must give the same weights as the whole grid.
+#[test]
+fn spherical_measure_gives_exact_lonlat_box_overlaps() {
+    use rwarp::weights::lonlat_measure;
+    let cases: [([f64; 6], (usize, usize), [f64; 6], (usize, usize)); 3] = [
+        ([100.0, 1.0, 0.0, -10.0, 0.0, -1.0], (60, 40), [101.3, 2.5, 0.0, -11.7, 0.0, -2.0], (20, 15)),
+        ([100.0, 2.0, 0.0, -10.0, 0.0, -2.0], (30, 20), [103.1, 0.75, 0.0, -13.4, 0.0, -0.75], (56, 40)),
+        // high latitude, south-up source rows, partly outside the source
+        ([0.0, 0.5, 0.0, -85.0, 0.0, 0.5], (80, 40), [-1.3, 1.7, 0.0, -62.2, 0.0, -1.1], (25, 20)),
+    ];
+    for (src_gt, (sw, sh), dst_gt, (dw, dh)) in cases {
+        let t = LonLat { src_gt, dst_gt };
+        let m = lonlat_measure(src_gt).unwrap();
+        let w = exact_weights(&t, &GridWindow::new(sw, sh), dw, dh, &WeightOptions::new(1).with_measure(m));
+        let s = w.normalised(Normalization::DestArea);
+        let mut worst: f64 = 0.0;
+        let mut seen = 0;
+        for k in 0..w.len() {
+            let (dr, dc, sr, sc) = (w.dst_row[k] as f64, w.dst_col[k] as f64, w.src_row[k] as f64, w.src_col[k] as f64);
+            let dbox = |c: f64, r: f64| (dst_gt[0] + c * dst_gt[1], dst_gt[3] + r * dst_gt[5]);
+            let sbox = |c: f64, r: f64| (src_gt[0] + c * src_gt[1], src_gt[3] + r * src_gt[5]);
+            let ((dl0, dp0), (dl1, dp1)) = (dbox(dc, dr), dbox(dc + 1.0, dr + 1.0));
+            let ((sl0, sp0), (sl1, sp1)) = (sbox(sc, sr), sbox(sc + 1.0, sr + 1.0));
+            let ov = sphere_box(dl0.max(sl0), dl1.min(sl1), dp0.min(dp1).max(sp0.min(sp1)), dp0.max(dp1).min(sp0.max(sp1)));
+            let want = ov / sphere_box(dl0, dl1, dp0, dp1);
+            worst = worst.max((s[k] - want).abs());
+            if ov > 0.0 { seen += 1; }
+        }
+        eprintln!("lon/lat boxes {src_gt:?} -> {dst_gt:?}: {} entries, max |S - exact| {worst:.2e}", w.len());
+        assert!(worst < 1e-12, "{worst}");
+        assert_eq!(seen, w.len(), "an entry with no overlap");
+
+        // a source window at an offset: the same entries for the cells inside it
+        let win = GridWindow::new(sw - 7, sh - 9).with_offset(3, 5);
+        let wo = exact_weights(&t, &win, dw, dh, &WeightOptions::new(1).with_measure(m));
+        let whole: HashMap<_, _> = (0..w.len()).map(|k| ((w.dst_row[k], w.dst_col[k], w.src_row[k], w.src_col[k]), w.frac[k])).collect();
+        for k in 0..wo.len() {
+            let key = (wo.dst_row[k], wo.dst_col[k], wo.src_row[k], wo.src_col[k]);
+            let f = whole[&key];
+            assert!((wo.frac[k] - f).abs() < 1e-12, "{key:?}: {} vs {f}", wo.frac[k]);
+        }
+    }
+}

@@ -24,8 +24,9 @@ proj = ["dep:proj", "dep:proj-sys"]
 proj4rs = ["dep:proj4rs"]
 # `Sample` for half-precision floats (`half::f16`), GDAL's Float16.
 f16 = ["dep:half"]
-# serde derives on chunk plans (`plan::WarpPlan`, `plan::Chunk`).
-serde = ["dep:serde"]
+# serde derives on chunk plans (`plan::WarpPlan`, `plan::Chunk`) and on
+# weights (`weights::Weights`, `weights::WeightOptions`).
+serde = ["dep:serde", "controlledburn/serde"]
 
 [dependencies]
 proj = { version = "0.31.0", features = ["pkg_config"], optional = true }

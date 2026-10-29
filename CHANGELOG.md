@@ -2,6 +2,34 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## Unreleased
+
+### Added
+
+- A spherical measure for conservative weights (stage 3a of
+  `design/conservative.md`): `WeightOptions::with_measure` with
+  `weights::lonlat_measure(src_gt)` measures areas on the sphere for a
+  source on a regular longitude/latitude grid, through controlledburn's
+  `Measure::CosLatitude` (closed-form edge integrals of `cos(lat)`; the
+  cell partition and conservation are unchanged). `Weights` records the
+  `measure`, `Weights::src_area(k)` gives an entry's source cell measure,
+  and `normalised`, `dst_covered` and `apply` weight overlaps by it; for the
+  default planar measure every cell is 1 and results are unchanged, bit for
+  bit. Exact against closed-form lon/lat box overlaps on the sphere (to
+  1e-14). Needs controlledburn 0.2.4. (2026-10-29)
+- ESMF oracle suite (stage 2 of `design/conservative.md`, `tests/esmf.rs`):
+  six cases, each against ESMPy 8.9.1's first-order conservative weights
+  in Cartesian source pixel space (rwarp's cell definition: equal to about
+  1e-12) and on the sphere with great-circle edges (differences recorded as
+  ceilings to shrink). Fixtures from `tests/fixtures/esmf/gen.py`, run in
+  `ghcr.io/hypertidy/gdal-r-esmf` by `.github/workflows/esmf-fixtures.yml`.
+  (2026-10-29)
+
+### Changed
+
+- The `serde` feature also enables controlledburn's, for `Measure` in
+  `WeightOptions` and `Weights`. (2026-10-29)
+
 ## 0.3.1 (2026-10-28)
 
 ### Added

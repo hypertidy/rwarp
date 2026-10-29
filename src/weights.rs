@@ -14,34 +14,43 @@
 //! - **Cells.** Destination cells have edges straight in destination pixel
 //!   space, each split into `densify` segments whose end points go through
 //!   the transformer exactly. Source cells are unit squares in source pixel
-//!   space. All areas are planar, in source pixel space: for a source whose
-//!   pixel-to-world map is affine (any regular grid in its own CRS) that is
-//!   world area in the source CRS, up to one constant.
-//! - **`frac`** is the overlap's area over the source cell's (which is 1),
-//!   unrounded `f64`. Because neighbouring destination outlines are built
+//!   space.
+//! - **Measure.** By default areas are planar in source pixel space: for a
+//!   source whose pixel-to-world map is affine (any regular grid in its own
+//!   CRS) that is world area in the source CRS, up to one constant. With
+//!   [`WeightOptions::with_measure`] and [`lonlat_measure`], a regular
+//!   longitude/latitude source measures area on the sphere instead
+//!   (controlledburn's [`Measure::CosLatitude`]): exact for the cells as
+//!   defined here, whose edges are straight in source pixel space.
+//! - **`frac`** is the overlap's measure over the source cell's (1 for the
+//!   planar measure), unrounded `f64`. Because neighbouring destination outlines are built
 //!   from the same transformed points, the destination cells tile source
 //!   pixel space: the `frac` of a source cell sums, over destination cells,
 //!   to 1 where the destination grid covers it completely and to the
 //!   covered fraction where its edge cuts it, up to `f64` rounding (about
 //!   1e-15; see `tests/weights.rs`).
-//! - **`dst_area`** is the area of each destination cell's outline in
-//!   source pixel space (controlledburn's [`ring_area`]), whether or not
+//! - **`dst_area`** is the measure of each destination cell's outline
+//!   (controlledburn's [`Measure::ring_area`]), whether or not
 //!   the outline lies inside the source window. `NaN` where a point of
 //!   the outline failed to transform. A destination cell wholly inside the
-//!   source has `dst_area` equal to the sum of its `frac`.
+//!   source has `dst_area` equal to the sum of its `frac` times the source
+//!   cell's measure ([`Weights::src_area`], 1 for the planar measure).
 //!
 //! # Normalisation
 //!
 //! ESMF's weight `S` for an entry follows from `frac` and `dst_area` (see
 //! [`Weights::normalised`]):
 //!
-//! - [`Normalization::FracArea`]: `frac / (sum of frac over the destination
-//!   cell)`. The mean over the part of the cell that has source; what
+//! With `a` the source cell's measure ([`Weights::src_area`]; 1 for the
+//! planar measure):
+//!
+//! - [`Normalization::FracArea`]: `frac a / (sum of frac a over the
+//!   destination cell)`. The mean over the part of the cell that has source; what
 //!   [`warp`](crate::warp::warp) computes. ESMF `fracarea`, xESMF
 //!   `conserve_normed`.
-//! - [`Normalization::DestArea`]: `frac / dst_area`. Partly covered cells
+//! - [`Normalization::DestArea`]: `frac a / dst_area`. Partly covered cells
 //!   are scaled down by their coverage, so `sum_i value_i * dst_area_i` is
-//!   `sum_j frac_j * src_j`: the integral is conserved. ESMF `destarea`,
+//!   `sum_j frac_j a_j src_j`: the integral is conserved. ESMF `destarea`,
 //!   xESMF `conserve`.
 //!
 //! # ESMF and SCRIP weight files
@@ -51,8 +60,9 @@
 //! `dst_row * dst_ncol_full + dst_col + 1`, `col` is `src_row *
 //! src_ncol_full + src_col + 1` ([`Weights::esmf_row_col`]), and `S` is
 //! [`Weights::normalised`]. ESMF's `area_b` corresponds to `dst_area`
-//! (in source pixel units, not steradians) and `frac_b` to the sum of
-//! `frac` per destination cell over `dst_area`.
+//! (in source pixels, or under the spherical measure source pixels at the
+//! equator, not steradians) and `frac_b` to [`Weights::dst_covered`] over
+//! `dst_area`.
 //!
 //! # Relation to `warp()`
 //!
@@ -80,10 +90,12 @@
 //!
 //! No antimeridian handling: a destination cell whose outline crosses the
 //! source's wrap column folds across the whole source width, and its
-//! weights are wrong. Areas are planar in source pixel space, not
-//! spherical. See `design/conservative.md`.
+//! weights are wrong. The spherical measure takes cell edges straight in
+//! source pixel space (rhumb lines on a longitude/latitude source), not
+//! great circles as ESMF does; see `design/conservative.md` and
+//! `tests/esmf.rs` for the size of the difference.
 
-use controlledburn::ring_area;
+pub use controlledburn::Measure;
 
 use crate::transform::Transformer;
 use crate::warp::{AreaMean, AreaReducer, BandNodata, Cover, DstNodata, Interleaved, Lattice, Nodata, Output, Res, Sample, SourceBuffer, WarpOptions};
@@ -121,6 +133,26 @@ impl<T> From<&SourceBuffer<'_, T>> for GridWindow {
     }
 }
 
+/// The spherical measure for a source on a regular longitude/latitude grid
+/// (degrees) with geotransform `src_gt`, over its full pixel space: rows are
+/// parallels, so the sphere's area element is a function of the row. `None`
+/// for a rotated or degenerate geotransform.
+///
+/// Areas come out per unit of source column, in units of a source pixel at
+/// the equator; the constant does not matter to the weights.
+pub fn lonlat_measure(src_gt: [f64; 6]) -> Option<Measure> {
+    (src_gt[2] == 0.0 && src_gt[4] == 0.0 && src_gt[1] != 0.0 && src_gt[5] != 0.0)
+        .then(|| Measure::cos_latitude(src_gt[3].to_radians(), src_gt[5].to_radians()))
+}
+
+/// `measure` with its row 0 moved to row `rows` of the grid it was given for.
+fn shift_rows(measure: Measure, rows: f64) -> Measure {
+    match measure {
+        Measure::CosLatitude { phi0, dphi } => Measure::cos_latitude(phi0 + dphi * rows, dphi),
+        m => m,
+    }
+}
+
 /// Options for [`exact_weights`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -141,6 +173,9 @@ pub struct WeightOptions {
     /// Round overlaps that are not snapped to `f32` (and back). Default
     /// false.
     pub round_to_f32: bool,
+    /// How area is measured, over the full source grid's pixel space.
+    /// Default [`Measure::Planar`]; see [`lonlat_measure`].
+    pub measure: Measure,
 }
 
 impl Default for WeightOptions {
@@ -155,6 +190,7 @@ impl WeightOptions {
         WeightOptions {
             densify, dst_col_off: 0, dst_row_off: 0,
             drop_tolerance: 0.0, snap_tolerance: 0.0, round_to_f32: false,
+            measure: Measure::Planar,
         }
     }
 
@@ -190,6 +226,13 @@ impl WeightOptions {
 
     pub fn with_f32_rounding(mut self, round: bool) -> Self {
         self.round_to_f32 = round;
+        self
+    }
+
+    /// Measure area with `measure`, given over the full source grid's pixel
+    /// space (see [`lonlat_measure`]).
+    pub fn with_measure(mut self, measure: Measure) -> Self {
+        self.measure = measure;
         self
     }
 
@@ -229,10 +272,10 @@ pub struct CellWeights<'a> {
     /// Full-grid indices of the destination cell.
     pub dst_row: u32,
     pub dst_col: u32,
-    /// Its outline's area in source pixel space; `NaN` if it failed.
+    /// Its outline's measure; `NaN` if it failed.
     pub dst_area: f64,
     /// Full-grid source indices and overlaps (fractions of the source
-    /// cell), one per entry.
+    /// cell's measure), one per entry.
     pub src_row: &'a [u32],
     pub src_col: &'a [u32],
     pub frac: &'a [f64],
@@ -252,15 +295,17 @@ pub struct Weights {
     pub dst_col: Vec<u32>,
     pub src_row: Vec<u32>,
     pub src_col: Vec<u32>,
-    /// Area of the overlap as a fraction of the source cell.
+    /// Measure of the overlap as a fraction of the source cell's.
     pub frac: Vec<f64>,
-    /// Per destination cell of the window, row-major: its outline's area in
-    /// source pixel space, `NaN` where it failed to transform.
+    /// Per destination cell of the window, row-major: its outline's
+    /// measure, `NaN` where it failed to transform.
     pub dst_area: Vec<f64>,
     /// The destination window: offset `[col, row]` in the full grid and
     /// size `[ncol, nrow]`. `dst_area` has `ncol * nrow` values.
     pub dst_off: [usize; 2],
     pub dst_size: [usize; 2],
+    /// The measure over the full source grid ([`WeightOptions::measure`]).
+    pub measure: Measure,
 }
 
 /// Options for [`Weights::apply`]: nodata and validity, as in
@@ -342,6 +387,9 @@ pub fn exact_weights_with(
     let (mut sr, mut sc, mut fr) = (Vec::new(), Vec::new(), Vec::new());
     if dst_ncol == 0 || dst_nrow == 0 { return; }
     let mut lat = Lattice::new(transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off));
+    // The window works in source window pixels.
+    let measure = shift_rows(opts.measure, src.row_off as f64);
+    lat.win.set_measure(measure);
     for row in 0..dst_nrow {
         lat.row(transformer, row);
         let dst_row = (opts.dst_row_off + row) as u32;
@@ -352,7 +400,7 @@ pub fn exact_weights_with(
             let cover = lat.cover(c, src_off, (ncol, nrow));
             let dst_area = match cover {
                 Cover::Failed => f64::NAN,
-                _ => ring_area(&lat.rx, &lat.ry).abs(),
+                _ => measure.ring_area(&lat.rx, &lat.ry).abs(),
             };
             if let Cover::Window { c0, r0, w } = cover {
                 for (k, &v) in lat.win.coverage().iter().enumerate() {
@@ -389,6 +437,7 @@ pub fn exact_weights(
         dst_off: [opts.dst_col_off, opts.dst_row_off],
         dst_size: [dst_ncol, dst_nrow],
         dst_area: Vec::with_capacity(dst_ncol * dst_nrow),
+        measure: opts.measure,
         ..Weights::default()
     };
     exact_weights_with(transformer, src, dst_ncol, dst_nrow, opts, |cell| {
@@ -477,24 +526,38 @@ impl Weights {
         order
     }
 
-    /// Sum of `frac` per destination cell of the window, row-major: the
-    /// covered area in source pixel space (ESMF's `frac_b * area_b`).
+    /// The measure of entry `k`'s source cell: 1 for the planar measure.
+    #[inline]
+    pub fn src_area(&self, k: usize) -> f64 {
+        self.measure.cell_area(self.src_row[k] as i64)
+    }
+
+    /// The measure of entry `k`'s overlap, `frac * src_area`.
+    #[inline]
+    fn overlap(&self, k: usize) -> f64 {
+        self.frac[k] * self.src_area(k)
+    }
+
+    /// Sum of the overlaps' measure per destination cell of the window,
+    /// row-major: the covered part of `dst_area` (ESMF's `frac_b *
+    /// area_b`). The sum of `frac` for the planar measure.
     pub fn dst_covered(&self) -> Vec<f64> {
         let mut s = vec![0.0; self.dst_size[0] * self.dst_size[1]];
-        for k in 0..self.len() { s[self.cell(k)] += self.frac[k]; }
+        for k in 0..self.len() { s[self.cell(k)] += self.overlap(k); }
         s
     }
 
-    /// ESMF's `S` for each entry under a normalisation: `frac / dst_area`
-    /// ([`Normalization::DestArea`]) or `frac` over the sum of `frac` of
-    /// its destination cell ([`Normalization::FracArea`]). Nodata is not
-    /// considered; [`Weights::apply`] renormalises over valid source cells.
+    /// ESMF's `S` for each entry under a normalisation: the overlap's
+    /// measure over `dst_area` ([`Normalization::DestArea`]) or over the
+    /// covered measure of its destination cell ([`Normalization::FracArea`]).
+    /// Nodata is not considered; [`Weights::apply`] renormalises over valid
+    /// source cells.
     pub fn normalised(&self, norm: Normalization) -> Vec<f64> {
         let denom = match norm {
             Normalization::FracArea => self.dst_covered(),
             Normalization::DestArea => self.dst_area.clone(),
         };
-        (0..self.len()).map(|k| self.frac[k] / denom[self.cell(k)]).collect()
+        (0..self.len()).map(|k| self.overlap(k) / denom[self.cell(k)]).collect()
     }
 
     /// ESMF/SCRIP's 1-based flattened indices, `(row, col)`: `row` for the
@@ -557,9 +620,8 @@ impl Weights {
             let run = |red: &mut dyn FnMut(usize, f64)| {
                 for full in [true, false] {
                     for &k in group {
-                        let w = self.frac[k];
-                        if (w >= 1.0) != full { continue; }
-                        if let Some(p) = buf_index(k) { red(p, w); }
+                        if (self.frac[k] >= 1.0) != full { continue; }
+                        if let Some(p) = buf_index(k) { red(p, self.overlap(k)); }
                     }
                 }
             };
