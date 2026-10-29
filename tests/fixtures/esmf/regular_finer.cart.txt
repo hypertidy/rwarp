@@ -1,5 +1,6 @@
 # case regular_finer: 2 degrees to 0.75 degrees, inside the source
 # oracle ESMPy 8.9.1 conserve, norm dstarea, Cartesian in source pixel space
+# proj 9.9.0
 # src_crs EPSG:4326
 # src_gt 100.0 2.0 0.0 -10.0 0.0 -2.0
 # src_size 30 20
