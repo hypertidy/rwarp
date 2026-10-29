@@ -1,5 +1,6 @@
 # case lonlat_3031: 0.5 degree lon/lat to EPSG:3031 at 25 km, 67 to 80 S
 # oracle ESMPy 8.9.1 conserve, norm dstarea, Cartesian in source pixel space
+# proj 9.9.0
 # src_crs EPSG:4326
 # src_gt 0.0 0.5 0.0 -55.0 0.0 -0.5
 # src_size 180 60

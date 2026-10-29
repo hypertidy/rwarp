@@ -1,5 +1,6 @@
 # case rotated_pole: 0.5 degree lon/lat to a 1 degree rotated-pole grid over Europe
 # oracle ESMPy 8.9.1 conserve, norm dstarea, spherical, great-circle edges
+# proj 9.9.0
 # src_crs EPSG:4326
 # src_gt -20.0 0.5 0.0 75.0 0.0 -0.5
 # src_size 160 90

@@ -17,8 +17,14 @@ area, as ESMF's S:
   space and areas are planar there. That is rwarp's cell definition at
   densify 1, so rwarp must match it to rounding.
 - <case>.sph.txt: spherical (CoordSys.SPH_DEG), with corners in lon/lat and
-  ESMF's great-circle edges. rwarp's measure is planar until stage 3; the test
-  records the difference as a number to shrink.
+  ESMF's great-circle edges. The test records rwarp's difference from it.
+- <case>.tr.txt, for regular_coarser and regular_finer: TempestRemap's
+  first-order finite volume map (GenerateRLLMesh, GenerateOverlapMesh,
+  GenerateOfflineMap --in_np 1). TempestRemap 2.2 builds lon/lat meshes with
+  great-circle edges too (GenerateRLLMesh.cpp defines ONLY_GREAT_CIRCLES), so
+  this is a second, independent implementation of ESMF's cells. TempestRemap
+  does not map between grids that only partly overlap ("Invalid overlap
+  mesh"), so regular_overhang has none.
 
 Fixture layout: '# key value' header lines, then 'n_b n_s', then n_b lines
 'frac_b area_b' (destination row-major), then n_s lines 'row col S' (ESMF's
@@ -27,8 +33,12 @@ Fixture layout: '# key value' header lines, then 'n_b n_s', then n_b lines
 
 import math
 import os
+import shutil
+import subprocess
+import tempfile
 
 import esmpy
+import netCDF4
 import numpy as np
 from osgeo import osr
 
@@ -131,15 +141,73 @@ def conserve(src_grid, dst_grid):
     return out
 
 
+def rll_mesh(path, gt, size):
+    """A TempestRemap lon/lat mesh for a north-up regular grid."""
+    (w, h), (lon0, dlon, lat0, dlat) = size, (gt[0], gt[1], gt[3], gt[5])
+    assert gt[2] == 0 and gt[4] == 0 and dlon > 0 and dlat < 0
+    run("GenerateRLLMesh", "--lon", str(w), "--lat", str(h),
+        "--lon_begin", repr(lon0), "--lon_end", repr(lon0 + w * dlon),
+        "--lat_begin", repr(lat0 + h * dlat), "--lat_end", repr(lat0),
+        "--file", path)
+
+
+def run(*args):
+    """Run a tool; TempestRemap exits 0 after some errors, so callers check
+    for its output too."""
+    p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode != 0 or "EXCEPTION" in p.stdout:
+        raise RuntimeError(f"{' '.join(args)} failed:\n{p.stdout}\n{p.stderr}")
+
+
+def grid_index(gt, size, lon, lat):
+    """0-based row-major index of the cell whose centre is (lon, lat)."""
+    c = np.floor((lon - gt[0]) / gt[1]).astype(int)
+    r = np.floor((lat - gt[3]) / gt[5]).astype(int)
+    assert (c >= 0).all() and (c < size[0]).all() and (r >= 0).all() and (r < size[1]).all()
+    return r * size[0] + c
+
+
+def tempest(case, work):
+    """TempestRemap's first-order map between regular lon/lat grids, in
+    ESMF's terms: frac_b, area_b per destination cell (row-major) and
+    1-based row, col, S."""
+    _, _, src_gt, src_size, _, dst_gt, dst_size, _ = case
+    a, b = os.path.join(work, "a.g"), os.path.join(work, "b.g")
+    ov, m = os.path.join(work, "ov.g"), os.path.join(work, "map.nc")
+    rll_mesh(a, src_gt, src_size)
+    rll_mesh(b, dst_gt, dst_size)
+    # The overlap wants the covered mesh first; the map reverses it.
+    run("GenerateOverlapMesh", "--a", b, "--b", a, "--out", ov)
+    run("GenerateOfflineMap", "--in_mesh", a, "--out_mesh", b, "--ov_mesh", ov,
+        "--in_np", "1", "--out_map", m)
+    if not os.path.exists(m):
+        raise RuntimeError(f"GenerateOfflineMap wrote no {m}")
+    with netCDF4.Dataset(m) as ds:
+        get = lambda v: ds[v][:].data
+        ia = grid_index(src_gt, src_size, get("xc_a"), get("yc_a"))
+        ib = grid_index(dst_gt, dst_size, get("xc_b"), get("yc_b"))
+        n_b = dst_size[0] * dst_size[1]
+        assert ib.size == n_b and len(set(ib)) == n_b
+        frac_b, area_b = np.zeros(n_b), np.zeros(n_b)
+        frac_b[ib], area_b[ib] = get("frac_b"), get("area_b")
+        row = ib[get("row") - 1] + 1
+        col = ia[get("col") - 1] + 1
+        return frac_b, area_b, row, col, get("S")
+
+
 def write(path, case, kind, result):
     name, src_crs, src_gt, src_size, dst_crs, dst_gt, dst_size, note = case
     frac_b, area_b, row, col, s = result
     order = np.lexsort((col, row))
     fmt = "%.17g" if kind == "cart" else "%.12g"
+    oracle = {
+        "cart": f"ESMPy {esmpy.__version__} conserve, norm dstarea, Cartesian in source pixel space",
+        "sph": f"ESMPy {esmpy.__version__} conserve, norm dstarea, spherical, great-circle edges",
+        "tr": "TempestRemap first-order FV (--in_np 1), great-circle edges",
+    }[kind]
     with open(path, "w") as f:
         f.write(f"# case {name}: {note}\n")
-        f.write(f"# oracle ESMPy {esmpy.__version__} conserve, norm dstarea, "
-                f"{'Cartesian in source pixel space' if kind == 'cart' else 'spherical, great-circle edges'}\n")
+        f.write(f"# oracle {oracle}\n")
         f.write(f"# proj {osr.GetPROJVersionMajor()}.{osr.GetPROJVersionMinor()}."
                 f"{osr.GetPROJVersionMicro()}\n")
         f.write(f"# src_crs {src_crs}\n# src_gt {' '.join(repr(float(v)) for v in src_gt)}\n")
@@ -175,6 +243,10 @@ def main():
         sph = conserve(grid(s_corner_ll, s_centre_ll, esmpy.CoordSys.SPH_DEG),
                        grid(d_corner_ll, d_centre_ll, esmpy.CoordSys.SPH_DEG))
         write(os.path.join(HERE, f"{name}.sph.txt"), case, "sph", sph)
+        if name in ("regular_coarser", "regular_finer"):
+            work = tempfile.mkdtemp()
+            write(os.path.join(HERE, f"{name}.tr.txt"), case, "tr", tempest(case, work))
+            shutil.rmtree(work)
 
 
 if __name__ == "__main__":

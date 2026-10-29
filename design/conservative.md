@@ -263,6 +263,46 @@ route isn't enough. The oracle suite would show that.
 This depends on bigcurve stage 2 (the edge-model trait and a batched forward
 map, m20 section 6).
 
+**Status (2026-10-29): parked, because it would not match ESMF.** ESMF's
+cells are great-circle quadrilaterals on *both* sides: its `area_b` equals the
+spherical excess of the quadrilateral through the cell corners to 4e-12, and
+that differs from the same cell bounded by parallels by up to 1.4e-4 (2.5 x 2
+degree cells at 40 S; `tests/esmf.rs`,
+`esmf_cells_are_great_circle_quadrilaterals`). The tops and bottoms of the
+*source* lon/lat cells are great circles in ESMF too, and rwarp's source cells
+are unit squares in source pixel space, which is what makes the coverage window
+exact. An experiment that moved every densified destination edge point onto
+its great circle (a wrapping transformer, densify up to 128) measured how much
+of the ESMF gap that closes, in max |S| difference:
+
+| case | sphere, straight edges | + great-circle destination edges |
+|---|---|---|
+| regular_coarser (1 to 2.5 x 2 degrees) | 1.1e-3 | 1.5e-4 |
+| regular_finer (2 to 0.75 degrees) | 5.0e-3 | 5.5e-3 |
+| regular_overhang (1 to 1 degree) | 7.9e-7 | 3.9e-4 |
+| rotated_pole | 2.0e-4 (densify 8) | 7.0e-5 |
+| lonlat_3031 | 5.2e-4 (densify 8) | 4.8e-4 |
+| lonlat_laea | 1.9e-4 (densify 1) | 5.3e-4 |
+
+Great-circle destination edges help only where destination cells are much
+wider than source cells. Elsewhere the source cells' edges dominate, and
+bending one side alone breaks the cancellation between equal bows. Matching
+ESMF exactly needs curved source cells: spherical polygon overlay, a separate
+engine from controlledburn's.
+
+For raster data on a regular lon/lat grid the cells are bounded by parallels
+(CF), so rwarp's definition is the data's, and it is exact
+(`spherical_measure_gives_exact_lonlat_box_overlaps`, 1e-14). TempestRemap
+cannot check that independently: version 2.2 builds lon/lat meshes with
+great-circle edges (`#define ONLY_GREAT_CIRCLES` in GenerateRLLMesh.cpp) and
+computes face areas by quadrature over great-circle triangles whatever the
+edge type. It serves instead as a second implementation of ESMF's cells.
+
+Great-circle edges stay worth having for grids defined that way: unstructured
+meshes (stage 5) and curvilinear grids whose corners are joined by great
+circles (stage 4). They come with those stages, through bigcurve-rs, whose
+stage 1 (the great-circle engine, `Forward`, shared-edge identity) is done.
+
 ## 6. Stage 4: curvilinear and periodic grids
 
 As [curvilinear-frontend.md](curvilinear-frontend.md) designs it. In
