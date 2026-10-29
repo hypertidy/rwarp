@@ -140,6 +140,8 @@ def write(path, case, kind, result):
         f.write(f"# case {name}: {note}\n")
         f.write(f"# oracle ESMPy {esmpy.__version__} conserve, norm dstarea, "
                 f"{'Cartesian in source pixel space' if kind == 'cart' else 'spherical, great-circle edges'}\n")
+        f.write(f"# proj {osr.GetPROJVersionMajor()}.{osr.GetPROJVersionMinor()}."
+                f"{osr.GetPROJVersionMicro()}\n")
         f.write(f"# src_crs {src_crs}\n# src_gt {' '.join(repr(float(v)) for v in src_gt)}\n")
         f.write(f"# src_size {src_size[0]} {src_size[1]}\n")
         f.write(f"# dst_crs {dst_crs}\n# dst_gt {' '.join(repr(float(v)) for v in dst_gt)}\n")

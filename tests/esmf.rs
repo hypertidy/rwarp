@@ -185,15 +185,19 @@ const CASES: [&str; 6] = ["regular_coarser", "regular_finer", "regular_overhang"
 #[test]
 fn cartesian_esmf_matches_exactly() {
     for name in CASES {
+        // The fixtures' corners come from the image's PROJ (9.9 matches to
+        // about 1e-12). LAEA on the ellipsoid differs between PROJ releases:
+        // Ubuntu 24.04's PROJ 9.4 is 3e-8 off in S and 9e-9 in area.
+        let tol = if name == "lonlat_laea" { 1e-7 } else { 1e-9 };
         let fx = read_fixture(&format!("{name}.cart.txt"));
         let o = ours(&fx, 1);
         let d = diff(&fx, &o);
         let area = o.area_b.iter().zip(&fx.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         eprintln!("{name:16} cart: {d:?}, max relative area difference {area:.2e}");
-        assert!(d.s < 1e-9, "{name}: S differs by {:e}", d.s);
-        assert!(d.frac_b < 1e-9, "{name}: frac_b differs by {:e}", d.frac_b);
-        assert!(area < 1e-9, "{name}: area differs by {area:e}");
-        assert!(d.field < 1e-9, "{name}: field differs by {:e}", d.field);
+        assert!(d.s < tol, "{name}: S differs by {:e}", d.s);
+        assert!(d.frac_b < tol, "{name}: frac_b differs by {:e}", d.frac_b);
+        assert!(area < tol, "{name}: area differs by {area:e}");
+        assert!(d.field < tol, "{name}: field differs by {:e}", d.field);
         assert!(d.esmf_rows < 1e-9, "{name}: ESMF row sums off by {:e}", d.esmf_rows);
     }
 }
