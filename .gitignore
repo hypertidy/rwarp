@@ -5,3 +5,6 @@ rwarp.Rproj
 .Rproj.user/
 .Rhistory
 book/book
+
+# Claude Code agent worktrees
+.claude/worktrees/
