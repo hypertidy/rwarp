@@ -185,32 +185,46 @@ const CASES: [&str; 6] = ["regular_coarser", "regular_finer", "regular_overhang"
 #[test]
 fn cartesian_esmf_matches_exactly() {
     for name in CASES {
+        // The fixtures' corners come from the image's PROJ (9.9 matches to
+        // about 1e-12). LAEA on the ellipsoid differs between PROJ releases:
+        // Ubuntu 24.04's PROJ 9.4 is 3e-8 off in S and 9e-9 in area.
+        let tol = if name == "lonlat_laea" { 1e-7 } else { 1e-9 };
         let fx = read_fixture(&format!("{name}.cart.txt"));
         let o = ours(&fx, 1);
         let d = diff(&fx, &o);
         let area = o.area_b.iter().zip(&fx.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         eprintln!("{name:16} cart: {d:?}, max relative area difference {area:.2e}");
-        assert!(d.s < 1e-9, "{name}: S differs by {:e}", d.s);
-        assert!(d.frac_b < 1e-9, "{name}: frac_b differs by {:e}", d.frac_b);
-        assert!(area < 1e-9, "{name}: area differs by {area:e}");
-        assert!(d.field < 1e-9, "{name}: field differs by {:e}", d.field);
+        assert!(d.s < tol, "{name}: S differs by {:e}", d.s);
+        assert!(d.frac_b < tol, "{name}: frac_b differs by {:e}", d.frac_b);
+        assert!(area < tol, "{name}: area differs by {area:e}");
+        assert!(d.field < tol, "{name}: field differs by {:e}", d.field);
         assert!(d.esmf_rows < 1e-9, "{name}: ESMF row sums off by {:e}", d.esmf_rows);
     }
 }
 
 /// Spherical ESMF (great-circle edges, spherical areas) against rwarp's
 /// planar measure: the recorded differences, per case, at densify 1 and 8.
-/// Ceilings are [S, frac_b, field], set a little above what was measured.
+/// Ceilings are [S, frac_b, field], about 1.5 times what was measured
+/// (ESMF 8.9.1, rwarp 0.3.1), over both densities.
+///
+/// What they show: the S differences (up to 0.6% at regular_finer, where
+/// one destination cell spans parts of several source rows) are the planar
+/// against spherical measure, and stage 3's spherical measure is what
+/// should close them. Densify 8 is further from ESMF than densify 1 for the
+/// projected cases: ESMF joins a destination cell's four corners with great
+/// circles, close to densify 1's chords in lon/lat, while densify 8
+/// follows the edge as straight in the destination projection. frac_b
+/// agrees to rounding except where the destination overhangs the source.
 #[test]
 fn spherical_esmf_differences_are_recorded() {
     #[rustfmt::skip]
     let ceilings: [(&str, [f64; 3]); 6] = [
-        ("regular_coarser",  [f64::INFINITY; 3]),
-        ("regular_finer",    [f64::INFINITY; 3]),
-        ("regular_overhang", [f64::INFINITY; 3]),
-        ("rotated_pole",     [f64::INFINITY; 3]),
-        ("lonlat_3031",      [f64::INFINITY; 3]),
-        ("lonlat_laea",      [f64::INFINITY; 3]),
+        ("regular_coarser",  [1.0e-3, 1e-12, 7.0e-5]),
+        ("regular_finer",    [9.5e-3, 1e-12, 5.0e-4]),
+        ("regular_overhang", [9.0e-4, 5e-4,  2.0e-5]),
+        ("rotated_pole",     [1.9e-3, 1e-12, 7.5e-5]),
+        ("lonlat_3031",      [2.5e-3, 1e-12, 1.6e-5]),
+        ("lonlat_laea",      [1.9e-3, 1e-12, 1.2e-5]),
     ];
     for (name, [cs, cf, cv]) in ceilings {
         let fx = read_fixture(&format!("{name}.sph.txt"));
