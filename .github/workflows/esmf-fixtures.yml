@@ -1,0 +1,36 @@
+# Regenerate the ESMF oracle fixtures (tests/fixtures/esmf/) in
+# ghcr.io/hypertidy/gdal-r-esmf, run tests/esmf.rs against them, and upload
+# them as an artifact to commit. Runs by hand and on pull requests that change
+# the generator; the fixtures are committed, so ordinary CI needs no ESMF.
+# Rerun when gen.py or the image's ESMF changes.
+name: esmf-fixtures
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tests/fixtures/esmf/gen.py'
+      - '.github/workflows/esmf-fixtures.yml'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/hypertidy/gdal-r-esmf:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate
+        run: /opt/gdal-py/bin/python tests/fixtures/esmf/gen.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esmf-fixtures
+          path: tests/fixtures/esmf/*.txt
+      - name: Test
+        run: cargo test --test esmf -- --nocapture
