@@ -327,18 +327,30 @@ fn esmf_cells_are_great_circle_quadrilaterals() {
     }
 }
 
-/// TempestRemap (a second, independent implementation of the same
-/// great-circle cells) against ESMF, and rwarp's spherical measure against
-/// TempestRemap, for the cases between regular lon/lat grids.
+/// TempestRemap, a second and independent implementation of the same
+/// great-circle cells, agrees with ESMF to the fixtures' 12 digits; rwarp's
+/// spherical measure differs from it as from ESMF (the ceilings of
+/// `spherical_measure_against_spherical_esmf`). Between regular lon/lat
+/// grids that only partly overlap TempestRemap makes no map, so
+/// regular_overhang is not here.
 #[test]
 fn tempestremap_agrees_with_esmf() {
-    for name in ["regular_coarser", "regular_finer", "regular_overhang"] {
+    #[rustfmt::skip]
+    let ceilings: [(&str, [f64; 3]); 2] = [
+        ("regular_coarser", [1.7e-3, 1e-12, 1.6e-4]),
+        ("regular_finer",   [7.5e-3, 1e-12, 4.0e-4]),
+    ];
+    for (name, [cs, cf, cv]) in ceilings {
         let (tr, esmf) = (read_fixture(&format!("{name}.tr.txt")), read_fixture(&format!("{name}.sph.txt")));
         let as_ours = |f: &Fixture| Ours { s: f.s.clone(), frac_b: f.frac_b.clone(), area_b: f.area_b.clone() };
         let d = diff(&esmf, &as_ours(&tr));
         let area = tr.area_b.iter().zip(&esmf.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         eprintln!("{name:16} TempestRemap vs ESMF: {d:?}, max relative area difference {area:.2e}");
+        assert_eq!(d.only.0 + d.only.1, 0, "{name}: different entries");
+        assert!(d.s < 1e-10 && d.frac_b < 1e-10 && d.field < 1e-10 && area < 1e-10, "{name}: {d:?}, area {area:e}");
         let r = diff(&tr, &ours(&tr, 1, true));
         eprintln!("{name:16} rwarp (sphere) vs TempestRemap: {r:?}");
+        assert!(r.esmf_rows < 1e-9, "{name}: TempestRemap row sums off by {:e}", r.esmf_rows);
+        assert!(r.s <= cs && r.frac_b <= cf && r.field <= cv, "{name}: {r:?}");
     }
 }

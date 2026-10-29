@@ -18,11 +18,13 @@ area, as ESMF's S:
   densify 1, so rwarp must match it to rounding.
 - <case>.sph.txt: spherical (CoordSys.SPH_DEG), with corners in lon/lat and
   ESMF's great-circle edges. The test records rwarp's difference from it.
-- <case>.tr.txt, for the cases between regular lon/lat grids: TempestRemap's
+- <case>.tr.txt, for regular_coarser and regular_finer: TempestRemap's
   first-order finite volume map (GenerateRLLMesh, GenerateOverlapMesh,
   GenerateOfflineMap --in_np 1). TempestRemap 2.2 builds lon/lat meshes with
   great-circle edges too (GenerateRLLMesh.cpp defines ONLY_GREAT_CIRCLES), so
-  this is a second, independent implementation of ESMF's cells.
+  this is a second, independent implementation of ESMF's cells. TempestRemap
+  does not map between grids that only partly overlap ("Invalid overlap
+  mesh"), so regular_overhang has none.
 
 Fixture layout: '# key value' header lines, then 'n_b n_s', then n_b lines
 'frac_b area_b' (destination row-major), then n_s lines 'row col S' (ESMF's
@@ -150,7 +152,11 @@ def rll_mesh(path, gt, size):
 
 
 def run(*args):
-    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+    """Run a tool; TempestRemap exits 0 after some errors, so callers check
+    for its output too."""
+    p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode != 0 or "EXCEPTION" in p.stdout:
+        raise RuntimeError(f"{' '.join(args)} failed:\n{p.stdout}\n{p.stderr}")
 
 
 def grid_index(gt, size, lon, lat):
@@ -170,9 +176,12 @@ def tempest(case, work):
     ov, m = os.path.join(work, "ov.g"), os.path.join(work, "map.nc")
     rll_mesh(a, src_gt, src_size)
     rll_mesh(b, dst_gt, dst_size)
-    run("GenerateOverlapMesh", "--a", a, "--b", b, "--out", ov)
+    # The overlap wants the covered mesh first; the map reverses it.
+    run("GenerateOverlapMesh", "--a", b, "--b", a, "--out", ov)
     run("GenerateOfflineMap", "--in_mesh", a, "--out_mesh", b, "--ov_mesh", ov,
         "--in_np", "1", "--out_map", m)
+    if not os.path.exists(m):
+        raise RuntimeError(f"GenerateOfflineMap wrote no {m}")
     with netCDF4.Dataset(m) as ds:
         get = lambda v: ds[v][:].data
         ia = grid_index(src_gt, src_size, get("xc_a"), get("yc_a"))
@@ -234,7 +243,7 @@ def main():
         sph = conserve(grid(s_corner_ll, s_centre_ll, esmpy.CoordSys.SPH_DEG),
                        grid(d_corner_ll, d_centre_ll, esmpy.CoordSys.SPH_DEG))
         write(os.path.join(HERE, f"{name}.sph.txt"), case, "sph", sph)
-        if name.startswith("regular_"):
+        if name in ("regular_coarser", "regular_finer"):
             work = tempfile.mkdtemp()
             write(os.path.join(HERE, f"{name}.tr.txt"), case, "tr", tempest(case, work))
             shutil.rmtree(work)
