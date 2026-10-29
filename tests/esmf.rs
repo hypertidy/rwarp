@@ -275,3 +275,70 @@ fn spherical_measure_against_spherical_esmf() {
         }
     }
 }
+
+// ---- what ESMF's spherical cells are -------------------------------------------
+
+fn unit(lon: f64, lat: f64) -> [f64; 3] {
+    let (l, p) = (lon.to_radians(), lat.to_radians());
+    [p.cos() * l.cos(), p.cos() * l.sin(), p.sin()]
+}
+
+/// Area of the spherical triangle with great-circle sides through unit
+/// vectors a, b, c (Van Oosterom and Strackee).
+fn triangle(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+    let dot = |u: [f64; 3], v: [f64; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let cross = [b[1] * c[2] - b[2] * c[1], b[2] * c[0] - b[0] * c[2], b[0] * c[1] - b[1] * c[0]];
+    2.0 * dot(a, cross).abs().atan2(1.0 + dot(a, b) + dot(b, c) + dot(c, a))
+}
+
+/// ESMF's spherical cells are the quadrilaterals whose corners are the
+/// destination cell corners and whose sides are great circles: its `area_b`
+/// is their area (spherical excess) to rounding. rwarp's cells under the
+/// spherical measure are bounded by the corners joined straight in source
+/// pixel space instead (parallels and meridians between regular lon/lat
+/// grids), so the remaining differences in `tests/esmf.rs` are this
+/// difference of definition, not arithmetic.
+#[test]
+fn esmf_cells_are_great_circle_quadrilaterals() {
+    for name in ["regular_coarser", "regular_finer", "regular_overhang"] {
+        let fx = read_fixture(&format!("{name}.sph.txt"));
+        let [dw, dh] = fx.nums::<2>("dst_size").map(|v| v as usize);
+        let g: [f64; 6] = fx.nums("dst_gt");
+        let (mut worst, mut box_vs_gc): (f64, f64) = (0.0, 0.0);
+        for r in 0..dh {
+            for c in 0..dw {
+                let p = |dc: usize, dr: usize| {
+                    let (x, y) = ((c + dc) as f64, (r + dr) as f64);
+                    (g[0] + x * g[1], g[3] + y * g[5])
+                };
+                let [a, b, cc, d] = [p(0, 0), p(1, 0), p(1, 1), p(0, 1)].map(|(lon, lat)| unit(lon, lat));
+                let gc = triangle(a, b, cc) + triangle(a, cc, d);
+                let e = fx.area_b[r * dw + c];
+                worst = worst.max(((e - gc) / gc).abs());
+                // the same cell bounded by parallels
+                let ((l0, p0), (l1, p1)) = (p(0, 0), p(1, 1));
+                let lonlat_box = (l1 - l0).abs().to_radians() * (p0.to_radians().sin() - p1.to_radians().sin()).abs();
+                box_vs_gc = box_vs_gc.max(((lonlat_box - gc) / gc).abs());
+            }
+        }
+        eprintln!("{name:16} ESMF area_b vs great-circle quadrilateral: {worst:.2e}; parallel-bounded box vs it: {box_vs_gc:.2e}");
+        assert!(worst < 1e-9, "{name}: ESMF area_b is not the great-circle quadrilateral: {worst:e}");
+        assert!(box_vs_gc > 1e-6, "{name}: the two definitions should differ visibly");
+    }
+}
+
+/// TempestRemap (a second, independent implementation of the same
+/// great-circle cells) against ESMF, and rwarp's spherical measure against
+/// TempestRemap, for the cases between regular lon/lat grids.
+#[test]
+fn tempestremap_agrees_with_esmf() {
+    for name in ["regular_coarser", "regular_finer", "regular_overhang"] {
+        let (tr, esmf) = (read_fixture(&format!("{name}.tr.txt")), read_fixture(&format!("{name}.sph.txt")));
+        let as_ours = |f: &Fixture| Ours { s: f.s.clone(), frac_b: f.frac_b.clone(), area_b: f.area_b.clone() };
+        let d = diff(&esmf, &as_ours(&tr));
+        let area = tr.area_b.iter().zip(&esmf.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
+        eprintln!("{name:16} TempestRemap vs ESMF: {d:?}, max relative area difference {area:.2e}");
+        let r = diff(&tr, &ours(&tr, 1, true));
+        eprintln!("{name:16} rwarp (sphere) vs TempestRemap: {r:?}");
+    }
+}
