@@ -228,6 +228,28 @@ dependency-free and index-space-only (m20 section 2.1). Its input is still
 rings in index space, plus the affine map from index to (λ, φ). The C++ port
 is the same per-edge formula.
 
+**Status (2026-10-29): done.** controlledburn's `Measure::CosLatitude` takes
+the other form of Green's theorem, `area = ∮ x w(y) dy` with `w = cos φ(y)`,
+which keeps `CoverageWindow`'s row accumulation unchanged: each piece books
+the closed-form integrals of `w dy` and `(x - k) w dy` (x is linear in y
+along a piece), and coverage is divided by the cell's measure. rwarp's
+`WeightOptions::with_measure(lonlat_measure(src_gt))` uses it. Results:
+
+- Exact: regular lon/lat to regular lon/lat weights equal the closed-form
+  box overlaps on the sphere to 1e-14 (`tests/weights.rs`).
+- Against ESMF (`tests/esmf.rs`), the remaining differences are the edge
+  definition, not the measure. ESMF joins a cell's corners with great
+  circles, which bow poleward of the parallels: 0.007 degrees over a 2.5
+  degree cell at 40 S. So regular_coarser and regular_finer stay at about
+  1e-3 and 5e-3 in S (the planar numbers were 7e-4 and 6e-3, partly
+  compensating), regular_overhang drops from 6e-4 to 8e-7 (the bows of
+  equal cells cancel), and the projected cases at densify 8 drop from
+  1.2e-3 to 2.0e-4 (rotated pole) and 1.6e-3 to 5.2e-4 (EPSG:3031).
+- Which edges are right depends on the grid: CF lon/lat cells are bounded
+  by parallels, which is what rwarp now measures exactly; ESMF's great
+  circles are a different cell. 5.2 adds great circles as an option, not a
+  replacement.
+
 ### 5.2 Great-circle edges: bigcurve
 
 A great-circle edge is a curve in (λ, φ). bigcurve's great-circle edge model
