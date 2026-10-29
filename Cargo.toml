@@ -12,9 +12,7 @@ description = "GDAL warp pipeline in Rust: coordinate transforms, approximate tr
 repository = "https://github.com/hypertidy/rwarp"
 keywords = ["gdal", "warp", "geospatial", "raster", "reprojection"]
 categories = ["science::geo"]
-# Test fixtures (about 12 MB) stay in the repository: from the packaged
-# crate, tests/get-fixtures.sh fetches them for this version.
-exclude = ["*.Rproj", ".Rproj.user", ".Rhistory", "rwarp-wasm", "tests/fixtures"]
+exclude = ["*.Rproj", ".Rproj.user", ".Rhistory", "rwarp-wasm"]
 
 [features]
 # Default: bind to libproj via the `proj` crate (full PROJ: proj.db, WKT,
