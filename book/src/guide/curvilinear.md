@@ -94,6 +94,25 @@ Outside the raster GDAL's search also succeeds at more points (squares
 further than one beyond the top and left edges, within its search radius),
 which no kernel reads.
 
+## Cells for coverage: `QuadMesh`
+
+The geolocation transformer is GDAL's point model. For coverage and
+area methods, `rwarp::mesh::QuadMesh` treats the same grid as cells: the
+straight-edged quadrilaterals through the corners (`from_corners`, or
+`from_centres` with corners at the mean of four centres). It maps world
+points to index space and back, and finds the owning cell, optionally
+walking from a hint.
+
+`CellMap::Bilinear` is GDAL's interior map (and matches
+`GeolocArrays::geo_to_pixel` with corner samples). `CellMap::EqualArea`
+splits each cell into four triangles so that areas in index space are
+the same fractions of the cell as in the world. That is what makes a
+burn in index space give world-area coverage on a curvilinear grid
+(`design/curvilinear-frontend.md`). The module needs no CRS backend.
+
+The module is unstable: stage 1 of the front end. The ring walk that
+moves whole polygons into index space comes next.
+
 ## Other differences from GDAL
 
 - rwarp treats NaN samples as missing, as well as the X array's nodata
