@@ -713,7 +713,7 @@ impl Transformer for GeolocArrays {
 /// 0 = (i, j), 1 = (i, j + 1), 2 = (i + 1, j), 3 = (i + 1, j + 1), and
 /// `(x, y)` is assumed to lie in the ring (0, 2, 3, 1).
 #[allow(clippy::too_many_arguments)]
-fn inverse_bilinear(
+pub(crate) fn inverse_bilinear(
     x: f64,
     y: f64,
     x0: f64,

@@ -6,6 +6,21 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `mesh` module, stage 1 of `design/curvilinear-frontend.md` (unstable):
+  `QuadMesh` holds a curvilinear grid as straight-edged quadrilateral
+  cells (`from_corners`, `from_centres`), refuses bow-ties and folds,
+  and maps between world coordinates and index space with
+  `CellMap::Bilinear` (GDAL's model; equal to `GeolocArrays::geo_to_pixel`
+  with corner samples, to 1e-9) or `CellMap::EqualArea` (four triangles
+  per cell with matching area shares, so index-space area fractions are
+  world-area fractions; checked to 1e-9 on jittered, non-convex, polar
+  and sheared grids, where the bilinear measure is off by more than
+  1e-3). Every point has at most one owning cell: side orientations are
+  computed once in a canonical direction, and points on a shared wall go
+  to the low-index cell. `locate` walks from a hint and falls back to CSR
+  buckets built on first use; `locate_all` returns every owner (for
+  checks). No CRS: builds with `--no-default-features`.
+  (2026-10-31)
 - A spherical measure for conservative weights (stage 3a of
   `design/conservative.md`): `WeightOptions::with_measure` with
   `weights::lonlat_measure(src_gt)` measures areas on the sphere for a

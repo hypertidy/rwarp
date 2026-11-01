@@ -1,6 +1,19 @@
 # Curvilinear grids: the coverage front end
 
-Status: proposed. Scope: how rwarp moves polygons (and its own
+Status: stage 1 implemented (`src/mesh.rs`, 2026-10-31); later stages
+proposed. Stage 1 as built: `QuadMesh::{from_corners, from_centres}`,
+validation (bow-ties and folds refused, zero-area cells allowed),
+`CellMap::{Bilinear, EqualArea}` with the equal-area split (corner mean
+for convex cells; for non-convex cells the balanced point in the kernel
+that keeps the four triangles furthest from degenerate), ownership by
+canonical side orientation, `locate` with a walking hint, `locate_all`,
+and CSR buckets built on first use. Not yet: `Topology` (only the bounded
+case exists, so there is no enum), `from_cf_bounds`, the boundary index
+(it belongs with the walk in stage 2). Decisions 1 to 5 below are taken
+at their recommendations, provisionally; `mesh` is public and documented
+as unstable until a second consumer uses it.
+
+Scope: how rwarp moves polygons (and its own
 destination pixel outlines) into the index space of a curvilinear grid so
 that controlledburn's unchanged engine gives exact coverage there. It is
 stage 4 of hypertidy/controlledburn-rs#7, re-homed per wxylib's m20:
