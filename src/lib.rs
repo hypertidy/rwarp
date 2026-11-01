@@ -58,7 +58,7 @@
 //! | [`transform`] | `Transformer` trait, `GenImgProjTransformer` | `GDALGenImgProjTransform` |
 //! | [`gcp_transform`] | `GcpTransformer` (polynomial order 1–3) | `GDALGCPTransform` |
 //! | [`geoloc_transform`] | `GeolocArrays`, `GenImgGeolocTransformer` (curvilinear source and/or target) | `GDALGeoLocTransform`, `GDALGenImgProjTransform` with geolocation arrays |
-//! | [`mesh`] | `QuadMesh`: curvilinear grids as straight-edged cells, `CellMap::{Bilinear, EqualArea}`, world to index space with hints (no CRS) | none (coverage front end, `design/curvilinear-frontend.md`) |
+//! | [`mesh`] | `QuadMesh`: curvilinear grids as straight-edged cells, `CellMap::{Bilinear, EqualArea}`, world to index space with hints, the ring walk and burns with exact world-area coverage; `Rectilinear` (no CRS) | none (coverage front end, `design/curvilinear-frontend.md`) |
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `compute_source_window` (one window, quick) | `ComputeSourceWindow` |
 //! | [`plan`] | `plan_chunks`, `ChunkPlanner`, `warp_chunks`: gdalwarp's chunk list, source windows and per-chunk kernel scale as values | `GDALWarpOperation::CollectChunkList`, `ComputeSourceWindow` |

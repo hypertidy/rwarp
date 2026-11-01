@@ -6,6 +6,28 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- The curvilinear front end, stage 2 of `design/curvilinear-frontend.md`
+  (unstable): `QuadMesh::ring_to_index` walks a world ring into the
+  mesh's index space, cutting each segment at every cell side and
+  split spoke it crosses (Cyrus-Beck clipping per triangle over a flood
+  of the cells it passes, so vertices, corners and centres on a segment
+  need no special case). A cut point is placed by its parameter along
+  the edge's canonical direction, so rings sharing an edge get bitwise
+  the same point. Stretches outside the mesh are replaced by the boundary
+  arc whose loop with the excursion does not wind around the mesh; a
+  ring around the whole mesh gives its outline. `QuadMesh::burn` burns
+  polygons (holes, multipolygons) and points through controlledburn with
+  the mesh's own `(row, col)` and fractions of each cell's world area;
+  `QuadMesh::cover_ring` does one small ring through a reused
+  `CoverageWindow`. `mesh::Rectilinear` is the same for grids given by
+  column and row edges (cut at every wall, piecewise linear per axis).
+  Checked against world-space clipping of every cell (Sutherland-Hodgman
+  per split triangle) on rotated, jittered, non-convex, polar, sheared
+  and flipped meshes with polygons crossing the boundary, holes and
+  vertices steered onto corners and centres; against the affine burn
+  for a rotated grid; and rectilinear against the mesh, all to 2e-6
+  (controlledburn's `f32` fractions). Lines and approx mode are refused
+  for now. (2026-11-01)
 - `mesh` module, stage 1 of `design/curvilinear-frontend.md` (unstable):
   `QuadMesh` holds a curvilinear grid as straight-edged quadrilateral
   cells (`from_corners`, `from_centres`), refuses bow-ties and folds,
