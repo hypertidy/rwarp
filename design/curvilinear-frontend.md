@@ -1,7 +1,16 @@
 # Curvilinear grids: the coverage front end
 
-Status: stage 1 implemented (`src/mesh.rs`, 2026-10-31); later stages
-proposed. Stage 1 as built: `QuadMesh::{from_corners, from_centres}`,
+Status: stages 1 and 2 implemented (`src/mesh.rs`, `src/mesh/walk.rs`,
+`src/mesh/rect.rs`; 2026-10-31 and 2026-11-01); later stages proposed.
+Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
+from the first point's cell, or from crossed boundary sides, and each
+segment clipped by every triangle it meets; cut points placed by their
+parameter along the canonical edge; off-mesh stretches closed by the
+boundary arc of zero winding), `QuadMesh::burn` (polygons, points),
+`QuadMesh::cover_ring` (`CoverageWindow`), `Rectilinear`. Not yet: lines,
+snapping of near-degenerate vertices (no property-test failure without
+it so far), a boundary index (crossed boundary sides are found by a scan
+when a segment leaves the mesh). Stage 1 as built: `QuadMesh::{from_corners, from_centres}`,
 validation (bow-ties and folds refused, zero-area cells allowed),
 `CellMap::{Bilinear, EqualArea}` with the equal-area split (corner mean
 for convex cells; for non-convex cells the balanced point in the kernel

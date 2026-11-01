@@ -1,7 +1,7 @@
 //! Quadrilateral meshes: curvilinear grids as cells, for coverage.
 //!
-//! Stage 1 of `design/curvilinear-frontend.md`, and unstable: the API may
-//! change while the ring walk (stage 2) is built on it. A [`QuadMesh`] holds the
+//! Stages 1 and 2 of `design/curvilinear-frontend.md`, and unstable: the
+//! API may change until a second consumer uses it. A [`QuadMesh`] holds the
 //! `(nrow + 1) x (ncol + 1)` corners of a curvilinear grid, validates
 //! them, and maps points between the grid's own coordinates ("world", in
 //! whatever CRS the corners are given in) and its index space: fractional
@@ -27,8 +27,20 @@
 //! interior map differs.
 //!
 //! No CRS is involved: the module builds with `--no-default-features`.
-//! The walk that moves whole rings into index space (stage 2) builds on
-//! this.
+//!
+//! # Rings and burns
+//!
+//! [`QuadMesh::ring_to_index`] moves a whole world ring into index space
+//! (under [`CellMap::EqualArea`]): every segment is cut where it crosses a
+//! cell side or a spoke of the four-triangle split, each cut point placed
+//! by its parameter along that edge (so neighbouring rings get bitwise the
+//! same point), and any stretch outside the mesh is replaced by an arc of
+//! the mesh boundary. Burning the result with controlledburn gives each
+//! cell's covered fraction of its world area, exactly for polygons with
+//! straight edges in the corners' coordinates. [`QuadMesh::burn`] does
+//! that for polygons and points, [`QuadMesh::cover_ring`] for one small
+//! ring through a reused `CoverageWindow`. [`Rectilinear`] is the same
+//! front end for grids given by column and row edges.
 //!
 //! # Ownership
 //!
@@ -64,6 +76,11 @@
 //! ```
 
 use std::sync::OnceLock;
+
+mod rect;
+mod walk;
+
+pub use rect::Rectilinear;
 
 use crate::geoloc_transform::inverse_bilinear;
 

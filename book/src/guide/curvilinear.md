@@ -110,8 +110,46 @@ the same fractions of the cell as in the world. That is what makes a
 burn in index space give world-area coverage on a curvilinear grid
 (`design/curvilinear-frontend.md`). The module needs no CRS backend.
 
-The module is unstable: stage 1 of the front end. The ring walk that
-moves whole polygons into index space comes next.
+`QuadMesh::burn` takes polygons and points in the grid's coordinates
+and returns controlledburn's tables with the grid's own `(row, col)`:
+fractions are of each cell's world area, exact for polygon edges that
+are straight in those coordinates (densify polygons from another CRS
+first). It walks each ring through the cells' triangles, inserting a
+vertex wherever the ring crosses a cell side or split spoke, and closes
+any part outside the grid along the grid's boundary.
+`QuadMesh::cover_ring` does the same for one small ring into a reused
+`CoverageWindow`, and `mesh::Rectilinear` is the front end for grids
+given by column and row edges. Lines and approx mode are not supported
+yet.
+
+```rust,ignore
+use controlledburn::{BurnOptions, Coord, Geometry, Polygon};
+use rwarp::mesh::{CellMap, QuadMesh};
+
+let (ncol, nrow) = (3, 2);
+let (mut x, mut y) = (Vec::new(), Vec::new());
+for j in 0..=nrow {
+    for i in 0..=ncol {
+        let (r, a) = (10.0 + 5.0 * j as f64, (30.0 * i as f64).to_radians());
+        x.push(r * a.cos());
+        y.push(r * a.sin());
+    }
+}
+let mesh = QuadMesh::from_corners(ncol, nrow, x, y, CellMap::EqualArea).unwrap();
+let ring = vec![
+    Coord { x: 5.0, y: 5.0 },
+    Coord { x: 30.0, y: 5.0 },
+    Coord { x: 30.0, y: 12.0 },
+    Coord { x: 5.0, y: 12.0 },
+    Coord { x: 5.0, y: 5.0 },
+];
+let res = mesh
+    .burn(&[Geometry::Polygon(Polygon { rings: vec![ring] })], BurnOptions::coverage())
+    .unwrap();
+assert!(!res.edges.is_empty());
+```
+
+The module is unstable until a second consumer uses it.
 
 ## Other differences from GDAL
 
