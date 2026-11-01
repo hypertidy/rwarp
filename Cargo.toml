@@ -12,7 +12,7 @@ description = "GDAL warp pipeline in Rust: coordinate transforms, approximate tr
 repository = "https://github.com/hypertidy/rwarp"
 keywords = ["gdal", "warp", "geospatial", "raster", "reprojection"]
 categories = ["science::geo"]
-exclude = ["*.Rproj", ".Rproj.user", ".Rhistory", "rwarp-wasm"]
+exclude = ["*.Rproj", ".Rproj.user", ".Rhistory", "rwarp-wasm", "rwarp-r"]
 
 [features]
 # Default: bind to libproj via the `proj` crate (full PROJ: proj.db, WKT,
@@ -46,4 +46,4 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [workspace]
-exclude = ["rwarp-wasm"]
+exclude = ["rwarp-wasm", "rwarp-r"]

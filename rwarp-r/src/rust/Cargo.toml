@@ -1,0 +1,25 @@
+[package]
+name = "rwarp-r"
+version = "0.1.0"
+edition = "2021"
+authors = ["Michael Sumner <mdsumner@gmail.com>"]
+
+[lib]
+crate-type = ["staticlib"]
+name = "rwarp_r"
+
+[dependencies]
+extendr-api = "0.7"
+proj-sys = "0.27"
+# Use crates.io release; for local development with a rwarp checkout, replace with:
+# rwarp = { path = "../../../../rwarp" }
+rwarp = "0.3.1"
+vaster = "0.1.0"
+flate2 = "1"
+# ZSTD for future tile decompression
+# zstd = "0.13"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1

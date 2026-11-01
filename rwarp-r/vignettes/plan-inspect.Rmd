@@ -1,0 +1,147 @@
+---
+title: "Warp Planning: Inspect Before You Read"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Warp Planning: Inspect Before You Read}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+## The plan/execute split
+
+A conventional warp pipeline reads source data and reprojects it in one step.
+**rwarp** separates these into two explicit phases:
+
+1. `warp_plan()` — pure geometry; no I/O. Returns the source windows and
+   destination sub-windows needed. Inspect, cache, or parallelise this.
+2. `warp_exec()` (or `warp_resample()`) — the actual pixel work, driven by
+   a user-supplied `read_fn`.
+
+This means you can:
+
+- **Inspect fill ratios** before deciding whether to fetch data at all.
+- **Cache plans** when the same destination grid is reused across many dates.
+- **Swap the reader** between GDAL, HTTP byte-refs, Zarr, or in-memory buffers
+  without touching the warp logic.
+- **Parallelise** by distributing chunks across workers.
+
+## Anatomy of a plan
+
+```{r plan_structure}
+library(rwarp)
+library(vaster)
+
+## A 10-degree-per-pixel global source
+src_gt  <- c(-180, 10, 0, 90, 0, -10)   # 36 x 18 grid
+src_dim <- c(36L, 18L)
+
+## A Web Mercator destination at ~156 km/pixel (zoom 1)
+dst_gt  <- c(-20037508, 156543, 0, 20037508, 0, -156543)
+dst_dim <- c(256L, 256L)
+
+plan <- warp_plan(
+  src_crs  = "EPSG:4326", src_gt = src_gt, src_dim = src_dim,
+  dst_crs  = "EPSG:3857", dst_gt = dst_gt,
+  dst_off  = c(0L, 0L), dst_size = dst_dim
+)
+
+cat("Length of plan:", length(plan), "\n")
+cat("Chunks in first group:", length(plan[[1]]), "\n")
+
+ch <- plan[[1]][[1]]
+cat("\nChunk fields:\n")
+str(ch)
+```
+
+## Fill ratio
+
+The fill ratio tells you what fraction of the destination window has a valid
+source pixel.  Values below 1 indicate that the source does not fully cover
+the destination.
+
+```{r fill}
+## A high-latitude destination that only partially overlaps the source
+## (global geographic source, destination tile near the North Pole in LAEA)
+src_gt2  <- c(-180, 1, 0, 90, 0, -1)
+src_dim2 <- c(360L, 180L)
+
+dst_gt2  <- c(-500000, 5000, 0, 500000, 0, -5000)   # 1000 km at North Pole
+dst_dim2 <- c(200L, 200L)
+
+plan2 <- warp_plan(
+  src_crs  = "EPSG:4326",
+  src_gt   = src_gt2,
+  src_dim  = src_dim2,
+  dst_crs  = "+proj=laea +lat_0=90 +datum=WGS84 +type=crs",
+  dst_gt   = dst_gt2,
+  dst_off  = c(0L, 0L), dst_size = dst_dim2
+)
+
+if (!is.null(plan2)) {
+  cat("Fill ratio:", plan2[[1]][[1]]$fill_ratio, "\n")
+} else {
+  cat("No overlap (NULL plan)\n")
+}
+```
+
+## Antimeridian splitting
+
+For source rasters that cross the antimeridian (e.g. a Pacific-centred
+projection), `warp_plan()` may return two chunk-lists: one for each side.
+
+```{r antimeridian}
+## Pacific-centred destination (centred on 180 E)
+dst_gt3  <- c(160 - 180, 1, 0, 10, 0, -1)   # simple illustration
+dst_dim3 <- c(40L, 20L)
+
+plan3 <- warp_plan(
+  src_crs  = "EPSG:4326",
+  src_gt   = c(-180, 1, 0, 90, 0, -1),
+  src_dim  = c(360L, 180L),
+  dst_crs  = "EPSG:4326",
+  dst_gt   = dst_gt3,
+  dst_off  = c(0L, 0L), dst_size = dst_dim3
+)
+cat("Chunk groups (expect 1 or 2 at antimeridian):", length(plan3), "\n")
+```
+
+## Tiled execution loop
+
+For large destinations, tile the output and call `warp_plan()` + `warp_exec()`
+per tile.  This caps memory usage and enables parallel execution:
+
+```{r tiled_loop, eval = FALSE}
+tile_size <- 512L
+ncol_full <- 4000L; nrow_full <- 3000L
+
+results <- vector("list", ceiling(ncol_full / tile_size) * ceiling(nrow_full / tile_size))
+k <- 1L
+
+for (tx in seq(0L, ncol_full - 1L, by = tile_size)) {
+  for (ty in seq(0L, nrow_full - 1L, by = tile_size)) {
+    tw <- min(tile_size, ncol_full - tx)
+    th <- min(tile_size, nrow_full - ty)
+
+    plan_tile <- warp_plan(
+      src_crs = src_crs, src_gt = src_gt, src_dim = as.integer(src_dim),
+      dst_crs = dst_crs, dst_gt = dst_gt,
+      dst_off  = c(tx, ty),
+      dst_size = c(tw, th)
+    )
+    if (is.null(plan_tile)) next
+
+    tile_result <- warp_exec(
+      plan_tile, read_fn,
+      src_crs, src_gt, dst_crs, dst_gt,
+      dst_size = c(tw, th),
+      nodata = nodata
+    )
+    results[[k]] <- list(result = tile_result, xoff = tx, yoff = ty, w = tw, h = th)
+    k <- k + 1L
+  }
+}
+```

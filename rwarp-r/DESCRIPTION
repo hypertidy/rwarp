@@ -1,0 +1,32 @@
+Package: rwarp
+Title: Plannable Raster Warp via Rust (rwarp)
+Version: 0.1.0.9000
+Authors@R:
+    person("Michael", "Sumner", , "mdsumner@gmail.com", role = c("aut", "cre"))
+Description: Provides R bindings to the rwarp Rust crate: a GDAL-style raster
+    warp pipeline implemented in pure Rust using the proj crate for coordinate
+    transforms. The package exposes a plannable, inspectable warp workflow where
+    the chunk plan (source windows, fill ratios) can be examined before
+    execution, and the read function is user-swappable (GDAL, byte-ref COG,
+    Zarr). Core functions replace vapour::gdal_raster_data() and related
+    gdal_raster_* utilities for common reprojection tasks.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+SystemRequirements: Rust (>= 1.75), cargo, PROJ (>= 9.0)
+Imports:
+    vaster
+Suggests:
+    gdalraster,
+    reproj,
+    vapour,
+    terra,
+    knitr,
+    rmarkdown,
+    ximage,
+    testthat (>= 3.0.0)
+Config/rextendr/version: 0.3.1
+VignetteBuilder: knitr
+URL: https://github.com/hypertidy/rwarp
+BugReports: https://github.com/hypertidy/rwarp/issues
+Config/roxygen2/version: 8.1.0

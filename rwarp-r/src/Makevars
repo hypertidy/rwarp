@@ -1,0 +1,22 @@
+TARGET_DIR = ./rust/target
+LIBDIR = $(TARGET_DIR)/release
+STATLIB = $(LIBDIR)/librwarp_r.a
+PKG_LIBS = -L$(LIBDIR) -lrwarp_r -lpthread -lm -ldl $(shell pkg-config --libs proj)
+
+all: C_clean
+
+$(SHLIB): $(STATLIB)
+
+CARGOTARGET = $(shell bash -c 'uname -m')-unknown-linux-gnu
+
+$(STATLIB):
+	if [ -f "$(LIBDIR)/librwarp_r.a" ]; then exit 0; fi && \
+		cargo build --lib --release --manifest-path=./rust/Cargo.toml \
+		--target-dir $(TARGET_DIR)
+
+C_clean:
+	rm -Rf $(SHLIB) $(STATLIB) $(OBJECTS)
+
+clean:
+	rm -Rf $(SHLIB) $(STATLIB) $(OBJECTS)
+	cargo clean --manifest-path=./rust/Cargo.toml

@@ -1,0 +1,179 @@
+---
+title: "Sentinel-2: Reproject from UTM to Albers Equal Area"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Sentinel-2: Reproject from UTM to Albers Equal Area}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE, comment = "#>",
+  eval = identical(Sys.getenv("VWARP_VIGNETTES"), "true")
+)
+```
+
+## Overview
+
+This vignette shows the canonical **rwarp** workflow for reprojecting a
+Sentinel-2 Band 4 COG tile from its native UTM projection (EPSG:32755) to US
+Albers Equal Area (EPSG:5070).
+
+The workflow has three steps:
+
+1. **Plan** — call `warp_plan()` to compute the source window(s) needed.
+   This is pure geometry: no data is read yet.
+2. **Read** — supply a reader function.  Here we use `gdalraster::GDALRaster`,
+   but the same function signature works for byte-ref COG tiles, Zarr chunks, etc.
+3. **Execute** — call `warp_exec()` with the plan and reader.
+
+```{r libraries}
+library(rwarp)
+library(gdalraster)
+library(vaster)
+library(reproj)
+```
+
+## Source raster
+
+We use a public Sentinel-2 COG from the Element 84 Earth Search STAC.  The
+`/vsicurl/` prefix lets GDAL stream range requests without downloading the file.
+
+```{r source}
+url <- paste0(
+  "/vsicurl/https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com",
+  "/sentinel-2-c1-l2a/55/G/CM/2026/2/S2C_T55GCM_20260227T000650_L2A/B04.tif"
+)
+
+ds      <- new(GDALRaster, url, read_only = TRUE)
+src_crs <- ds$getProjectionRef()
+src_gt  <- ds$getGeoTransform()
+src_dim <- c(ds$getRasterXSize(), ds$getRasterYSize())
+nodata  <- ds$getNoDataValue(1L)
+if (is.na(nodata)) nodata <- 0L
+
+cat("Source CRS:", substr(src_crs, 1, 40), "...\n")
+cat("Source geotransform:", paste(src_gt, collapse = ", "), "\n")
+cat("Source dimensions:", src_dim, "\n")
+```
+
+## Destination grid
+
+We reproject the bounding box of the source tile into EPSG:5070 and build a
+destination geotransform at 10 m resolution.
+
+```{r destination}
+dst_crs  <- "EPSG:5070"
+
+## Reproject the source bounding box into the destination CRS
+bbox_ll  <- ds$bbox()[c(1, 3, 2, 4)]   # c(xmin, xmax, ymin, ymax)
+dst_ext  <- reproj_extent(bbox_ll, target = dst_crs, source = src_crs)
+cat("Destination extent (EPSG:5070):", dst_ext, "\n")
+
+## 10-metre pixels; round up to whole pixels
+dst_dim  <- as.integer(ceiling(diff(dst_ext[c(1, 2, 3, 4)][c(1, 3)] * c(1, -1)) / 10))
+dst_dim  <- as.integer(c(
+  ceiling((dst_ext[2] - dst_ext[1]) / 10),
+  ceiling((dst_ext[4] - dst_ext[3]) / 10)
+))
+dst_gt   <- extent_dim_to_gt(dst_ext, dst_dim)
+cat("Destination dimensions:", dst_dim, "\n")
+```
+
+## Step 1: Plan
+
+`warp_plan()` computes all source windows needed to fill the destination
+without touching the file.  Inspect it before committing to I/O.
+
+```{r plan}
+plan <- warp_plan(
+  src_crs  = src_crs, src_gt  = src_gt,  src_dim = as.integer(src_dim),
+  dst_crs  = dst_crs, dst_gt  = dst_gt,
+  dst_off  = c(0L, 0L), dst_size = as.integer(dst_dim),
+  resample_padding = 1L
+)
+
+cat("Number of chunk-lists:", length(plan), "\n")
+for (i in seq_along(plan)) {
+  for (j in seq_along(plan[[i]])) {
+    ch <- plan[[i]][[j]]
+    cat(sprintf(
+      "  [%d][%d] src window [%d,%d] %dx%d  fill=%.3f\n",
+      i, j, ch$src_xoff, ch$src_yoff, ch$src_xsize, ch$src_ysize, ch$fill_ratio
+    ))
+  }
+}
+```
+
+## Step 2: Define the read function
+
+The read function has a fixed signature `f(xoff, yoff, xsize, ysize)` and
+returns an integer vector in row-major order.  Swap this out for any other
+source (byte-ref tiles, Zarr, etc.) without changing the plan or execute steps.
+
+```{r read_fn}
+read_fn <- function(xoff, yoff, xsize, ysize) {
+  as.integer(
+    ds$read(1L, xoff = xoff, yoff = yoff,
+            xsize = xsize, ysize = ysize,
+            out_xsize = xsize, out_ysize = ysize)
+  )
+}
+```
+
+## Step 3: Execute
+
+```{r execute}
+result <- warp_exec(
+  plan      = plan,
+  read_fn   = read_fn,
+  src_crs   = src_crs, src_gt = src_gt,
+  dst_crs   = dst_crs, dst_gt = dst_gt,
+  dst_size  = as.integer(dst_dim),
+  nodata    = as.integer(nodata),
+  resample  = "near",
+  verbose   = TRUE
+)
+
+cat("Result range:", range(result, na.rm = TRUE), "\n")
+```
+
+## Visualise
+
+```{r visualise, fig.width=7, fig.height=6}
+## Mask nodata (0 = swath edge; out-of-bounds pixels are already NA)
+result[result <= 0L] <- NA
+
+if (requireNamespace("ximage", quietly = TRUE)) {
+  ximage::ximage(result, dst_ext,
+    main = "Sentinel-2 B04 reprojected to EPSG:5070 (Albers)",
+    col  = grey.colors(256))
+} else {
+  image(result, main = "Sentinel-2 B04 (EPSG:5070)")
+}
+
+ds$close()
+```
+
+## Verification: compare with GDAL warp
+
+```{r verify, fig.width=10, fig.height=4}
+tf <- tempfile(tmpdir = "/vsimem", fileext = ".tif")
+ds2 <- new(GDALRaster, url, read_only = TRUE)
+gdalraster::warp(ds2, tf, t_srs = dst_crs,
+  cl_arg = c("-ts", dst_dim, "-te", dst_ext[c(1, 3, 2, 4)], "-r", "near")
+)
+wds <- new(GDALRaster, tf)
+gdal_result <- matrix(read_ds(wds), nrow = dst_dim[2L], ncol = dst_dim[1L])
+wds$close()
+ds2$close()
+
+gdal_result[gdal_result <= 0L] <- NA
+
+if (requireNamespace("ximage", quietly = TRUE)) {
+  par(mfrow = c(1, 2))
+  ximage::ximage(result,      dst_ext, main = "rwarp",      col = grey.colors(256))
+  ximage::ximage(gdal_result, dst_ext, main = "GDAL warp",  col = grey.colors(256))
+}
+```

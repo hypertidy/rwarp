@@ -1,0 +1,97 @@
+---
+title: "CRS Strings: What PROJ Actually Sees"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{CRS Strings: What PROJ Actually Sees}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+## Motivation
+
+A common source of silent failures in raster reprojection is a CRS string that
+PROJ accepts but interprets differently from what was intended.  The classic
+example is a bare `+proj=` PROJ string: PROJ treats it as a coordinate
+*operation* (a unit conversion or a transformation step) rather than as a full
+CRS definition that includes a datum.
+
+`crs_describe()` calls PROJ directly via the C API and returns every output
+representation it can produce.  This makes it easy to check whether a string
+is being read as a CRS or as an operation, and to convert between formats.
+
+```{r library}
+library(rwarp)
+```
+
+## EPSG codes: the safe baseline
+
+```{r epsg}
+d <- crs_describe("EPSG:4326")
+cat("id:", d$id, "\n")
+cat("WKT2 (first 120 chars):\n")
+cat(substr(d$wkt2_2019, 1, 120), "...\n")
+cat("PROJ4:", d$proj4, "\n")
+```
+
+## Bare PROJ string: treated as an *operation*
+
+Without `+type=crs`, PROJ interprets `+proj=laea` as a conversion step, not a
+CRS.  It has no WKT1 form and no datum information.
+
+```{r bare}
+d_bare <- crs_describe("+proj=laea")
+cat("id:", d_bare$id, "\n")
+cat("description:", d_bare$description, "\n")
+cat("wkt2_2019:", substr(d_bare$wkt2_2019, 1, 60), "...\n")
+```
+
+## Adding +type=crs: now it is a CRS
+
+```{r typed}
+d_typed <- crs_describe("+proj=laea +datum=WGS84 +type=crs")
+cat("id:", d_typed$id, "\n")
+cat("description:", d_typed$description, "\n")
+cat("WKT2 (first 200 chars):\n")
+cat(substr(d_typed$wkt2_2019, 1, 200), "...\n")
+```
+
+## EPSG:3412 (Antarctic Polar Stereographic)
+
+```{r polar}
+d3412 <- crs_describe("EPSG:3412")
+cat("id:", d3412$id, "\n")
+cat("description:", d3412$description, "\n")
+cat("PROJ4:", d3412$proj4, "\n")
+```
+
+## WKT as input
+
+`crs_describe()` accepts WKT strings too.  You can round-trip from EPSG to WKT
+and back:
+
+```{r wkt}
+wkt <- crs_describe("EPSG:32755")$wkt1_gdal
+cat("WKT1 (first 100 chars):", substr(wkt, 1, 100), "...\n")
+
+d_from_wkt <- crs_describe(wkt)
+cat("Round-trip id:", d_from_wkt$id, "\n")
+```
+
+## Quick validity check helper
+
+A simple function that flags whether a string is recognised as a CRS:
+
+```{r check}
+is_crs <- function(x) {
+  d <- crs_describe(x)
+  is.na(d$error) && !is.na(d$wkt1_gdal)
+}
+
+is_crs("EPSG:4326")
+is_crs("+proj=laea")                         # FALSE - operation, not CRS
+is_crs("+proj=laea +datum=WGS84 +type=crs")  # TRUE
+```
