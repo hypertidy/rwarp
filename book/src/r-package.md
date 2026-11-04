@@ -175,8 +175,8 @@ vignette("plan-inspect",    package = "rwarp")
 
 ## Relationship to vapour
 
-rwarp is designed to replace `vapour::gdal_raster_data()` and the
-`gdal_raster_*` family for warp use-cases. The key differences are:
+rwarp has the same feature set in mind as `vapour::gdal_raster_data()` and
+the `gdal_raster_*` family. A few things the pipeline adds:
 
 - The read step is **user-supplied**: any source, not just GDAL files.
 - The plan is **inspectable**: fill ratios and source windows are

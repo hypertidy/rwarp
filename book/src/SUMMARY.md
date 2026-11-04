@@ -4,6 +4,7 @@
 
 - [Getting started](getting-started.md)
 - [R package](r-package.md)
+- [Python package](python-package.md)
 
 # Guide
 

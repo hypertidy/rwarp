@@ -9,8 +9,8 @@ This folder is the R package rwarp, bindings to the rwarp Rust crate in the root
 of this repository: a GDAL-style warp pipeline
 implemented in pure Rust using the proj crate for coordinate transforms.
 
-The design goal is to **replace** `vapour::gdal_raster_data()` and the
-`gdal_raster_*` family with a pipeline where:
+The design has the same feature set in mind as `vapour::gdal_raster_data()` and
+the `gdal_raster_*` family, with a pipeline where:
 
 - The **chunk plan** (source windows, fill ratios) is computed first and can
   be inspected or cached before any I/O is performed.
@@ -119,6 +119,6 @@ Use `crs_describe()` to diagnose any string.
 - [cogcache](https://github.com/hypertidy/cogcache) — earlier R prototype
   (wariirp -> cogcache -> rwarp provenance chain)
 - [vapour](https://github.com/hypertidy/vapour) — GDAL bindings this aims
-  to supplement for warp use-cases
+  — raster I/O package; vapour and rwarp work alongside each other
 - [gdalraster](https://usdaforestservice.github.io/gdalraster/) — GDAL R
   bindings used in examples

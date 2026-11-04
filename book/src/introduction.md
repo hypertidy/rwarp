@@ -68,3 +68,11 @@ See the [R package chapter](r-package.md) or install directly:
 ```r
 remotes::install_github("hypertidy/rwarp", subdir = "rwarp-r")
 ```
+
+## Python package
+
+A Python package lives in the [`rwarp-py/`](https://github.com/hypertidy/rwarp/tree/main/rwarp-py)
+subdirectory. It wraps the same core via [PyO3](https://pyo3.rs/), with
+NumPy arrays as the pixel buffer type. The API shape mirrors the R package.
+See the [Python package chapter](python-package.md). It is in early
+development; contributions are welcome.
