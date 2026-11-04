@@ -1,6 +1,6 @@
 # Notes on rwarp Rust API compatibility
 
-`src/rust/src/lib.rs` is written against rwarp 0.3.1: `transform::GenImgProjTransformer`,
+`src/rust/src/lib.rs` is written against rwarp 0.3.2: `transform::GenImgProjTransformer`,
 `transform::transform_grid`, `approx::ApproxTransformer`, `plan::ChunkPlanner`
 and `warp::warp_resample`.
 
