@@ -1,0 +1,42 @@
+url: https://hypertidy.github.io/rwarp/r/
+
+template:
+  bootstrap: 5
+
+navbar:
+  structure:
+    left:  [intro, reference, articles]
+    right: [rust-book, github]
+  components:
+    rust-book:
+      text: "Rust docs"
+      href: https://hypertidy.github.io/rwarp/
+
+home:
+  links:
+    - text: "rwarp Rust crate"
+      href: https://crates.io/crates/rwarp
+    - text: "Full documentation (book)"
+      href: https://hypertidy.github.io/rwarp/
+
+reference:
+  - title: "Warp pipeline"
+    desc: "Plan source windows, execute reads, and resample."
+    contents:
+      - warp_plan
+      - warp_exec
+      - warp_resample
+  - title: "Utilities"
+    desc: "Pixel coordinate transforms and CRS diagnostics."
+    contents:
+      - pixel_transform
+      - crs_describe
+
+articles:
+  - title: "Worked examples"
+    navbar: ~
+    contents:
+      - sentinel2-warp
+      - ghrsst-polar
+      - plan-inspect
+      - crs-strings

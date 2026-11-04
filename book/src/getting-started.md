@@ -41,7 +41,9 @@ equal-area projection from a Web Mercator tile pyramid. It is
 {{#include ../../examples/tile_laea.rs:12:}}
 ```
 
-The four steps are the whole pipeline:
+The four steps are the whole pipeline. For sources that cross 180 degrees,
+see [Sources across 180 degrees](guide/transformers.md#sources-across-180-degrees)
+before building the transformer.
 
 1. **Transformer.** Maps target pixels to source pixels. Wrapping it in
    `ApproxTransformer` with a 0.125 pixel error, as gdalwarp does by

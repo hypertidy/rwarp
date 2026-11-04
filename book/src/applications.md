@@ -38,6 +38,20 @@ rwarp and gdalwarp together to pin down what gdalwarp actually does: how
 ties are broken, how edges are placed for curvilinear grids, where kernels
 widen. rwarp's fixtures are the evidence for those answers.
 
+## R package
+
+The [`rwarp` R package](r-package.md) wraps the same planning and
+resampling pipeline via [extendr](https://extendr.github.io/).
+Install from the `rwarp-r/` subdirectory of this repository:
+
+```r
+remotes::install_github("hypertidy/rwarp", subdir = "rwarp-r")
+```
+
+It exposes `warp_plan()`, `warp_exec()`, `warp_resample()`,
+`pixel_transform()` and `crs_describe()`. The plan/execute split and
+the user-supplied read function work the same way as in the Rust API.
+
 ## Using rwarp in your project
 
 If you build on rwarp, an issue or pull request adding your project here

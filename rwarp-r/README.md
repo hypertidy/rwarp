@@ -1,5 +1,8 @@
 # rwarp (R package)
 
+[![R-CMD-check](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml)
+[![Crate](https://img.shields.io/crates/v/rwarp.svg)](https://crates.io/crates/rwarp)
+
 **Plannable raster warp via Rust ([rwarp](https://crates.io/crates/rwarp))**
 
 This folder is the R package rwarp, bindings to the rwarp Rust crate in the root
