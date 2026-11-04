@@ -43,6 +43,9 @@ jobs:
           upload-snapshots: true
           build_args: 'c("--no-build-vignettes")'
           args: 'c("--no-manual", "--no-vignettes", "--as-cran")'
+          # Errors only, temporarily, until rwarp-r is ready for CRAN
+          # (Makevars, vendored crates, vignettes); warnings stay in the log.
+          error-on: '"error"'
 
       - name: Show install log
         if: failure()
