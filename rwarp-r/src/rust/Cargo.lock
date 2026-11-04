@@ -282,14 +282,14 @@ dependencies = [
 
 [[package]]
 name = "rwarp"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "990539d6f3ccc5227217416e306423664d92e0dfed89ad977caf73d4aad4a81b"
+checksum = "b8a597dd05caa25142adafa9760b8fde9b8ca97fbc5d04e847175734783a9bcd"
 dependencies = [
  "controlledburn",
  "proj",
  "proj-sys",
- "vaster 0.2.0",
+ "vaster",
 ]
 
 [[package]]
@@ -300,7 +300,6 @@ dependencies = [
  "flate2",
  "proj-sys",
  "rwarp",
- "vaster 0.1.0",
 ]
 
 [[package]]
@@ -403,12 +402,6 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
-
-[[package]]
-name = "vaster"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94970ced4a1eb521bf789f31e0dd409fbee3e451f4636e4d4257d3c51aa92a24"
 
 [[package]]
 name = "vaster"
