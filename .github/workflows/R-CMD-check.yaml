@@ -11,6 +11,12 @@ name: R-CMD-check
 jobs:
   R-CMD-check:
     runs-on: ubuntu-24.04
+    # proj-sys 0.27 needs a system PROJ >= 9.6.2. With Ubuntu 24.04's 9.4 it
+    # builds its own static PROJ into the staticlib, which R's link line does
+    # not complete (undefined sqlite3 symbols) and which would meet apt's 9.4
+    # proj.db at run time. This image has R, Rust and PROJ built from source.
+    container:
+      image: ghcr.io/hypertidy/gdal-r-python-extras-rust:latest
 
     env:
       GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
@@ -19,17 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PROJ and system dependencies
+      - name: Versions
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y libproj-dev proj-bin libgdal-dev gdal-bin
-
-      - name: Install stable Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: r-lib/actions/setup-r@v2
-        with:
-          use-public-rspm: true
+          R --version | head -1
+          cargo --version
+          echo "PROJ $(pkg-config --modversion proj)"
 
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -41,5 +41,12 @@ jobs:
         with:
           working-directory: rwarp-r
           upload-snapshots: true
-          build_args: '--no-build-vignettes'
-          args: '--no-manual --no-vignettes --as-cran'
+          build_args: 'c("--no-build-vignettes")'
+          args: 'c("--no-manual", "--no-vignettes", "--as-cran")'
+          # Errors only, temporarily, until rwarp-r is ready for CRAN
+          # (Makevars, vendored crates, vignettes); warnings stay in the log.
+          error-on: '"error"'
+
+      - name: Show install log
+        if: failure()
+        run: cat rwarp-r/check/rwarp.Rcheck/00install.out || true
