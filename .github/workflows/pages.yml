@@ -2,6 +2,7 @@
 #   /        the book (book/), with the changelog
 #   /demo/   the rwarp-wasm browser demo
 #   /api/    rustdoc for main
+#   /r/      pkgdown site for rwarp-r
 # One-time setup in the repo: Settings -> Pages -> Source: "GitHub Actions".
 name: pages
 
@@ -15,6 +16,7 @@ on:
       - "book/**"
       - "examples/**"
       - "CHANGELOG.md"
+      - "rwarp-r/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -28,6 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── Rust book + wasm demo + API docs ─────────────────────────────────────────
   build:
     runs-on: ubuntu-latest
     steps:
@@ -63,16 +66,116 @@ jobs:
           cp rwarp-wasm/pkg/rwarp_wasm.js rwarp-wasm/pkg/rwarp_wasm_bg.wasm site/demo/pkg/
           # www/ imports ../pkg/...; on the site pkg/ sits beside the demo.
           sed -i 's#"\.\./pkg/#"./pkg/#' site/demo/worker.js site/demo/index.html
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
+          name: rust-site
           path: site
 
+  # ── pkgdown site for rwarp-r ──────────────────────────────────────────────
+  # Uses gdal-r-full which has: R, Rust/cargo, PROJ 9.9, GDAL 3.13,
+  # Quarto CLI, pak, and pkgdown pre-installed. pak is called with
+  # pkg.sysreqs = FALSE so it never apt-installs GDAL/PROJ/GEOS headers
+  # that would shadow the /usr/local builds already in the image.
+  pkgdown:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/hypertidy/gdal-r-full:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: |
+          R --version | head -1
+          cargo --version
+          echo "PROJ $(pkg-config --modversion proj)"
+          echo "GDAL $(gdal-config --version)"
+          quarto --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rwarp-r/src/rust
+
+      - name: Install rwarp-r dependencies
+        # pkg.sysreqs = FALSE: prevent pak from apt-installing libgdal-dev /
+        # libproj-dev which would shadow the /usr/local builds in the image.
+        # vaster and ximage are needed for vignettes; pkgdown/quarto/knitr are
+        # already in the image but listed for explicitness.
+        working-directory: rwarp-r
+        run: |
+          Rscript -e "
+            options(
+              pkg.sysreqs         = FALSE,
+              pkg.sysreqs_update  = FALSE,
+              pkg.sysreqs_db_update = FALSE,
+              Ncpus = parallel::detectCores()
+            )
+            Sys.setenv(PKG_SYSREQS = 'false')
+            pak::pkg_install(
+              c('pkgdown', 'quarto', 'knitr', 'rmarkdown',
+                'vaster', 'ximage', 'gdalraster', 'remotes'),
+              ask = FALSE, upgrade = FALSE
+            )
+          "
+
+      - name: Install rwarp-r
+        working-directory: rwarp-r
+        run: |
+          Rscript -e "
+            options(
+              pkg.sysreqs        = FALSE,
+              pkg.sysreqs_update = FALSE
+            )
+            Sys.setenv(PKG_SYSREQS = 'false')
+            pak::local_install(ask = FALSE)
+          "
+
+      - name: Build pkgdown site
+        working-directory: rwarp-r
+        run: |
+          Rscript -e "
+            pkgdown::build_site(
+              override = list(destination = '../site-r'),
+              preview  = FALSE
+            )
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r-site
+          path: site-r
+
+  # ── Assemble and deploy ───────────────────────────────────────────────────
   deploy:
-    needs: build
+    needs: [build, pkgdown]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
     steps:
+      - name: Download Rust site
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-site
+          path: site
+
+      - name: Download R pkgdown site
+        uses: actions/download-artifact@v4
+        with:
+          name: r-site
+          path: site/r
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
       - id: deployment
         uses: actions/deploy-pages@v4
