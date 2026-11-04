@@ -1,5 +1,6 @@
 # case lonlat_laea: 0.5 degree lon/lat to LAEA centred on Tasmania at 40 km
 # oracle ESMPy 8.9.1 conserve, norm dstarea, spherical, great-circle edges
+# proj 9.9.0
 # src_crs EPSG:4326
 # src_gt 130.0 0.5 0.0 -30.0 0.0 -0.5
 # src_size 70 50

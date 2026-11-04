@@ -1,5 +1,6 @@
 # case regular_coarser: 1 degree to 2.5 x 2 degrees, offset, inside the source
 # oracle ESMPy 8.9.1 conserve, norm dstarea, spherical, great-circle edges
+# proj 9.9.0
 # src_crs EPSG:4326
 # src_gt 100.0 1.0 0.0 -10.0 0.0 -1.0
 # src_size 60 40
