@@ -75,7 +75,7 @@ result <- warp_exec(
 ds$close()
 
 ## result is a flat integer vector, length dst_dim[1] * dst_dim[2]
-image(matrix(result, dst_dim[1], dst_dim[2]))
+ximage::ximage(result, dst_ext)
 ```
 
 Swapping the reader is the point. The same plan works with an HTTP

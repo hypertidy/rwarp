@@ -62,7 +62,7 @@ result <- warp_exec(
   dst_crs = dst_crs, dst_gt = dst_gt,
   dst_size = dst_dim, nodata = -32768L
 )
-image(result)
+ximage::ximage(result, dst_ext)
 ds$close()
 ```
 
