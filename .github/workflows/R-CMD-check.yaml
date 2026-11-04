@@ -41,5 +41,5 @@ jobs:
         with:
           working-directory: rwarp-r
           upload-snapshots: true
-          build_args: '--no-build-vignettes'
-          args: '--no-manual --no-vignettes --as-cran'
+          build_args: 'c("--no-build-vignettes")'
+          args: 'c("--no-manual", "--no-vignettes", "--as-cran")'
