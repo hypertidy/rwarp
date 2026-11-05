@@ -2,8 +2,12 @@
 
 [![R-CMD-check](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml)
 [![Crate](https://img.shields.io/crates/v/rwarp.svg)](https://crates.io/crates/rwarp)
+[![pkgdown site](https://img.shields.io/badge/docs-pkgdown-blue)](https://hypertidy.github.io/rwarp/r/)
 
 **Plannable raster warp via Rust ([rwarp](https://crates.io/crates/rwarp))**
+
+> Full documentation, function reference and vignettes:
+> **<https://hypertidy.github.io/rwarp/r/>**
 
 This folder is the R package rwarp, bindings to the rwarp Rust crate in the root
 of this repository: a GDAL-style warp pipeline
