@@ -1,1 +1,4 @@
 ^NOTES-RUST-API\.md$
+^_pkgdown\.yml$
+^tools/vendor\.sh$
+^src/rust/target$

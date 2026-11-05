@@ -31,21 +31,27 @@ jobs:
           cargo --version
           echo "PROJ $(pkg-config --modversion proj)"
 
+      - uses: r-lib/actions/setup-pandoc@v2
+
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           working-directory: rwarp-r
           extra-packages: any::rcmdcheck
           needs: check
 
+      # As for a CRAN submission: crates vendored into the package, and an
+      # empty NOT_CRAN so tools/config.R builds offline (cargo --offline).
+      - name: Vendor crates
+        run: rwarp-r/tools/vendor.sh
+
       - uses: r-lib/actions/check-r-package@v2
+        env:
+          NOT_CRAN: ""
         with:
           working-directory: rwarp-r
           upload-snapshots: true
-          build_args: 'c("--no-build-vignettes")'
-          args: 'c("--no-manual", "--no-vignettes", "--as-cran")'
-          # Errors only, temporarily, until rwarp-r is ready for CRAN
-          # (Makevars, vendored crates, vignettes); warnings stay in the log.
-          error-on: '"error"'
+          args: 'c("--no-manual", "--as-cran")'
+          error-on: '"warning"'
 
       - name: Show install log
         if: failure()

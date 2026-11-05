@@ -24,7 +24,7 @@ the `gdal_raster_*` family, with a pipeline where:
 
 ## Installation
 
-Requires a Rust toolchain (>= 1.75) and PROJ (>= 9.0):
+Requires a Rust toolchain (>= 1.86), pkg-config, and PROJ (>= 9.6.2):
 
 ```r
 # install.packages("remotes")

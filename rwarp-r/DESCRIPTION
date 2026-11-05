@@ -13,9 +13,8 @@ Description: Provides R bindings to the rwarp Rust crate: a GDAL-style raster
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-SystemRequirements: Rust (>= 1.75), cargo, PROJ (>= 9.0)
-Imports:
-    vaster
+SystemRequirements: Cargo (Rust's package manager), rustc (>= 1.86),
+    PROJ (>= 9.6.2), pkg-config
 Suggests:
     gdalraster,
     reproj,
@@ -24,8 +23,9 @@ Suggests:
     knitr,
     rmarkdown,
     ximage,
-    testthat (>= 3.0.0)
-Config/rextendr/version: 0.3.1
+    testthat (>= 3.0.0),
+    vaster
+Config/rextendr/version: 0.5.0
 VignetteBuilder: knitr
 URL: https://github.com/hypertidy/rwarp
 BugReports: https://github.com/hypertidy/rwarp/issues
