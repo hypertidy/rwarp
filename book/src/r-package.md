@@ -74,7 +74,8 @@ result <- warp_exec(
 )
 ds$close()
 
-## result is a flat integer vector, length dst_dim[1] * dst_dim[2]
+## result is an integer matrix, dst_dim[2] rows by dst_dim[1] columns
+## (warp_resample() instead returns a row-major vector)
 ximage::ximage(result, dst_ext)
 ```
 
