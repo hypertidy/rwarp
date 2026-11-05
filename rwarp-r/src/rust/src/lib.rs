@@ -4,7 +4,10 @@ use proj_sys as ffi;
 use rwarp::approx::ApproxTransformer;
 use rwarp::plan::{ChunkOptions, ChunkPlanner};
 use rwarp::transform::GenImgProjTransformer;
-use rwarp::warp::ResampleAlg;
+use rwarp::warp::{
+    BandNodata, DstNodata, KernelScaling, ModeTies, Nodata, ResampleAlg, Sample, SourceBuffer,
+    WarpOptions,
+};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -42,13 +45,124 @@ fn transformer(src_crs: &str, src_gt: &[f64], dst_crs: &str, dst_gt: &[f64]) -> 
         .unwrap_or_else(|e| throw_r_error(&e))
 }
 
+/// The transformer as gdalwarp builds it: with the source size (so source
+/// longitudes wrap at GDAL's CENTER_LONG) and the target extent of the full
+/// destination grid (gdalwarp's -te).
+fn transformer_gdal(
+    src_crs: &str, src_gt: &[f64], src_size: [usize; 2],
+    dst_crs: &str, dst_gt: &[f64], dst_full: [usize; 2],
+) -> GenImgProjTransformer {
+    let g = dst_gt;
+    let (w, h) = (dst_full[0] as f64, dst_full[1] as f64);
+    let xs = [g[0], g[0] + w * g[1], g[0] + h * g[2], g[0] + w * g[1] + h * g[2]];
+    let ys = [g[3], g[3] + w * g[4], g[3] + h * g[5], g[3] + w * g[4] + h * g[5]];
+    let fmin = |v: &[f64; 4]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+    let fmax = |v: &[f64; 4]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    transformer(src_crs, src_gt, dst_crs, dst_gt)
+        .with_source_size(src_size)
+        .with_target_extent([fmin(&xs), fmin(&ys), fmax(&xs), fmax(&ys)])
+}
+
+fn inv_gt_apply(g: &[f64], x: f64, y: f64) -> [f64; 2] {
+    let det = g[1] * g[5] - g[2] * g[4];
+    let (dx, dy) = (x - g[0], y - g[3]);
+    [(g[5] * dx - g[2] * dy) / det, (-g[4] * dx + g[1] * dy) / det]
+}
+
+/// The source CRS's geographic CRS, as WKT, via PROJ.
+fn geodetic_wkt(crs: &str) -> Option<String> {
+    let cdef = CString::new(rwarp_crs_string(crs)).ok()?;
+    unsafe {
+        let ctx = ffi::proj_context_create();
+        if ctx.is_null() { return None; }
+        let pj = ffi::proj_create(ctx, cdef.as_ptr());
+        let mut out = None;
+        if !pj.is_null() {
+            let geod = ffi::proj_crs_get_geodetic_crs(ctx, pj);
+            if !geod.is_null() {
+                out = cstr_to_option(ffi::proj_as_wkt(ctx, geod, ffi::PJ_WKT_TYPE_PJ_WKT2_2019, std::ptr::null()));
+                ffi::proj_destroy(geod);
+            }
+            ffi::proj_destroy(pj);
+        }
+        ffi::proj_context_destroy(ctx);
+        out
+    }
+}
+
+fn rwarp_crs_string(s: &str) -> String {
+    if s.starts_with("+proj=") && !s.contains("+type=crs") { format!("{} +type=crs", s) } else { s.to_string() }
+}
+
+/// GDAL's special points (GDALTransformLonLatToDestGenImgProjTransformer):
+/// longitude 0 at latitudes -89.9999 and 89.9999, as target pixels. A
+/// target window holding one is grid-sampled when planned, so a pole inside
+/// it is not missed. For a source geographic in degrees GDAL (3.6 and later)
+/// takes the two points as target coordinates and applies only the target's
+/// inverse geotransform; otherwise they are reprojected from the source's
+/// geographic CRS.
+fn special_points(src_crs: &str, dst_crs: &str, dst_gt: &[f64]) -> Vec<[f64; 2]> {
+    let pts = [(0.0, -89.9999), (0.0, 89.9999)];
+    if rwarp::crs::is_geographic_degrees(src_crs).unwrap_or(false) {
+        return pts.iter().map(|&(x, y)| inv_gt_apply(dst_gt, x, y)).collect();
+    }
+    let Some(geod) = geodetic_wkt(src_crs) else { return Vec::new() };
+    let Ok(b) = rwarp::crs::ProjBackend::new(&geod, dst_crs) else { return Vec::new() };
+    use rwarp::crs::CrsTransform;
+    pts.iter()
+        .filter_map(|&(x, y)| b.convert(x, y))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| inv_gt_apply(dst_gt, x, y))
+        .collect()
+}
+
 fn resample_alg(resample: &str) -> ResampleAlg {
     match resample {
         "near" => ResampleAlg::NearestNeighbour,
         "bilinear" => ResampleAlg::Bilinear,
         "cubic" => ResampleAlg::Cubic,
+        "cubicspline" => ResampleAlg::CubicSpline,
         "lanczos" => ResampleAlg::Lanczos,
+        "average" => ResampleAlg::Average,
+        "mode" => ResampleAlg::Mode,
+        "min" => ResampleAlg::Min,
+        "max" => ResampleAlg::Max,
+        "med" => ResampleAlg::Med,
+        "rms" => ResampleAlg::Rms,
         _ => throw_r_error(&format!("unsupported resample method: {}", resample)),
+    }
+}
+
+
+fn kernel_scaling(scaling: &str, scale: &[f64]) -> KernelScaling {
+    match scaling {
+        "widen" => KernelScaling::WidenWhenDownsampling,
+        "point" => KernelScaling::Point,
+        "fixed" => {
+            if scale.len() != 2 || !scale.iter().all(|v| v.is_finite() && *v > 0.0) {
+                throw_r_error("scaling = \"fixed\" needs scale = c(x, y), both positive");
+            }
+            KernelScaling::Fixed { x: scale[0], y: scale[1] }
+        }
+        _ => throw_r_error(&format!("unsupported scaling: {}", scaling)),
+    }
+}
+
+fn mode_ties(ties: &str) -> ModeTies {
+    match ties {
+        "first" => ModeTies::First,
+        "min" => ModeTies::Min,
+        "max" => ModeTies::Max,
+        _ => throw_r_error(&format!("unsupported mode_ties: {}", ties)),
+    }
+}
+
+fn band_nodata(rule: &str) -> BandNodata {
+    match rule {
+        "partial" => BandNodata::Partial,
+        "unified" => BandNodata::Unified,
+        "per_band" => BandNodata::PerBand,
+        _ => throw_r_error(&format!("unsupported band_nodata: {}", rule)),
     }
 }
 
@@ -255,13 +369,19 @@ fn warp_plan(
     resample_padding: i32,
     min_fill_ratio: f64,
     min_dst_size: i32,
+    resample: &str,
+    scaling: &str,
+    scale: &[f64],
 ) -> Robj {
-    let t = transformer(src_crs, src_gt, dst_crs, dst_gt);
     let src_size = [src_dim[0] as usize, src_dim[1] as usize];
     let off = [dst_off[0] as usize, dst_off[1] as usize];
     let size = [dst_size[0] as usize, dst_size[1] as usize];
-    let opts = ChunkOptions::default()
-        .with_source_extra(Some(resample_padding as usize))
+    let full = [off[0] + size[0], off[1] + size[1]];
+    let t = transformer_gdal(src_crs, src_gt, src_size, dst_crs, dst_gt, full);
+    let opts = ChunkOptions::new(resample_alg(resample))
+        .with_scaling(kernel_scaling(scaling, scale))
+        .with_special_points(special_points(src_crs, dst_crs, dst_gt))
+        .with_source_extra(if resample_padding < 0 { None } else { Some(resample_padding as usize) })
         .with_fill_ratio_split(min_fill_ratio, min_dst_size as usize);
     let planner = ChunkPlanner::new(&t, src_size, [off[0] + size[0], off[1] + size[1]], opts);
     let plan = planner.plan_window(off, size);
@@ -275,7 +395,9 @@ fn warp_plan(
             src_yoff   = c.src_off[1] as i32,
             src_xsize  = c.src_size[0] as i32,
             src_ysize  = c.src_size[1] as i32,
-            fill_ratio = c.fill_ratio
+            fill_ratio = c.fill_ratio,
+            scale_x    = c.scale[0],
+            scale_y    = c.scale[1]
         ).into()
     }).collect();
     if chunks.is_empty() {
@@ -404,6 +526,290 @@ fn warp_resample(
     )
 }
 
+
+// ---------------------------------------------------------------------------
+// Typed chunk loop: warp_exec()
+// ---------------------------------------------------------------------------
+
+/// The R vector types a read function can return, and the sample type each
+/// maps to: integer -> i32 (NA is i32::MIN), double -> f64, raw -> u8.
+trait RSample: Sample {
+    fn from_robj(r: &Robj) -> Option<Vec<Self>>;
+    /// An R nodata value (NA arrives as NaN) as this type's nodata, or None.
+    /// `dst` is true for the destination, where a double NA means NaN fill.
+    fn nodata(v: f64, dst: bool) -> Option<f64>;
+    fn to_robj(v: Vec<Self>) -> Robj;
+}
+
+impl RSample for i32 {
+    fn from_robj(r: &Robj) -> Option<Vec<Self>> { r.as_integer_slice().map(|s| s.to_vec()) }
+    fn nodata(v: f64, _dst: bool) -> Option<f64> {
+        if v.is_nan() { Some(i32::MIN as f64) } else { Some(v) }
+    }
+    fn to_robj(v: Vec<Self>) -> Robj { r!(v) }
+}
+
+impl RSample for f64 {
+    fn from_robj(r: &Robj) -> Option<Vec<Self>> { r.as_real_slice().map(|s| s.to_vec()) }
+    fn nodata(v: f64, dst: bool) -> Option<f64> {
+        // NaN is always nodata in a source; as a destination it is the fill.
+        if v.is_nan() { if dst { Some(f64::NAN) } else { None } } else { Some(v) }
+    }
+    fn to_robj(v: Vec<Self>) -> Robj { r!(v) }
+}
+
+impl RSample for u8 {
+    fn from_robj(r: &Robj) -> Option<Vec<Self>> { r.as_raw_slice().map(|s| s.to_vec()) }
+    fn nodata(v: f64, _dst: bool) -> Option<f64> { if v.is_nan() { None } else { Some(v) } }
+    fn to_robj(v: Vec<Self>) -> Robj { Raw::from_bytes(&v).into() }
+}
+
+fn nodata_of<T: RSample>(v: &[f64], dst: bool) -> Vec<Option<f64>> {
+    v.iter().map(|&x| T::nodata(x, dst)).collect()
+}
+
+fn src_nodata_opt<T: RSample>(v: &[f64]) -> Nodata {
+    let nd = nodata_of::<T>(v, false);
+    match nd.len() {
+        0 => Nodata::None,
+        1 => nd[0].map_or(Nodata::None, Nodata::Value),
+        _ if nd.iter().all(|x| x.is_none()) => Nodata::None,
+        // PerBand has no "none for this band"; a NaN never matches, so it stands in.
+        _ => Nodata::PerBand(nd.iter().map(|x| x.unwrap_or(f64::NAN)).collect()),
+    }
+}
+
+fn dst_nodata_opt<T: RSample>(v: &[f64]) -> DstNodata {
+    let nd = nodata_of::<T>(v, true);
+    match nd.len() {
+        0 => DstNodata::None,
+        1 => nd[0].map_or(DstNodata::None, DstNodata::Value),
+        _ if nd.iter().all(|x| x.is_none()) => DstNodata::None,
+        _ => DstNodata::PerBand(nd.iter().map(|x| x.unwrap_or(0.0)).collect()),
+    }
+}
+
+struct ExecArgs<'a> {
+    chunks: &'a [i32],   // 8 per chunk: dst xoff yoff xsize ysize, src xoff yoff xsize ysize
+    scales: &'a [f64],   // 2 per chunk
+    read_fn: &'a Function,
+    t: &'a ApproxTransformer<GenImgProjTransformer>,
+    dst_off: [usize; 2],
+    dst_size: [usize; 2],
+    nb: usize,
+    verbose: bool,
+}
+
+fn read_chunk<T: RSample>(a: &ExecArgs, k: usize) -> Vec<T> {
+    let c = &a.chunks[k * 8..k * 8 + 8];
+    let got = a.read_fn
+        .call(pairlist!(c[4], c[5], c[6], c[7]))
+        .unwrap_or_else(|e| throw_r_error(&format!("read_fn failed: {}", e)));
+    let v = T::from_robj(&got).unwrap_or_else(|| {
+        throw_r_error("read_fn must return the same type (integer, double or raw) for every chunk")
+    });
+    let n = c[6] as usize * c[7] as usize * a.nb;
+    if v.len() != n {
+        throw_r_error(&format!(
+            "read_fn returned {} values for a {}x{} window of {} band(s); expected {}",
+            v.len(), c[6], c[7], a.nb, n
+        ));
+    }
+    v
+}
+
+/// Band-sequential (as R reads bands) to pixel-interleaved (as rwarp warps).
+fn interleave<T: Copy>(v: &[T], npix: usize, nb: usize) -> Vec<T> {
+    if nb == 1 { return v.to_vec(); }
+    let mut out = Vec::with_capacity(v.len());
+    for p in 0..npix { for b in 0..nb { out.push(v[b * npix + p]); } }
+    out
+}
+
+fn exec_typed<T: RSample>(a: &ExecArgs, first: Vec<T>, base: &WarpOptions) -> Vec<T> {
+    let nb = a.nb;
+    let [w, h] = a.dst_size;
+    // The fill, from a warp that sees no source (as rwarp::plan::warp_chunks).
+    let empty: SourceBuffer<'_, T> = SourceBuffer { data: &[], ncol: 0, nrow: 0, nbands: nb, col_off: 0, row_off: 0 };
+    let mut o = base.clone();
+    o.alg = ResampleAlg::NearestNeighbour;
+    o.scaling = KernelScaling::Point;
+    let fill: Vec<T> = rwarp::warp::warp_to(a.t, &empty, 1, 1, &o);
+    let mut out: Vec<T> = Vec::with_capacity(w * h * nb);
+    for _ in 0..w * h { out.extend_from_slice(&fill); }
+
+    let nchunk = a.chunks.len() / 8;
+    let mut first = Some(first);
+    for k in 0..nchunk {
+        let c = &a.chunks[k * 8..k * 8 + 8];
+        let (sw, sh) = (c[6] as usize, c[7] as usize);
+        if sw == 0 || sh == 0 { continue; }
+        let raw = match first.take() { Some(v) => v, None => read_chunk::<T>(a, k) };
+        let data = interleave(&raw, sw * sh, nb);
+        let buf = SourceBuffer { data: &data, ncol: sw, nrow: sh, nbands: nb, col_off: c[4] as usize, row_off: c[5] as usize };
+        let mut co = base.clone();
+        co.scaling = KernelScaling::Fixed { x: a.scales[k * 2], y: a.scales[k * 2 + 1] };
+        co.dst_col_off = c[0] as usize;
+        co.dst_row_off = c[1] as usize;
+        let (cw, ch) = (c[2] as usize, c[3] as usize);
+        if a.verbose {
+            rprintln!("chunk {}/{}: src [{},{}] {}x{} -> dst [{},{}] {}x{}, scale {:.3} {:.3}",
+                k + 1, nchunk, c[4], c[5], sw, sh, c[0], c[1], cw, ch, a.scales[k * 2], a.scales[k * 2 + 1]);
+        }
+        let tile: Vec<T> = rwarp::warp::warp(a.t, &buf, cw, ch, &co);
+        let (dx, dy) = (c[0] as usize - a.dst_off[0], c[1] as usize - a.dst_off[1]);
+        for (iy, row) in tile.chunks_exact(cw * nb).enumerate() {
+            let at = ((dy + iy) * w + dx) * nb;
+            out[at..at + cw * nb].copy_from_slice(row);
+        }
+    }
+    out
+}
+
+/// Pixel-interleaved, row-major to an R matrix (one band) or array
+/// c(nrow, ncol, nbands), column-major.
+fn to_r_array<T: RSample>(v: Vec<T>, w: usize, h: usize, nb: usize) -> Robj {
+    let mut cm: Vec<T> = Vec::with_capacity(v.len());
+    for b in 0..nb { for c in 0..w { for r in 0..h { cm.push(v[(r * w + c) * nb + b]); } } }
+    let mut obj = T::to_robj(cm);
+    let dim: Vec<i32> = if nb == 1 { vec![h as i32, w as i32] } else { vec![h as i32, w as i32, nb as i32] };
+    obj.set_attrib("dim", dim).unwrap();
+    obj
+}
+
+/// Bytes, pixel-interleaved and row-major, packed as a nativeRaster:
+/// R | G<<8 | B<<16 | A<<24 per pixel, which is also row-major. One band is
+/// grey, three are RGB, four are RGBA. Without an alpha band, a pixel whose
+/// bands all equal the destination nodata is transparent.
+fn to_nara(v: &[u8], w: usize, h: usize, nb: usize, dst_nd: &[Option<f64>]) -> Robj {
+    let nd: Vec<Option<u8>> = (0..nb)
+        .map(|b| dst_nd.get(if dst_nd.len() == 1 { 0 } else { b }).copied().flatten())
+        .map(|x| x.filter(|v| (0.0..=255.0).contains(v)).map(|v| v as u8))
+        .collect();
+    let masked = nb != 4 && nd.iter().all(|x| x.is_some());
+    let mut px: Vec<i32> = Vec::with_capacity(w * h);
+    for p in 0..w * h {
+        let s = &v[p * nb..(p + 1) * nb];
+        let (r, g, b, a) = match nb {
+            1 => (s[0], s[0], s[0], 255u8),
+            3 => (s[0], s[1], s[2], 255u8),
+            4 => (s[0], s[1], s[2], s[3]),
+            _ => throw_r_error("output = \"nara\" needs 1, 3 or 4 bands"),
+        };
+        let a = if masked && s.iter().zip(&nd).all(|(x, n)| Some(*x) == *n) { 0 } else { a };
+        px.push((r as u32 | (g as u32) << 8 | (b as u32) << 16 | (a as u32) << 24) as i32);
+    }
+    let mut obj: Robj = r!(px);
+    obj.set_attrib("dim", vec![h as i32, w as i32]).unwrap();
+    obj.set_attrib("channels", 4i32).unwrap();
+    obj.set_class(&["nativeRaster"]).unwrap();
+    obj
+}
+
+/// Internal: the chunk loop behind the R function warp_exec().
+/// @noRd
+#[extendr]
+fn warp_exec_rs(
+    chunks: &[i32], scales: &[f64],
+    read_fn: Function,
+    src_crs: &str, src_gt: &[f64], src_dim: &[i32],
+    dst_crs: &str, dst_gt: &[f64],
+    dst_off: &[i32], dst_size: &[i32],
+    nbands: i32,
+    max_error: f64,
+    resample: &str,
+    mode_ties_: &str,
+    src_nodata: &[f64], dst_nodata: &[f64],
+    band_nodata_: &str,
+    mask_band: i32,
+    nara: bool,
+    verbose: bool,
+) -> Robj {
+    if chunks.len() % 8 != 0 || scales.len() != chunks.len() / 4 {
+        throw_r_error("malformed plan: 8 integers and 2 scales per chunk");
+    }
+    if nbands < 1 { throw_r_error("nbands must be at least 1"); }
+    let nb = nbands as usize;
+    let t = if src_dim.len() == 2 {
+        let full = [(dst_off[0] + dst_size[0]) as usize, (dst_off[1] + dst_size[1]) as usize];
+        ApproxTransformer::new(transformer_gdal(
+            src_crs, src_gt, [src_dim[0] as usize, src_dim[1] as usize], dst_crs, dst_gt, full), max_error)
+    } else {
+        ApproxTransformer::new(transformer(src_crs, src_gt, dst_crs, dst_gt), max_error)
+    };
+    let a = ExecArgs {
+        chunks, scales, read_fn: &read_fn, t: &t,
+        dst_off: [dst_off[0] as usize, dst_off[1] as usize],
+        dst_size: [dst_size[0] as usize, dst_size[1] as usize],
+        nb, verbose,
+    };
+    let mut base = WarpOptions::default();
+    base.alg = resample_alg(resample);
+    base.mode_ties = mode_ties(mode_ties_);
+    base.band_nodata = band_nodata(band_nodata_);
+    if mask_band > 0 {
+        if mask_band as usize > nb { throw_r_error("mask_band is past the last band"); }
+        base.mask_band = Some(mask_band as usize - 1);
+    }
+    let [w, h] = a.dst_size;
+
+    // The first non-empty chunk's read decides the type.
+    let k0 = (0..chunks.len() / 8).find(|&k| chunks[k * 8 + 6] > 0 && chunks[k * 8 + 7] > 0);
+    let probe: Robj = match k0 {
+        Some(k) => {
+            let c = &chunks[k * 8..k * 8 + 8];
+            read_fn.call(pairlist!(c[4], c[5], c[6], c[7]))
+                .unwrap_or_else(|e| throw_r_error(&format!("read_fn failed: {}", e)))
+        }
+        // Nothing to read: the type comes from read_fn on an empty window.
+        None => read_fn.call(pairlist!(0i32, 0i32, 0i32, 0i32))
+            .unwrap_or_else(|e| throw_r_error(&format!("read_fn failed: {}", e))),
+    };
+    // Run the typed loop; the probe read is reused for the first chunk.
+    macro_rules! run {
+        ($t:ty) => {{
+            base.src_nodata = src_nodata_opt::<$t>(src_nodata);
+            base.dst_nodata = dst_nodata_opt::<$t>(dst_nodata);
+            let first: Vec<$t> = match k0 {
+                Some(k) => {
+                    let v = <$t>::from_robj(&probe).unwrap();
+                    let c = &chunks[k * 8..k * 8 + 8];
+                    let n = c[6] as usize * c[7] as usize * nb;
+                    if v.len() != n {
+                        throw_r_error(&format!(
+                            "read_fn returned {} values for a {}x{} window of {} band(s); expected {}",
+                            v.len(), c[6], c[7], nb, n));
+                    }
+                    v
+                }
+                None => Vec::new(),
+            };
+            exec_typed::<$t>(&a, first, &base)
+        }};
+    }
+    match probe.rtype() {
+        Rtype::Integers => {
+            let v = run!(i32);
+            if nara { throw_r_error("output = \"nara\" needs raw (byte) data from read_fn"); }
+            to_r_array(v, w, h, nb)
+        }
+        Rtype::Doubles => {
+            let v = run!(f64);
+            if nara { throw_r_error("output = \"nara\" needs raw (byte) data from read_fn"); }
+            to_r_array(v, w, h, nb)
+        }
+        Rtype::Raw => {
+            let v = run!(u8);
+            if nara {
+                to_nara(&v, w, h, nb, &nodata_of::<u8>(dst_nodata, true))
+            } else {
+                to_r_array(v, w, h, nb)
+            }
+        }
+        _ => throw_r_error("read_fn must return an integer, double or raw vector"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // extendr boilerplate
 // ---------------------------------------------------------------------------
@@ -414,4 +820,5 @@ extendr_module! {
     fn pixel_transform;
     fn warp_plan;
     fn warp_resample;
+    fn warp_exec_rs;
 }

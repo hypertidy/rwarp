@@ -12,9 +12,12 @@ warp_plan(
   dst_gt,
   dst_off = c(0L, 0L),
   dst_size,
-  resample_padding = 1L,
+  resample_padding = NULL,
   min_fill_ratio = 0,
-  min_dst_size = 1L
+  min_dst_size = 1L,
+  resample = "near",
+  scaling = c("widen", "point", "fixed"),
+  scale = NULL
 )
 }
 \arguments{
@@ -28,21 +31,40 @@ window (0-based).  Default \code{c(0L, 0L)}.}
 
 \item{dst_size}{Integer \code{c(ncol, nrow)} of the destination window.}
 
-\item{resample_padding}{Extra source pixels of context for interpolating
-kernels (1 for bilinear).  Default \code{1L}.}
+\item{resample_padding}{Extra source pixels added to every side of each
+source window (gdalwarp's \verb{-wo SOURCE_EXTRA}).  \code{NULL} (the default) is
+gdalwarp's rule: none, or 10 when a sample point fails to transform.
+The kernel's own radius is always added, from \code{resample}.}
 
 \item{min_fill_ratio}{Split a chunk with fill above 0 and below this
 fraction.  Default \code{0} (never split on fill).}
 
 \item{min_dst_size}{Only split a chunk with a side longer than this, in
 pixels.  Default \code{1L}.}
+
+\item{resample}{Resampling method the plan is for: one of \code{"near"},
+\code{"bilinear"}, \code{"cubic"}, \code{"cubicspline"}, \code{"lanczos"}, \code{"average"},
+\code{"mode"}, \code{"min"}, \code{"max"}, \code{"med"}, \code{"rms"} (gdalwarp's \code{-r} names).
+Source windows are padded by the kernel's radius, times the kernel
+scale when downsampling.  \code{\link[=warp_exec]{warp_exec()}} uses it by default.}
+
+\item{scaling}{How the kernel is widened when downsampling:
+\code{"widen"} (gdalwarp's default: by the destination/source scale,
+estimated per chunk), \code{"point"} (never: gdalwarp
+\verb{-wo XSCALE=1 -wo YSCALE=1}) or \code{"fixed"} (by \code{scale}, as gdalwarp
+\verb{-wo XSCALE= -wo YSCALE=}).}
+
+\item{scale}{With \code{scaling = "fixed"}, \code{c(x, y)}: destination pixels per
+source pixel (below 1 is downsampling).}
 }
 \value{
 A list holding one chunk list, itself a list of chunk objects with
 fields:
 \code{dst_xoff}, \code{dst_yoff}, \code{dst_xsize}, \code{dst_ysize},
 \code{src_xoff}, \code{src_yoff}, \code{src_xsize}, \code{src_ysize},
-\code{fill_ratio}.
+\code{fill_ratio}, \code{scale_x}, \code{scale_y} (the kernel scale for the chunk).
+Attributes \code{src_dim}, \code{dst_off}, \code{dst_size}, \code{resample} and \code{scaling} record what
+it was planned for.
 Returns \code{NULL} when no valid chunks are found (source does not overlap
 the destination window).
 }
