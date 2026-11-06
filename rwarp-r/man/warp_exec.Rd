@@ -11,45 +11,89 @@ warp_exec(
   src_gt,
   dst_crs,
   dst_gt,
-  dst_size,
-  nodata = -32768L,
+  dst_size = attr(plan, "dst_size"),
+  nbands = 1L,
+  resample = attr(plan, "resample"),
+  src_nodata = NA,
+  dst_nodata = NA,
+  band_nodata = c("partial", "unified", "per_band"),
+  mask_band = NULL,
+  mode_ties = c("first", "min", "max"),
   max_error = 0.125,
-  resample = "near",
-  verbose = FALSE
+  output = c("array", "nara"),
+  verbose = FALSE,
+  nodata = NULL
 )
 }
 \arguments{
-\item{plan}{Chunk plan as returned by \code{\link[=warp_plan]{warp_plan()}}.}
+\item{plan}{Chunk plan as returned by \code{\link[=warp_plan]{warp_plan()}}.  A chunk without
+\code{scale_x}/\code{scale_y} (a plan made by hand) uses a kernel scale of 1.}
 
-\item{read_fn}{A function \code{f(xoff, yoff, xsize, ysize)} that returns an
-\strong{integer} vector in row-major order of length \code{xsize * ysize}.  The
-simplest implementation uses \code{GDALRaster$read()}.  Can also call a
-byte-ref tile reader, a Zarr chunk fetcher, or any other source.}
+\item{read_fn}{A function \code{f(xoff, yoff, xsize, ysize)} returning the
+source window as one vector of length \code{xsize * ysize * nbands}: each band
+row-major (as \code{GDALRaster$read()} gives it), bands one after another.
+Integer, double or raw.  Can call GDAL, a byte-ref tile reader, a Zarr
+chunk fetcher, or anything else.}
 
-\item{src_crs, src_gt}{Source CRS and geotransform (same as passed to
+\item{src_crs, src_gt}{Source CRS and geotransform (as passed to
 \code{\link[=warp_plan]{warp_plan()}}).}
 
-\item{dst_crs, dst_gt}{Destination CRS and geotransform.}
+\item{dst_crs, dst_gt}{Destination CRS and geotransform of the full grid
+(as passed to \code{\link[=warp_plan]{warp_plan()}}).}
 
-\item{dst_size}{Integer \code{c(ncol, nrow)} of the full destination window.}
+\item{dst_size}{Integer \code{c(ncol, nrow)} of the planned window.  Default:
+the plan's.}
 
-\item{nodata}{Integer no-data value.  Default \code{-32768L}.}
+\item{nbands}{Number of bands \code{read_fn} returns.  Default \code{1L}.}
 
-\item{max_error}{Approx-transformer pixel error bound.  Default \code{0.125}.}
+\item{resample}{Resampling method (see \code{\link[=warp_plan]{warp_plan()}}).  Default: the
+method the plan was made for.  Planning for one method and warping with
+a wider one can clip kernels at window edges.}
 
-\item{resample}{Resampling method: \code{"near"} (default) or \code{"bilinear"}.}
+\item{src_nodata}{Source nodata, one value or one per band.  \code{NA} (the
+default) means R's \code{NA} for integer data; NaN is always nodata in double
+data; raw has none.  \code{NULL} for none.}
 
-\item{verbose}{Print progress per chunk.  Default \code{FALSE}.}
+\item{dst_nodata}{Value written where no source contributes, one value or
+one per band.  \code{NA} (the default) writes \code{NA} (integer and double) or 0
+(raw).  \code{NULL} writes 0.}
+
+\item{band_nodata}{How nodata works across bands (gdalwarp
+\code{UNIFIED_SRC_NODATA}): \code{"partial"} (gdalwarp's default), \code{"unified"}, or
+\code{"per_band"}.}
+
+\item{mask_band}{A band (1-based) whose zeros mark source pixels invalid,
+such as an alpha band.  \code{NULL} for none.}
+
+\item{mode_ties}{For \code{resample = "mode"}, how ties break: \code{"first"},
+\code{"min"} or \code{"max"} (gdalwarp \verb{-wo MODE_TIES=}).}
+
+\item{max_error}{Approx-transformer pixel error bound.  Default \code{0.125}
+(gdalwarp's \code{-et}).}
+
+\item{output}{\code{"array"} (default): a matrix \code{c(nrow, ncol)} for one band,
+an array \code{c(nrow, ncol, nbands)} for more.  \code{"nara"}: a \code{nativeRaster}
+for raw data of 1 (grey), 3 (RGB) or 4 (RGBA) bands, ready for
+\code{plot()}, \code{grid::grid.raster()} or \code{png::writePNG()}.  Without an alpha
+band, pixels whose bands all equal \code{dst_nodata} are transparent.}
+
+\item{verbose}{Print a line per chunk.  Default \code{FALSE}.}
+
+\item{nodata}{Deprecated: sets both \code{src_nodata} and \code{dst_nodata}.}
 }
 \value{
-Integer matrix of dimensions \code{c(dst_size[2], dst_size[1])} (rows,
-cols) in standard R matrix orientation.  Composite rule: first non-nodata
-value wins; use \code{result[result == nodata] <- NA} to mask.
+See \code{output}.  The matrix/array is in standard R orientation
+(row 1 at the top).
 }
 \description{
-Iterates over the chunk plan returned by \code{\link[=warp_plan]{warp_plan()}}, reads each source
-window via \code{read_fn}, reprojects the pixels with \code{\link[=warp_resample]{warp_resample()}}, and
-composites the results ("first valid wins") into an output integer matrix.
+Runs the chunk plan returned by \code{\link[=warp_plan]{warp_plan()}}: reads each chunk's source
+window with \code{read_fn}, warps it with rwarp's kernels, and places it in the
+output.  The loop runs in Rust and calls \code{read_fn} once per chunk.
+}
+\details{
+The data type follows what \code{read_fn} returns: an integer vector warps as
+32-bit integers, a double vector as 64-bit floats, a raw vector as bytes.
+The output is the same type.
 }
 \examples{
 \dontrun{
@@ -73,13 +117,13 @@ dst_ext  <- reproj::reproj_extent(ds$bbox()[c(1,3,2,4)], "EPSG:4326", source = s
 dst_dim  <- c(512L, 512L)
 dst_gt   <- extent_dim_to_gt(dst_ext, dst_dim)
 
-## Read function using GDAL
 read_fn <- function(xoff, yoff, xsize, ysize) {
   as.integer(ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize))
 }
 
-plan   <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt, dst_size = dst_dim)
-result <- warp_exec(plan, read_fn, src_crs, src_gt, dst_crs, dst_gt, dst_dim)
+plan   <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+                    dst_size = dst_dim, resample = "cubic")
+result <- warp_exec(plan, read_fn, src_crs, src_gt, dst_crs, dst_gt)
 
 ximage::ximage(result, dst_ext, col = grey.colors(256))
 ds$close()

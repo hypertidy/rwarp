@@ -65,18 +65,34 @@ pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
 #' @param dst_off Integer `c(col_off, row_off)` origin of the destination
 #'   window (0-based).  Default `c(0L, 0L)`.
 #' @param dst_size Integer `c(ncol, nrow)` of the destination window.
-#' @param resample_padding Extra source pixels of context for interpolating
-#'   kernels (1 for bilinear).  Default `1L`.
+#' @param resample_padding Extra source pixels added to every side of each
+#'   source window (gdalwarp's `-wo SOURCE_EXTRA`).  `NULL` (the default) is
+#'   gdalwarp's rule: none, or 10 when a sample point fails to transform.
+#'   The kernel's own radius is always added, from `resample`.
 #' @param min_fill_ratio Split a chunk with fill above 0 and below this
 #'   fraction.  Default `0` (never split on fill).
 #' @param min_dst_size Only split a chunk with a side longer than this, in
 #'   pixels.  Default `1L`.
+#' @param resample Resampling method the plan is for: one of `"near"`,
+#'   `"bilinear"`, `"cubic"`, `"cubicspline"`, `"lanczos"`, `"average"`,
+#'   `"mode"`, `"min"`, `"max"`, `"med"`, `"rms"` (gdalwarp's `-r` names).
+#'   Source windows are padded by the kernel's radius, times the kernel
+#'   scale when downsampling.  [warp_exec()] uses it by default.
+#' @param scaling How the kernel is widened when downsampling:
+#'   `"widen"` (gdalwarp's default: by the destination/source scale,
+#'   estimated per chunk), `"point"` (never: gdalwarp
+#'   `-wo XSCALE=1 -wo YSCALE=1`) or `"fixed"` (by `scale`, as gdalwarp
+#'   `-wo XSCALE= -wo YSCALE=`).
+#' @param scale With `scaling = "fixed"`, `c(x, y)`: destination pixels per
+#'   source pixel (below 1 is downsampling).
 #'
 #' @return A list holding one chunk list, itself a list of chunk objects with
 #'   fields:
 #'   `dst_xoff`, `dst_yoff`, `dst_xsize`, `dst_ysize`,
 #'   `src_xoff`, `src_yoff`, `src_xsize`, `src_ysize`,
-#'   `fill_ratio`.
+#'   `fill_ratio`, `scale_x`, `scale_y` (the kernel scale for the chunk).
+#'   Attributes `src_dim`, `dst_off`, `dst_size`, `resample` and `scaling` record what
+#'   it was planned for.
 #'   Returns `NULL` when no valid chunks are found (source does not overlap
 #'   the destination window).
 #'
@@ -106,9 +122,17 @@ warp_plan <- function(
     dst_crs, dst_gt,
     dst_off  = c(0L, 0L),
     dst_size,
-    resample_padding = 1L,
+    resample_padding = NULL,
     min_fill_ratio   = 0,
-    min_dst_size     = 1L) {
+    min_dst_size     = 1L,
+    resample         = "near",
+    scaling          = c("widen", "point", "fixed"),
+    scale            = NULL) {
+  resample <- match.arg(resample, c("near", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode", "min", "max", "med", "rms"))
+  scaling  <- match.arg(scaling)
+  if (scaling == "fixed" && (is.null(scale) || length(scale) != 2L)) {
+    stop("scaling = \"fixed\" needs scale = c(x, y)")
+  }
   stopifnot(
     is.character(src_crs), length(src_crs) == 1L,
     is.numeric(src_gt),    length(src_gt)  == 6L,
@@ -118,39 +142,77 @@ warp_plan <- function(
     is.integer(dst_off),   length(dst_off) == 2L,
     is.integer(dst_size),  length(dst_size) == 2L
   )
-  .Call(wrap__warp_plan,
+  plan <- .Call(wrap__warp_plan,
     src_crs, src_gt, src_dim,
     dst_crs, dst_gt,
     dst_off, dst_size,
-    as.integer(resample_padding),
+    if (is.null(resample_padding)) -1L else as.integer(resample_padding),
     as.double(min_fill_ratio),
-    as.integer(min_dst_size)
+    as.integer(min_dst_size),
+    resample, scaling, as.double(if (is.null(scale)) numeric(0) else scale)
   )
+  ## NULL (no chunk reads source) stays NULL, as before
+  if (is.null(plan)) return(NULL)
+  attr(plan, "src_dim")  <- src_dim
+  attr(plan, "dst_off")  <- dst_off
+  attr(plan, "dst_size") <- dst_size
+  attr(plan, "resample") <- resample
+  attr(plan, "scaling")  <- scaling
+  plan
 }
 
 #' Execute a warp plan using a user-supplied read function
 #'
-#' Iterates over the chunk plan returned by [warp_plan()], reads each source
-#' window via `read_fn`, reprojects the pixels with [warp_resample()], and
-#' composites the results ("first valid wins") into an output integer matrix.
+#' Runs the chunk plan returned by [warp_plan()]: reads each chunk's source
+#' window with `read_fn`, warps it with rwarp's kernels, and places it in the
+#' output.  The loop runs in Rust and calls `read_fn` once per chunk.
 #'
-#' @param plan Chunk plan as returned by [warp_plan()].
-#' @param read_fn A function `f(xoff, yoff, xsize, ysize)` that returns an
-#'   **integer** vector in row-major order of length `xsize * ysize`.  The
-#'   simplest implementation uses `GDALRaster$read()`.  Can also call a
-#'   byte-ref tile reader, a Zarr chunk fetcher, or any other source.
-#' @param src_crs,src_gt Source CRS and geotransform (same as passed to
+#' The data type follows what `read_fn` returns: an integer vector warps as
+#' 32-bit integers, a double vector as 64-bit floats, a raw vector as bytes.
+#' The output is the same type.
+#'
+#' @param plan Chunk plan as returned by [warp_plan()].  A chunk without
+#'   `scale_x`/`scale_y` (a plan made by hand) uses a kernel scale of 1.
+#' @param read_fn A function `f(xoff, yoff, xsize, ysize)` returning the
+#'   source window as one vector of length `xsize * ysize * nbands`: each band
+#'   row-major (as `GDALRaster$read()` gives it), bands one after another.
+#'   Integer, double or raw.  Can call GDAL, a byte-ref tile reader, a Zarr
+#'   chunk fetcher, or anything else.
+#' @param src_crs,src_gt Source CRS and geotransform (as passed to
 #'   [warp_plan()]).
-#' @param dst_crs,dst_gt Destination CRS and geotransform.
-#' @param dst_size Integer `c(ncol, nrow)` of the full destination window.
-#' @param nodata Integer no-data value.  Default `-32768L`.
-#' @param max_error Approx-transformer pixel error bound.  Default `0.125`.
-#' @param resample Resampling method: `"near"` (default) or `"bilinear"`.
-#' @param verbose Print progress per chunk.  Default `FALSE`.
+#' @param dst_crs,dst_gt Destination CRS and geotransform of the full grid
+#'   (as passed to [warp_plan()]).
+#' @param dst_size Integer `c(ncol, nrow)` of the planned window.  Default:
+#'   the plan's.
+#' @param nbands Number of bands `read_fn` returns.  Default `1L`.
+#' @param resample Resampling method (see [warp_plan()]).  Default: the
+#'   method the plan was made for.  Planning for one method and warping with
+#'   a wider one can clip kernels at window edges.
+#' @param src_nodata Source nodata, one value or one per band.  `NA` (the
+#'   default) means R's `NA` for integer data; NaN is always nodata in double
+#'   data; raw has none.  `NULL` for none.
+#' @param dst_nodata Value written where no source contributes, one value or
+#'   one per band.  `NA` (the default) writes `NA` (integer and double) or 0
+#'   (raw).  `NULL` writes 0.
+#' @param band_nodata How nodata works across bands (gdalwarp
+#'   `UNIFIED_SRC_NODATA`): `"partial"` (gdalwarp's default), `"unified"`, or
+#'   `"per_band"`.
+#' @param mask_band A band (1-based) whose zeros mark source pixels invalid,
+#'   such as an alpha band.  `NULL` for none.
+#' @param mode_ties For `resample = "mode"`, how ties break: `"first"`,
+#'   `"min"` or `"max"` (gdalwarp `-wo MODE_TIES=`).
+#' @param max_error Approx-transformer pixel error bound.  Default `0.125`
+#'   (gdalwarp's `-et`).
+#' @param output `"array"` (default): a matrix `c(nrow, ncol)` for one band,
+#'   an array `c(nrow, ncol, nbands)` for more.  `"nara"`: a `nativeRaster`
+#'   for raw data of 1 (grey), 3 (RGB) or 4 (RGBA) bands, ready for
+#'   `plot()`, `grid::grid.raster()` or `png::writePNG()`.  Without an alpha
+#'   band, pixels whose bands all equal `dst_nodata` are transparent.
+#' @param verbose Print a line per chunk.  Default `FALSE`.
+#' @param nodata Deprecated: sets both `src_nodata` and `dst_nodata`.
 #'
-#' @return Integer matrix of dimensions `c(dst_size[2], dst_size[1])` (rows,
-#'   cols) in standard R matrix orientation.  Composite rule: first non-nodata
-#'   value wins; use `result[result == nodata] <- NA` to mask.
+#' @return See `output`.  The matrix/array is in standard R orientation
+#'   (row 1 at the top).
 #'
 #' @seealso [warp_plan()], [warp_resample()]
 #' @export
@@ -176,13 +238,13 @@ warp_plan <- function(
 #' dst_dim  <- c(512L, 512L)
 #' dst_gt   <- extent_dim_to_gt(dst_ext, dst_dim)
 #'
-#' ## Read function using GDAL
 #' read_fn <- function(xoff, yoff, xsize, ysize) {
 #'   as.integer(ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize))
 #' }
 #'
-#' plan   <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt, dst_size = dst_dim)
-#' result <- warp_exec(plan, read_fn, src_crs, src_gt, dst_crs, dst_gt, dst_dim)
+#' plan   <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+#'                     dst_size = dst_dim, resample = "cubic")
+#' result <- warp_exec(plan, read_fn, src_crs, src_gt, dst_crs, dst_gt)
 #'
 #' ximage::ximage(result, dst_ext, col = grey.colors(256))
 #' ds$close()
@@ -191,65 +253,60 @@ warp_exec <- function(
     plan, read_fn,
     src_crs, src_gt,
     dst_crs, dst_gt,
-    dst_size,
-    nodata    = -32768L,
-    max_error = 0.125,
-    resample  = "near",
-    verbose   = FALSE) {
-
-  ncol <- dst_size[1L]
-  nrow <- dst_size[2L]
-  out  <- matrix(nodata, nrow = nrow, ncol = ncol)
-
-  for (chunk_list in plan) {
-    for (chunk in chunk_list) {
-      if (verbose) {
-        message(sprintf(
-          "chunk: src [%d,%d] %dx%d | fill %.3f",
-          chunk$src_xoff, chunk$src_yoff,
-          chunk$src_xsize, chunk$src_ysize,
-          chunk$fill_ratio
-        ))
-      }
-      src_buf <- read_fn(
-        chunk$src_xoff, chunk$src_yoff,
-        chunk$src_xsize, chunk$src_ysize
-      )
-      if (!is.integer(src_buf)) src_buf <- as.integer(src_buf)
-
-      ## warp_resample() fills a grid from pixel 0, so shift dst_gt to the chunk
-      chunk_gt <- dst_gt
-      chunk_gt[1L] <- dst_gt[1L] + chunk$dst_xoff * dst_gt[2L] + chunk$dst_yoff * dst_gt[3L]
-      chunk_gt[4L] <- dst_gt[4L] + chunk$dst_xoff * dst_gt[5L] + chunk$dst_yoff * dst_gt[6L]
-
-      warped <- warp_resample(
-        src_crs = src_crs, src_gt = src_gt,
-        dst_crs = dst_crs, dst_gt = chunk_gt,
-        dst_dim = as.integer(c(chunk$dst_xsize, chunk$dst_ysize)),
-        src_pixels  = src_buf,
-        src_ncol    = chunk$src_xsize,
-        src_nrow    = chunk$src_ysize,
-        src_col_off = chunk$src_xoff,
-        src_row_off = chunk$src_yoff,
-        nodata      = nodata,
-        max_error   = max_error,
-        resample    = resample
-      )
-      ## Place the warped tile into the output matrix (first valid wins)
-      tile_m <- matrix(warped,
-        nrow = chunk$dst_ysize, ncol = chunk$dst_xsize,
-        byrow = TRUE
-      )
-      dst_rows <- chunk$dst_yoff + seq_len(chunk$dst_ysize)
-      dst_cols <- chunk$dst_xoff + seq_len(chunk$dst_xsize)
-      existing <- out[dst_rows, dst_cols, drop = FALSE]
-      mask_new <- !is.na(tile_m) & tile_m != nodata
-      mask_fill <- mask_new & (is.na(existing) | existing == nodata)
-      existing[mask_fill] <- tile_m[mask_fill]
-      out[dst_rows, dst_cols] <- existing
-    }
+    dst_size    = attr(plan, "dst_size"),
+    nbands      = 1L,
+    resample    = attr(plan, "resample"),
+    src_nodata  = NA,
+    dst_nodata  = NA,
+    band_nodata = c("partial", "unified", "per_band"),
+    mask_band   = NULL,
+    mode_ties   = c("first", "min", "max"),
+    max_error   = 0.125,
+    output      = c("array", "nara"),
+    verbose     = FALSE,
+    nodata      = NULL) {
+  if (!is.null(nodata)) {
+    .Deprecated(msg = "warp_exec(nodata = ) is deprecated; use src_nodata and dst_nodata")
+    src_nodata <- dst_nodata <- nodata
   }
-  out
+  band_nodata <- match.arg(band_nodata)
+  mode_ties   <- match.arg(mode_ties)
+  output      <- match.arg(output)
+  if (is.null(resample)) resample <- "near"
+  resample <- match.arg(resample, c("near", "bilinear", "cubic", "cubicspline",
+                                    "lanczos", "average", "mode", "min", "max",
+                                    "med", "rms"))
+  if (is.null(dst_size)) stop("dst_size is needed (the plan has no dst_size attribute)")
+  dst_off <- attr(plan, "dst_off")
+  if (is.null(dst_off)) dst_off <- c(0L, 0L)
+  stopifnot(is.function(read_fn), length(dst_size) == 2L)
+
+  chunks <- unlist(plan, recursive = FALSE)
+  geom <- vapply(chunks, function(ch) as.integer(c(
+    ch$dst_xoff, ch$dst_yoff, ch$dst_xsize, ch$dst_ysize,
+    ch$src_xoff, ch$src_yoff, ch$src_xsize, ch$src_ysize)), integer(8L))
+  ## a chunk without a kernel scale (a plan made by hand) uses 1: no widening
+  scales <- vapply(chunks, function(ch) c(
+    if (is.null(ch$scale_x)) 1 else ch$scale_x,
+    if (is.null(ch$scale_y)) 1 else ch$scale_y), numeric(2L))
+
+  nd <- function(x) if (is.null(x)) numeric(0) else as.double(x)
+  .Call(wrap__warp_exec_rs,
+    as.integer(geom), as.double(scales),
+    read_fn,
+    src_crs, as.double(src_gt),
+    if (is.null(attr(plan, "src_dim"))) integer(0) else as.integer(attr(plan, "src_dim")),
+    dst_crs, as.double(dst_gt),
+    as.integer(dst_off), as.integer(dst_size),
+    as.integer(nbands),
+    as.double(max_error),
+    resample, mode_ties,
+    nd(src_nodata), nd(dst_nodata),
+    band_nodata,
+    if (is.null(mask_band)) 0L else as.integer(mask_band),
+    output == "nara",
+    isTRUE(verbose)
+  )
 }
 
 #' Warp and resample a source pixel buffer into a destination grid
