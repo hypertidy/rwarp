@@ -85,6 +85,13 @@ pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
 #'   `-wo XSCALE= -wo YSCALE=`).
 #' @param scale With `scaling = "fixed"`, `c(x, y)`: destination pixels per
 #'   source pixel (below 1 is downsampling).
+#' @param split_antimeridian When a chunk's source window spans the whole
+#'   source width (gdalwarp's 90% rule, as when the destination crosses the
+#'   antimeridian of a global longitude/latitude source), split the chunk
+#'   where source x jumps, into compact windows either side. That reads the
+#'   two edges of the source instead of a full-width strip (the few columns
+#'   at the jump read a small window at each edge). gdalwarp does not split.
+#'   Default `TRUE`; `FALSE` is gdalwarp's plan.
 #'
 #' @return A list holding one chunk list, itself a list of chunk objects with
 #'   fields:
@@ -127,7 +134,8 @@ warp_plan <- function(
     min_dst_size     = 1L,
     resample         = "near",
     scaling          = c("widen", "point", "fixed"),
-    scale            = NULL) {
+    scale            = NULL,
+    split_antimeridian = TRUE) {
   resample <- match.arg(resample, c("near", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode", "min", "max", "med", "rms"))
   scaling  <- match.arg(scaling)
   if (scaling == "fixed" && (is.null(scale) || length(scale) != 2L)) {
@@ -149,7 +157,8 @@ warp_plan <- function(
     if (is.null(resample_padding)) -1L else as.integer(resample_padding),
     as.double(min_fill_ratio),
     as.integer(min_dst_size),
-    resample, scaling, as.double(if (is.null(scale)) numeric(0) else scale)
+    resample, scaling, as.double(if (is.null(scale)) numeric(0) else scale),
+    isTRUE(split_antimeridian)
   )
   ## NULL (no chunk reads source) stays NULL, as before
   if (is.null(plan)) return(NULL)

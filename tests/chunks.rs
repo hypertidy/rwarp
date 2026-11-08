@@ -455,27 +455,57 @@ fn plans_round_trip_through_serde() {
 
 /// The antimeridian split (0.2's `collect_chunk_list`): a target whose
 /// source x jumps across the whole source width is split at the jump into
-/// compact windows either side and a gap of a few columns; GDAL's planning
-/// reads the whole width.
+/// compact windows either side; the gap columns at the jump get two chunks,
+/// one window at each source edge. GDAL's planning reads the whole width.
+/// Warping either plan gives the same values.
 #[test]
 fn split_antimeridian_reads_compact_windows() {
-    // source column = target column + 100, wrapped at 200
+    // a 40-column target straddling the wrap of a 200-column source:
+    // source column = target column + 180, wrapped at 200 (so 180..200, then 0..20)
     struct Wrap;
     impl Transformer for Wrap {
         fn transform(&self, _: bool, x: &mut [f64], _: &mut [f64]) -> Vec<bool> {
-            x.iter_mut().for_each(|v| *v = (*v + 100.0).rem_euclid(200.0));
+            x.iter_mut().for_each(|v| *v = (*v + 180.0).rem_euclid(200.0));
             vec![true; x.len()]
         }
     }
     let base = ChunkOptions::new(ResampleAlg::NearestNeighbour);
-    let gdal = plan_chunks(&Wrap, [200, 150], [200, 150], &base);
-    let split = plan_chunks(&Wrap, [200, 150], [200, 150], &base.with_split_antimeridian(true));
+    let gdal = plan_chunks(&Wrap, [200, 150], [40, 150], &base);
+    let split = plan_chunks(&Wrap, [200, 150], [40, 150], &base.clone().with_split_antimeridian(true));
     assert_eq!(gdal.src_pixels(), 200 * 150);
-    assert!(split.chunks.len() >= 2);
-    // compact either side; only the columns at the jump read the whole width
+    assert!(split.chunks.len() >= 3, "{:?}", split.chunks);
+    // nothing reads the whole width, not even the gap
     for k in &split.chunks {
-        assert!(k.dst_size[0] <= 2 || k.src_size[0] < 100, "{k:?}");
+        assert!(k.src_size[0] < 40, "{k:?}");
     }
-    let area: usize = split.chunks.iter().map(|k| k.dst_size[0] * k.dst_size[1]).sum();
-    assert_eq!(area, 200 * 150);
+    // the gap: two chunks on one target window, at opposite source edges
+    let pair = split.chunks.iter().enumerate().find_map(|(i, a)| {
+        split.chunks[i + 1..].iter().find(|b| b.dst_off == a.dst_off && b.dst_size == a.dst_size).map(|b| (a, b))
+    });
+    let (a, b) = pair.expect("a gap pair");
+    assert!(a.src_off[0].min(b.src_off[0]) < 20 && a.src_off[0].max(b.src_off[0]) > 150, "{a:?} {b:?}");
+    assert!(split.src_pixels() < gdal.src_pixels() / 2, "{} vs {}", split.src_pixels(), gdal.src_pixels());
+    // every target pixel is in some chunk
+    let mut seen = vec![0u8; 40 * 150];
+    for k in &split.chunks {
+        for r in k.dst_off[1]..k.dst_off[1] + k.dst_size[1] {
+            for c in k.dst_off[0]..k.dst_off[0] + k.dst_size[0] {
+                seen[r * 40 + c] += 1;
+            }
+        }
+    }
+    assert!(seen.iter().all(|&n| n >= 1));
+
+    // the same values either way
+    let data: Vec<f64> = (0..200 * 150).map(|i| ((i % 200) * 7 + (i / 200) * 3) as f64).collect();
+    let buf = SourceBuffer { data: &data, ncol: 200, nrow: 150, nbands: 1, col_off: 0, row_off: 0 };
+    for alg in [ResampleAlg::NearestNeighbour, ResampleAlg::Bilinear] {
+        let o = ChunkOptions::new(alg);
+        let g = plan_chunks(&Wrap, [200, 150], [40, 150], &o);
+        let s = plan_chunks(&Wrap, [200, 150], [40, 150], &o.clone().with_split_antimeridian(true));
+        let wo = WarpOptions::new(alg).with_dst_nodata(rwarp::warp::DstNodata::Value(-1.0));
+        let a: Vec<f64> = warp_chunks(&Wrap, &g, &buf, &wo);
+        let b: Vec<f64> = warp_chunks(&Wrap, &s, &buf, &wo);
+        assert_eq!(a, b, "{alg:?}");
+    }
 }

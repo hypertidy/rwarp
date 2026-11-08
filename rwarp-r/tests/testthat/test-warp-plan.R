@@ -59,3 +59,36 @@ test_that("pixel_transform identity warp has expected pixel offsets", {
   expect_equal(coords$src_x[1], 180.5, tolerance = 0.01)
   expect_equal(coords$src_y[1],  80.5, tolerance = 0.01)
 })
+
+## The antimeridian: a destination centred on 180 degrees reads the two edges
+## of a global lon/lat source, not a full-width strip, and warps to the same
+## values (exact transformer).
+test_that("split_antimeridian reads two edge windows and gives the same values", {
+  dst_crs <- "+proj=laea +lat_0=-17 +lon_0=180"
+  dst_gt  <- c(-1.5e6, 7812.5, 0, 1.5e6, 0, -7812.5)
+  dst_dim <- c(384L, 384L)
+  pl <- function(split, resample) warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+                                            dst_size = dst_dim, resample = resample,
+                                            split_antimeridian = split)
+  full  <- pl(FALSE, "bilinear")[[1]]
+  split <- pl(TRUE, "bilinear")[[1]]
+  px <- function(p) sum(vapply(p, function(c) c$src_xsize * c$src_ysize, 0))
+  expect_length(full, 1L)
+  expect_equal(full[[1]]$src_xsize, 360L)
+  expect_true(all(vapply(split, function(c) c$src_xsize < 180L, TRUE)))
+  expect_lt(px(split), px(full) / 4)
+  ## the gap: two chunks on one target window
+  key <- vapply(split, function(c) paste(c$dst_xoff, c$dst_yoff, c$dst_xsize, c$dst_ysize), "")
+  expect_true(anyDuplicated(key) > 0)
+
+  ## values: x * 1000 + y, so a pixel from the wrong column shows
+  src <- outer(seq_len(src_dim[2]) - 1L, (seq_len(src_dim[1]) - 1L) * 1000L, `+`)
+  read_fn <- function(xoff, yoff, xsize, ysize) {
+    as.double(t(src[yoff + seq_len(ysize), xoff + seq_len(xsize), drop = FALSE]))
+  }
+  for (rs in c("near", "bilinear", "cubic")) {
+    ex <- function(split) warp_exec(pl(split, rs), read_fn, src_crs, src_gt, dst_crs, dst_gt,
+                                    dst_nodata = -1, max_error = 0)
+    expect_identical(ex(TRUE), ex(FALSE), info = rs)
+  }
+})

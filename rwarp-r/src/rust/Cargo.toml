@@ -13,7 +13,7 @@ extendr-api = "0.7"
 proj-sys = "0.27"
 # Use crates.io release; for local development with a rwarp checkout, replace with:
 # rwarp = { path = "../../../../rwarp" }
-rwarp = "0.3.2"
+rwarp = "0.3.3"
 flate2 = "1"
 # ZSTD for future tile decompression
 # zstd = "0.13"

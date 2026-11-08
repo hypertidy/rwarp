@@ -61,7 +61,9 @@
 //!   given, so a kernel stretched further is clipped at the window edge.
 //!
 //! [`ChunkOptions::split_antimeridian`] (off by default) adds the split at
-//! a discontinuity of 0.2's `collect_chunk_list`, which this replaces.
+//! a discontinuity of 0.2's `collect_chunk_list`, which this replaces, and
+//! reads the columns at the jump from two edge windows instead of the whole
+//! width (two chunks on one target window, merged by [`warp_chunks`]).
 //!
 //! Not modelled: `CHECK_WITH_INVERT_PROJ` (a PROJ switch, retried by GDAL
 //! when a window comes back with wild values), `STREAMABLE_OUTPUT`, and
@@ -202,8 +204,11 @@ pub struct ChunkOptions {
     /// When a chunk's source window spans the whole source width (GDAL's
     /// 90% rule, as at the antimeridian), find the target columns where
     /// source x jumps and split the chunk there, into compact windows
-    /// either side. GDAL does not (its fill ratio stays high); off by
-    /// default.
+    /// either side. The few columns at the jump (the gap) map near both
+    /// source edges: they become two chunks on the same target window, one
+    /// window at each edge, so nothing reads the whole width. GDAL does not
+    /// split (its fill ratio stays high); off by default. Independent of
+    /// the fill ratio split, apart from its minimum chunk size.
     pub split_antimeridian: bool,
     /// A round-trip check on the forward probe; `None` (GDAL) checks
     /// nothing.
@@ -410,7 +415,11 @@ pub struct WarpPlan {
     pub dst_off: [usize; 2],
     /// Size of the planned target window.
     pub dst_size: [usize; 2],
-    /// The chunks, covering the target window without overlap.
+    /// The chunks, covering the target window. They don't overlap, except
+    /// that the chunks either side of an antimeridian gap
+    /// ([`ChunkOptions::split_antimeridian`]) share a target window: each
+    /// warps the pixels whose source falls in its window, and
+    /// [`warp_chunks`] keeps the pixels each one wrote.
     pub chunks: Vec<Chunk>,
 }
 
@@ -557,23 +566,29 @@ impl<'a, T: Transformer> ChunkPlanner<'a, T> {
             + o.dst_pixel_bits * dw as f64 * dh as f64)
             / 8.0;
         let big = o.min_split_size as i32;
+        // The antimeridian split doesn't depend on the fill ratio split:
+        // it is wanted even when that is off (min_fill_ratio 0).
         let split = (memory > o.memory_limit && (dw > 2 || dh > 2))
-            || (fill > 0.0 && fill < o.min_fill_ratio && (dw > big || dh > big));
+            || (fill > 0.0 && fill < o.min_fill_ratio && (dw > big || dh > big))
+            || (antimeridian && (dw > big || dh > big));
         if split {
             if antimeridian {
                 if let Some((c0, c1)) = find_discontinuity_range(self.t, off, size, self.src) {
-                    let left = c0 - off[0];
-                    let right = off[0] + dw - c1;
-                    if left > 0 {
-                        self.collect(off, [left, dh], out);
+                    // Keep the split only if it reads under half of the
+                    // full-width window. Around a pole every longitude is
+                    // needed and splitting at the meridian saves nothing,
+                    // so the chunk stays as GDAL plans it.
+                    let mut parts = Vec::new();
+                    self.split_at_jump(off, size, c0, c1, &mut parts);
+                    let read: usize = parts.iter().map(|c: &Chunk| c.src_size[0] * c.src_size[1]).sum();
+                    if (read as f64) < 0.5 * src_size[0] as f64 * src_size[1] as f64 {
+                        out.extend(parts);
+                        return;
                     }
-                    if c1 > c0 {
-                        // The gap itself is not split again.
-                        self.push(out, [c0, off[1]], [c1 - c0, dh], self.window([c0, off[1]], [c1 - c0, dh]));
-                    }
-                    if right > 0 {
-                        self.collect([c1, off[1]], [right, dh], out);
-                    }
+                }
+                // Not worth it: GDAL's plan, which splits only for memory.
+                if !(memory > o.memory_limit && (dw > 2 || dh > 2)) {
+                    self.push(out, off, size, w);
                     return;
                 }
             }
@@ -610,6 +625,33 @@ impl<'a, T: Transformer> ChunkPlanner<'a, T> {
             return;
         }
         self.push(out, off, size, w);
+    }
+
+    /// Split a target window at the antimeridian jump, target columns
+    /// `[c0, c1)`: compact chunks either side (planned as usual) and two
+    /// chunks for the gap, one window at each source edge (see
+    /// [`warp_chunks`]).
+    fn split_at_jump(&self, off: [i32; 2], size: [i32; 2], c0: i32, c1: i32, out: &mut Vec<Chunk>) {
+        let [dw, dh] = size;
+        let left = c0 - off[0];
+        let right = off[0] + dw - c1;
+        if left > 0 {
+            self.collect(off, [left, dh], out);
+        }
+        if c1 > c0 {
+            let (goff, gsize) = ([c0, off[1]], [c1 - c0, dh]);
+            match self.gap_windows(goff, gsize) {
+                Some(ws) if !ws.is_empty() => {
+                    for w in ws {
+                        self.push(out, goff, gsize, Some(w));
+                    }
+                }
+                _ => self.push(out, goff, gsize, self.window(goff, gsize)),
+            }
+        }
+        if right > 0 {
+            self.collect([c1, off[1]], [right, dh], out);
+        }
     }
 
     fn push(&self, out: &mut Vec<Chunk>, off: [i32; 2], size: [i32; 2], w: Option<Win>) {
@@ -827,10 +869,20 @@ impl<'a, T: Transformer> ChunkPlanner<'a, T> {
         if grid {
             self.probe_source(off, size, &mut b);
         }
+        Some(self.win_from_bounds(size, b, failed, n, None))
+    }
+
+    /// The padded, clamped source window for sampled source bounds `b`
+    /// (min x, min y, max x, max y) of a `size` target window: the tail of
+    /// GDAL's `ComputeSourceWindow`. `scale_cap`, when given, caps the
+    /// kernel scale the padding is sized for (the chunk's own scale, for a
+    /// window that sees only part of the chunk's sample points).
+    fn win_from_bounds(&self, size: [i32; 2], b: [f64; 4], failed: i32, n: i32, scale_cap: Option<[f64; 2]>) -> Win {
+        let o = &self.opts;
         let [w, h] = self.src;
         let (wf, hf) = (w as f64, h as f64);
         if b[0] > wf || b[2] < 0.0 || b[1] > hf || b[3] < 0.0 {
-            return Some(Win { off: [0, 0], size: [0, 0], fill: 0.0, failed, samples: n, full_width: false });
+            return Win { off: [0, 0], size: [0, 0], fill: 0.0, failed, samples: n, full_width: false };
         }
         let snap = |v: f64| {
             let r = v.round();
@@ -846,6 +898,10 @@ impl<'a, T: Transformer> ChunkPlanner<'a, T> {
         let mut xscale = (size[0] as f64 / (max_x - min_x)).max(1e-3);
         let mut yscale = (size[1] as f64 / (max_y - min_y)).max(1e-3);
         if let (true, KernelScaling::Fixed { x, y }) = (o.pad_for_fixed_scale, o.scaling) {
+            xscale = xscale.min(x.max(1e-3));
+            yscale = yscale.min(y.max(1e-3));
+        }
+        if let Some([x, y]) = scale_cap {
             xscale = xscale.min(x.max(1e-3));
             yscale = yscale.min(y.max(1e-3));
         }
@@ -880,7 +936,53 @@ impl<'a, T: Transformer> ChunkPlanner<'a, T> {
         let (yo, ys, _) = axis(min_yc, max_yc, h, yr);
         let fill = xs as f64 * ys as f64
             / ((max_x - min_x + 2.0 * xr as f64) * (max_y - min_y + 2.0 * yr as f64)).max(1.0);
-        Some(Win { off: [xo, yo], size: [xs, ys], fill, failed, samples: n, full_width })
+        Win { off: [xo, yo], size: [xs, ys], fill, failed, samples: n, full_width }
+    }
+
+    /// The source windows of an antimeridian gap: target columns whose
+    /// pixels map near both edges of the source. No one window holds both
+    /// edges short of the whole width, but each pixel needs only one, so
+    /// this samples the gap every half pixel, sorts the points by source
+    /// half, and gives each half its own padded window, sized for the
+    /// gap's own kernel scale plus a pixel. `None` if no point transforms.
+    fn gap_windows(&self, off: [i32; 2], size: [i32; 2]) -> Option<Vec<Win>> {
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for iy in 0..=2 * size[1] {
+            for ix in 0..=2 * size[0] {
+                xs.push(off[0] as f64 + ix as f64 * 0.5);
+                ys.push(off[1] as f64 + iy as f64 * 0.5);
+            }
+        }
+        let n = xs.len() as i32;
+        let ok = self.t.transform(true, &mut xs, &mut ys);
+        let half = self.src[0] as f64 / 2.0;
+        let empty = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let (mut west, mut east) = (empty, empty);
+        let mut failed = 0;
+        for i in 0..xs.len() {
+            if !ok[i] || xs[i].is_nan() || ys[i].is_nan() {
+                failed += 1;
+                continue;
+            }
+            let b = if xs[i] < half { &mut west } else { &mut east };
+            b[0] = b[0].min(xs[i] - 1.0);
+            b[1] = b[1].min(ys[i] - 1.0);
+            b[2] = b[2].max(xs[i] + 1.0);
+            b[3] = b[3].max(ys[i] + 1.0);
+        }
+        if failed == n {
+            return None;
+        }
+        let u = |v: i32| v.max(0) as usize;
+        let probe = Chunk { dst_off: off.map(u), dst_size: size.map(u), src_off: [0, 0], src_size: [1, 1], fill_ratio: 0.0, scale: [1.0, 1.0] };
+        let cap = self.chunk_scale(&probe);
+        let wins: Vec<Win> = [west, east]
+            .into_iter()
+            .filter(|b| b[0] <= b[2])
+            .map(|b| self.win_from_bounds(size, b, failed, n, Some(cap)))
+            .filter(|w| w.size[0] > 0 && w.size[1] > 0)
+            .collect();
+        Some(wins)
     }
 }
 
@@ -924,10 +1026,27 @@ pub fn warp_chunks<S: Sample, D: Sample>(
         let [cw, ch] = c.dst_size;
         let tile: Vec<D> = warp_to(transformer, &buf, cw, ch, &c.warp_options(opts));
         let [dx, dy] = [c.dst_off[0] - plan.dst_off[0], c.dst_off[1] - plan.dst_off[1]];
-        for (iy, row) in tile.chunks_exact(cw * nb).enumerate() {
-            let at = ((dy + iy) * w + dx) * nb;
-            out[at..at + cw * nb].copy_from_slice(row);
-        }
+        merge_tile(&mut out, &tile, &fill, w, [dx, dy], cw, nb);
     }
     out
+}
+
+/// Place a chunk's warped `tile` (`cw` pixels wide, `nb` bands
+/// interleaved) at `at` in `out` (`w` pixels wide), copying only the
+/// pixels the chunk wrote, i.e. those not equal to `fill` (NaN equal to
+/// NaN). Pixels whose source falls outside a chunk's window keep the fill,
+/// so for chunks that don't overlap this is a plain copy, and the two
+/// chunks of an antimeridian gap, which share a target window, each add
+/// their own pixels.
+pub fn merge_tile<D: Sample>(out: &mut [D], tile: &[D], fill: &[D], w: usize, at: [usize; 2], cw: usize, nb: usize) {
+    let same = |a: &[D], b: &[D]| a.iter().zip(b).all(|(&x, &y)| x == y || (x.is_nan() && y.is_nan()));
+    for (iy, row) in tile.chunks_exact(cw * nb).enumerate() {
+        let start = ((at[1] + iy) * w + at[0]) * nb;
+        for (ix, px) in row.chunks_exact(nb).enumerate() {
+            if !same(px, fill) {
+                let o = start + ix * nb;
+                out[o..o + nb].copy_from_slice(px);
+            }
+        }
+    }
 }
