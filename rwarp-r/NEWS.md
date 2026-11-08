@@ -1,5 +1,12 @@
 # rwarp (development version)
 
+* `plan_windows()` lists a plan's source windows in the order `warp_exec()`
+  reads them, for fetching them all at once before the warp: `read_fn` is
+  called per chunk, in turn, so over HTTP a reader that prefetches makes its
+  requests overlap. At 0.4 s per request and 5 MB/s, a 384x384 Pacific view
+  of GEBCO warps in 1.35 s this way against 3.06 s for gdalwarp (warp-sandbox
+  `bench/latency-local.R`).
+
 * `warp_plan()` gains `split_antimeridian` (default `TRUE`): a destination
   crossing the antimeridian of a global longitude/latitude source reads the
   two edges of the source instead of a full-width strip (about 11x fewer

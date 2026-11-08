@@ -186,7 +186,10 @@ warp_plan <- function(
 #'   source window as one vector of length `xsize * ysize * nbands`: each band
 #'   row-major (as `GDALRaster$read()` gives it), bands one after another.
 #'   Integer, double or raw.  Can call GDAL, a byte-ref tile reader, a Zarr
-#'   chunk fetcher, or anything else.
+#'   chunk fetcher, or anything else.  It is called once per chunk, in turn;
+#'   for a remote source, fetch every chunk's window at once first (see
+#'   [plan_windows()]) and answer `read_fn` from what was fetched, so the
+#'   requests overlap instead of queueing.
 #' @param src_crs,src_gt Source CRS and geotransform (as passed to
 #'   [warp_plan()]).
 #' @param dst_crs,dst_gt Destination CRS and geotransform of the full grid
@@ -367,4 +370,41 @@ warp_resample <- function(
     as.integer(nodata), as.double(max_error),
     as.character(resample)
   )
+}
+
+#' The source windows of a warp plan
+#'
+#' Every chunk's source window, one row per chunk, in the order [warp_exec()]
+#' calls `read_fn`.  For fetching them all at once before the warp: over HTTP
+#' the requests then overlap, where `warp_exec()` alone would make them one
+#' after another.  Windows can repeat (the two chunks of an antimeridian gap
+#' share a target window, and windows can overlap), so match on all four
+#' values.
+#'
+#' @param plan A plan from [warp_plan()].
+#' @return An integer matrix with columns `xoff`, `yoff`, `xsize`, `ysize`
+#'   (0-based offsets, in pixels of the full source), one row per chunk that
+#'   reads something; zero rows for `NULL`.
+#' @export
+#' @examples
+#' plan <- warp_plan("EPSG:4326", c(-180, 1, 0, 90, 0, -1), c(360L, 180L),
+#'                   "+proj=laea +lat_0=-17 +lon_0=180",
+#'                   c(-1.5e6, 7812.5, 0, 1.5e6, 0, -7812.5), dst_size = c(384L, 384L))
+#' w <- plan_windows(plan)
+#' w
+#' \dontrun{
+#' ## fetch every window (concurrently, however the reader can), then warp
+#' got <- my_fetch_all(w)          # a list, one vector per row of w
+#' key <- apply(w, 1, paste, collapse = ",")
+#' read_fn <- function(xoff, yoff, xsize, ysize) got[[match(paste(xoff, yoff, xsize, ysize, sep = ","), key)]]
+#' warp_exec(plan, read_fn, ...)
+#' }
+plan_windows <- function(plan) {
+  cols <- c("xoff", "yoff", "xsize", "ysize")
+  if (is.null(plan)) return(matrix(integer(), 0L, 4L, dimnames = list(NULL, cols)))
+  ch <- Filter(function(c) c$src_xsize > 0L && c$src_ysize > 0L, plan[[1]])
+  m <- matrix(vapply(ch, function(c) as.integer(c(c$src_xoff, c$src_yoff, c$src_xsize, c$src_ysize)), integer(4)),
+              ncol = 4L, byrow = TRUE)
+  colnames(m) <- cols
+  m
 }

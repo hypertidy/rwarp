@@ -24,6 +24,7 @@ reference:
     desc: "Plan source windows, execute reads, and resample."
     contents:
       - warp_plan
+      - plan_windows
       - warp_exec
       - warp_resample
   - title: "Utilities"

@@ -92,3 +92,21 @@ test_that("split_antimeridian reads two edge windows and gives the same values",
     expect_identical(ex(TRUE), ex(FALSE), info = rs)
   }
 })
+
+test_that("plan_windows lists every chunk's source window in exec order", {
+  dst_gt <- c(-1.5e6, 7812.5, 0, 1.5e6, 0, -7812.5)
+  plan <- warp_plan(src_crs, src_gt, src_dim, "+proj=laea +lat_0=-17 +lon_0=180", dst_gt,
+                    dst_size = c(384L, 384L), resample = "bilinear")
+  w <- plan_windows(plan)
+  expect_identical(colnames(w), c("xoff", "yoff", "xsize", "ysize"))
+  expect_equal(nrow(w), length(plan[[1]]))
+  ## read_fn sees exactly these windows, in this order
+  seen <- list()
+  src <- matrix(1, src_dim[2], src_dim[1])
+  invisible(warp_exec(plan, function(xoff, yoff, xsize, ysize) {
+    seen[[length(seen) + 1L]] <<- c(xoff, yoff, xsize, ysize)
+    rep(1, xsize * ysize)
+  }, src_crs, src_gt, "+proj=laea +lat_0=-17 +lon_0=180", dst_gt))
+  expect_equal(unname(w), do.call(rbind, seen), ignore_attr = TRUE)
+  expect_equal(nrow(plan_windows(NULL)), 0L)
+})

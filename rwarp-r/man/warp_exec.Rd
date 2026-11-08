@@ -33,7 +33,10 @@ warp_exec(
 source window as one vector of length \code{xsize * ysize * nbands}: each band
 row-major (as \code{GDALRaster$read()} gives it), bands one after another.
 Integer, double or raw.  Can call GDAL, a byte-ref tile reader, a Zarr
-chunk fetcher, or anything else.}
+chunk fetcher, or anything else.  It is called once per chunk, in turn;
+for a remote source, fetch every chunk's window at once first (see
+\code{\link[=plan_windows]{plan_windows()}}) and answer \code{read_fn} from what was fetched, so the
+requests overlap instead of queueing.}
 
 \item{src_crs, src_gt}{Source CRS and geotransform (as passed to
 \code{\link[=warp_plan]{warp_plan()}}).}
