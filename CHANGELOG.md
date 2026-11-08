@@ -2,6 +2,25 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## 0.3.3 (unreleased)
+
+### Changed
+
+- `ChunkOptions::split_antimeridian` no longer reads the whole source width
+  for the columns at the jump (the gap). Each gap pixel needs only one edge
+  of the source, so the gap becomes two chunks on the same target window,
+  one source window at each edge, sampled every half pixel and padded for
+  the gap's own kernel scale. A 384x384 Lambert azimuthal target centred on
+  180 degrees over GEBCO at overview 3 reads 200,600 source pixels instead
+  of 2,257,200, with the same values (exact transformer; nearest, bilinear
+  and cubic; Int16, Float32 and Byte).
+- The split is kept only when it reads under half of the full-width window,
+  so a target around a pole (where every longitude is needed) keeps GDAL's
+  plan, and it no longer depends on the fill ratio split being on.
+- `warp_chunks` places only the pixels a chunk wrote (not equal to the fill,
+  NaN equal to NaN), through the new `plan::merge_tile`. For chunks that don't
+  overlap this is the plain copy it was.
+
 ## 0.3.2 (2026-11-04)
 
 ### Added
