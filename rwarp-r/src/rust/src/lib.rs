@@ -372,6 +372,7 @@ fn warp_plan(
     resample: &str,
     scaling: &str,
     scale: &[f64],
+    split_antimeridian: bool,
 ) -> Robj {
     let src_size = [src_dim[0] as usize, src_dim[1] as usize];
     let off = [dst_off[0] as usize, dst_off[1] as usize];
@@ -382,7 +383,8 @@ fn warp_plan(
         .with_scaling(kernel_scaling(scaling, scale))
         .with_special_points(special_points(src_crs, dst_crs, dst_gt))
         .with_source_extra(if resample_padding < 0 { None } else { Some(resample_padding as usize) })
-        .with_fill_ratio_split(min_fill_ratio, min_dst_size as usize);
+        .with_fill_ratio_split(min_fill_ratio, min_dst_size as usize)
+        .with_split_antimeridian(split_antimeridian);
     let planner = ChunkPlanner::new(&t, src_size, [off[0] + size[0], off[1] + size[1]], opts);
     let plan = planner.plan_window(off, size);
     let chunks: Vec<Robj> = plan.live().map(|c| {
@@ -658,10 +660,9 @@ fn exec_typed<T: RSample>(a: &ExecArgs, first: Vec<T>, base: &WarpOptions) -> Ve
         }
         let tile: Vec<T> = rwarp::warp::warp(a.t, &buf, cw, ch, &co);
         let (dx, dy) = (c[0] as usize - a.dst_off[0], c[1] as usize - a.dst_off[1]);
-        for (iy, row) in tile.chunks_exact(cw * nb).enumerate() {
-            let at = ((dy + iy) * w + dx) * nb;
-            out[at..at + cw * nb].copy_from_slice(row);
-        }
+        // only the pixels the chunk wrote: the two chunks of an antimeridian
+        // gap share a target window (rwarp::plan::merge_tile)
+        rwarp::plan::merge_tile(&mut out, &tile, &fill, w, [dx, dy], cw, nb);
     }
     out
 }

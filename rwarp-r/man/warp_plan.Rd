@@ -17,7 +17,8 @@ warp_plan(
   min_dst_size = 1L,
   resample = "near",
   scaling = c("widen", "point", "fixed"),
-  scale = NULL
+  scale = NULL,
+  split_antimeridian = TRUE
 )
 }
 \arguments{
@@ -56,6 +57,14 @@ estimated per chunk), \code{"point"} (never: gdalwarp
 
 \item{scale}{With \code{scaling = "fixed"}, \code{c(x, y)}: destination pixels per
 source pixel (below 1 is downsampling).}
+
+\item{split_antimeridian}{When a chunk's source window spans the whole
+source width (gdalwarp's 90\% rule, as when the destination crosses the
+antimeridian of a global longitude/latitude source), split the chunk
+where source x jumps, into compact windows either side. That reads the
+two edges of the source instead of a full-width strip (the few columns
+at the jump read a small window at each edge). gdalwarp does not split.
+Default \code{TRUE}; \code{FALSE} is gdalwarp's plan.}
 }
 \value{
 A list holding one chunk list, itself a list of chunk objects with

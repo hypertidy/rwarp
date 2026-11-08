@@ -1,5 +1,12 @@
 # rwarp (development version)
 
+* `warp_plan()` gains `split_antimeridian` (default `TRUE`): a destination
+  crossing the antimeridian of a global longitude/latitude source reads the
+  two edges of the source instead of a full-width strip (about 11x fewer
+  source pixels for a Pacific view of GEBCO), with the same values. A
+  destination around a pole keeps gdalwarp's plan. `FALSE` is gdalwarp's plan
+  everywhere. Needs rwarp (the crate) 0.3.3.
+
 * `warp_exec()` runs its chunk loop in Rust and exposes the crate's warp
   (rwarp 0.3.2): all of gdalwarp's kernels (`near`, `bilinear`, `cubic`,
   `cubicspline`, `lanczos`, `average`, `mode`, `min`, `max`, `med`, `rms`),
