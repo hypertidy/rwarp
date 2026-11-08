@@ -7,6 +7,10 @@ Documentation, a guide, the changelog and a browser demo:
 **<https://hypertidy.github.io/rwarp/>**. API reference for releases:
 [docs.rs/rwarp](https://docs.rs/rwarp).
 
+Design notes are in [design/](design/), for example
+[the antimeridian](design/antimeridian.md): where rwarp reads 11x less than
+gdalwarp, and what it took to make that faster cold.
+
 ## CRS backends
 
 The CRS-to-CRS step is behind the `CrsTransform` trait (`rwarp::crs`), selected

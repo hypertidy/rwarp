@@ -102,6 +102,14 @@ antimeridian wrapping and minimum fill ratios.  No pixels are read.
 `warp_exec()` iterates the plan, calls `read_fn` per chunk, and composites
 with a "first valid wins" rule.  Swap `read_fn` for any source.
 
+At the antimeridian of a global longitude/latitude source, `warp_plan()`
+(`split_antimeridian = TRUE`) reads the two edges of the source where gdalwarp
+reads a full-width strip: 11x fewer pixels for a Pacific view of GEBCO, with the
+same values.  `read_fn` is called per chunk, in turn, so for a remote source
+fetch every window in `plan_windows(plan)` at once first.  With both, that view
+warps in 1.35 s where gdalwarp takes 3.06 s at 0.4 s per request and 5 MB/s.
+The story and the numbers: [design/antimeridian.md](../design/antimeridian.md).
+
 ### CRS strings
 
 The `proj` Rust crate (as of 0.31) requires CRS strings to be recognisable
