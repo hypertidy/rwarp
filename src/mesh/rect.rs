@@ -139,11 +139,23 @@ impl Rectilinear {
         geoms: &[Geometry],
         opts: impl Into<BurnOptions>,
     ) -> Result<BurnResult, String> {
+        self.burn_par(geoms, opts, 1)
+    }
+
+    /// [`Rectilinear::burn`] on up to `threads` threads (0 for all
+    /// available), as [`QuadMesh::burn_par`](super::QuadMesh::burn_par).
+    pub fn burn_par(
+        &self,
+        geoms: &[Geometry],
+        opts: impl Into<BurnOptions>,
+        threads: usize,
+    ) -> Result<BurnResult, String> {
         burn_with(
             self.ncol(),
             self.nrow(),
             geoms,
             opts.into(),
+            threads,
             &|r| Ok(self.ring_to_index(r)),
             &|p, _| self.cell(p),
         )

@@ -23,6 +23,7 @@
 //! exact for either model.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use controlledburn::{
     BurnMode, BurnOptions, BurnResult, Coord, CoverageWindow, Geometry, GridPoint, GridSpec,
@@ -609,6 +610,21 @@ impl QuadMesh {
         geoms: &[Geometry],
         opts: impl Into<BurnOptions>,
     ) -> Result<BurnResult, String> {
+        self.burn_par(geoms, opts, 1)
+    }
+
+    /// [`QuadMesh::burn`] on up to `threads` threads (0 for all
+    /// available), with the same result record for record. Both halves
+    /// run in parallel: walking the rings into the mesh's index space, on
+    /// contiguous chunks of the geometries of about equal vertex counts,
+    /// and the burn, with [`controlledburn::burn_par`]. One geometry is
+    /// never split, and small inputs stay on the calling thread.
+    pub fn burn_par(
+        &self,
+        geoms: &[Geometry],
+        opts: impl Into<BurnOptions>,
+        threads: usize,
+    ) -> Result<BurnResult, String> {
         if self.map != CellMap::EqualArea {
             return Err("the ring walk needs CellMap::EqualArea".into());
         }
@@ -617,6 +633,7 @@ impl QuadMesh {
             self.nrow,
             geoms,
             opts.into(),
+            threads,
             &|r| self.ring_to_index(r),
             &|p, hint| self.locate(p, hint),
         )
@@ -644,22 +661,128 @@ impl QuadMesh {
     }
 }
 
+/// A world ring to an index ring `[col, row]`.
+pub(crate) type RingFn<'a> = dyn Fn(&[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> + Sync + 'a;
+/// A world point (with the last point's cell as a hint) to its `(row, col)`.
+pub(crate) type CellFn<'a> =
+    dyn Fn([f64; 2], Option<(usize, usize)>) -> Option<(usize, usize)> + Sync + 'a;
+
 /// Map rings with `ring` (world ring to index ring `[col, row]`) and
 /// points with `cell`, then burn the index-space geometries with
 /// controlledburn on the `ncol` by `nrow` grid. Shared by the curvilinear
 /// and rectilinear front ends.
-#[allow(clippy::type_complexity)]
+///
+/// With `threads` other than 1 (0 for all available), the geometries are
+/// mapped on several threads, in contiguous chunks of about equal vertex
+/// counts taken in turn, and burned with [`controlledburn::burn_par`]. The result is the
+/// same as with one thread, record for record.
 pub(crate) fn burn_with(
     ncol: usize,
     nrow: usize,
     geoms: &[Geometry],
     opts: BurnOptions,
-    ring: &dyn Fn(&[[f64; 2]]) -> Result<Vec<[f64; 2]>, String>,
-    cell: &dyn Fn([f64; 2], Option<(usize, usize)>) -> Option<(usize, usize)>,
+    threads: usize,
+    ring: &RingFn,
+    cell: &CellFn,
 ) -> Result<BurnResult, String> {
     if opts.mode != BurnMode::Coverage {
         return Err("only coverage mode is defined for a grid front end".into());
     }
+    let threads = match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+    // up to 8 chunks per thread, taken in turn, so a chunk holding one
+    // large geometry doesn't hold up the rest
+    let chunks = vertex_chunks(geoms, threads * 8);
+    let mapped: Vec<Result<Mapped, String>> = if chunks.len() <= 1 {
+        vec![map_geoms(geoms, 0, nrow, ring, cell)]
+    } else {
+        let next = AtomicUsize::new(0);
+        let mut done: Vec<(usize, Result<Mapped, String>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..threads.min(chunks.len()))
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut out = Vec::new();
+                        loop {
+                            let k = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&(a, b)) = chunks.get(k) else {
+                                break out;
+                            };
+                            out.push((k, map_geoms(&geoms[a..b], a, nrow, ring, cell)));
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .flat_map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| vec![(0, Err("a mapping thread panicked".into()))])
+                })
+                .collect()
+        });
+        done.sort_by_key(|d| d.0);
+        done.into_iter().map(|d| d.1).collect()
+    };
+    let mut plane = Vec::with_capacity(geoms.len());
+    let mut points = Vec::new();
+    for m in mapped {
+        let (pl, pt) = m?;
+        plane.extend(pl);
+        points.extend(pt);
+    }
+    let grid = GridSpec::new(0.0, 0.0, ncol as f64, nrow as f64, ncol as u32, nrow as u32);
+    let mut res =
+        controlledburn::burn_par(&plane, &grid, opts, threads).map_err(|e| e.to_string())?;
+    res.points.extend(points);
+    Ok(res)
+}
+
+/// Index-space geometries (one per input, in order) and points.
+type Mapped = (Vec<Geometry>, Vec<GridPoint>);
+
+/// Contiguous `[a, b)` ranges of `geoms`, at most `n` of them, of
+/// about equal vertex counts; one range when a thread isn't worth it.
+fn vertex_chunks(geoms: &[Geometry], n: usize) -> Vec<(usize, usize)> {
+    // at least this many vertices a chunk
+    const MIN_VERTICES: usize = 1 << 12;
+    let w: Vec<usize> = geoms.iter().map(vertices).collect();
+    let total: usize = w.iter().sum();
+    let n = n.min(geoms.len()).min(total / MIN_VERTICES).max(1);
+    if n == 1 {
+        return vec![(0, geoms.len())];
+    }
+    let mut out = Vec::with_capacity(n);
+    let (mut a, mut acc) = (0, 0);
+    for (k, wk) in w.iter().enumerate() {
+        acc += wk;
+        if acc * n >= total * (out.len() + 1) && out.len() + 1 < n {
+            out.push((a, k + 1));
+            a = k + 1;
+        }
+    }
+    out.push((a, geoms.len()));
+    out
+}
+
+fn vertices(g: &Geometry) -> usize {
+    let poly = |p: &Polygon| p.rings.iter().map(Vec::len).sum::<usize>();
+    match g {
+        Geometry::Polygon(p) => poly(p),
+        Geometry::MultiPolygon(ps) => ps.iter().map(poly).sum(),
+        Geometry::MultiPoint(cs) => cs.len(),
+        _ => 1,
+    }
+}
+
+/// Map `geoms` (whose first has id `id0`) into the index plane.
+fn map_geoms(
+    geoms: &[Geometry],
+    id0: usize,
+    nrow: usize,
+    ring: &RingFn,
+    cell: &CellFn,
+) -> Result<Mapped, String> {
     let nr = nrow as f64;
     let to_plane = |r: &[Coord]| -> Result<Vec<Coord>, String> {
         let pts: Vec<[f64; 2]> = r.iter().map(|c| [c.x, c.y]).collect();
@@ -692,8 +815,8 @@ pub(crate) fn burn_with(
     };
     let mut plane = Vec::with_capacity(geoms.len());
     let mut points = Vec::new();
-    for (id, g) in geoms.iter().enumerate() {
-        let id = id as i32;
+    for (k, g) in geoms.iter().enumerate() {
+        let id = (id0 + k) as i32;
         let polys: Vec<Polygon> = match g {
             Geometry::Polygon(p) => polygon(p)?.into_iter().collect(),
             Geometry::MultiPolygon(ps) => {
@@ -732,8 +855,5 @@ pub(crate) fn burn_with(
         };
         plane.push(Geometry::MultiPolygon(polys));
     }
-    let grid = GridSpec::new(0.0, 0.0, ncol as f64, nr, ncol as u32, nrow as u32);
-    let mut res = controlledburn::burn(&plane, &grid, opts).map_err(|e| e.to_string())?;
-    res.points.extend(points);
-    Ok(res)
+    Ok((plane, points))
 }

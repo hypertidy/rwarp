@@ -662,3 +662,86 @@ fn multipolygon_parts_merge_per_cell() {
     assert!((merged.edges[0].fraction as f64 - 0.36).abs() < 1e-6);
     assert_eq!(dense(&merged, 4, 3), dense(&split, 4, 3));
 }
+
+/// Many polygons (enough vertices to split across threads), multi-parts
+/// and points, in mesh order.
+fn many(m: &QuadMesh, seed: u64) -> Vec<Geometry> {
+    let polys: Vec<Geometry> = cases(m, seed, 3000).iter().map(|r| polygon(r)).collect();
+    let mut out = Vec::new();
+    for (k, p) in polys.into_iter().enumerate() {
+        if k % 97 == 0 {
+            let p0 = m.split_centre(k % m.nrow(), k % m.ncol()).0;
+            out.push(Geometry::Point(Coord { x: p0[0], y: p0[1] }));
+        }
+        match (k % 50, out.pop()) {
+            (0, Some(Geometry::Polygon(a))) => match p {
+                Geometry::Polygon(b) => out.push(Geometry::MultiPolygon(vec![a, b])),
+                _ => unreachable!(),
+            },
+            (_, Some(prev)) => {
+                out.push(prev);
+                out.push(p);
+            }
+            (_, None) => out.push(p),
+        }
+    }
+    out
+}
+
+#[test]
+fn burn_par_matches_burn() {
+    for (name, m) in [("polar", mesh(polar())), ("jitter", mesh(jittered(7, 0.2)))] {
+        let g = many(&m, 2026);
+        let nv: usize = g
+            .iter()
+            .map(|g| match g {
+                Geometry::Polygon(p) => p.rings.iter().map(Vec::len).sum(),
+                Geometry::MultiPolygon(ps) => ps.iter().flat_map(|p| &p.rings).map(Vec::len).sum(),
+                _ => 1,
+            })
+            .sum();
+        assert!(nv > 3 * 8192, "{name}: {nv} vertices is too few to split");
+        let one = m.burn(&g, BurnOptions::coverage()).unwrap();
+        assert!(!one.points.is_empty() && !one.edges.is_empty());
+        for threads in [0, 2, 3, 8] {
+            assert_eq!(
+                m.burn_par(&g, BurnOptions::coverage(), threads).unwrap(),
+                one,
+                "{name} at {threads}"
+            );
+        }
+        let parity = BurnOptions::parity(controlledburn::BurnMode::Coverage);
+        assert_eq!(
+            m.burn_par(&g, parity, 4).unwrap(),
+            m.burn(&g, parity).unwrap(),
+            "{name} parity"
+        );
+    }
+    let xs: Vec<f64> = (0..=40)
+        .map(|i| i as f64 * 0.25 + (i as f64 * 0.7).sin() * 0.05)
+        .collect();
+    let ys: Vec<f64> = (0..=30).rev().map(|j| j as f64 * 0.2).collect();
+    let rect = Rectilinear::new(xs.clone(), ys.clone()).unwrap();
+    let m = mesh(lattice(rect.ncol(), rect.nrow(), |i, j| {
+        [xs[i as usize], ys[j as usize]]
+    }));
+    let g = many(&m, 7);
+    assert_eq!(
+        rect.burn_par(&g, BurnOptions::coverage(), 4).unwrap(),
+        rect.burn(&g, BurnOptions::coverage()).unwrap()
+    );
+}
+
+#[test]
+fn burn_par_reports_the_first_error() {
+    let m = mesh(polar());
+    let mut g = many(&m, 3);
+    g.insert(
+        g.len() * 2 / 3,
+        Geometry::LineString(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 }]),
+    );
+    assert_eq!(
+        m.burn_par(&g, BurnOptions::coverage(), 4).unwrap_err(),
+        m.burn(&g, BurnOptions::coverage()).unwrap_err()
+    );
+}
