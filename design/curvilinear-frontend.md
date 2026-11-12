@@ -373,8 +373,9 @@ from the walk).
 item 8). This front end makes the truncation visible per cell, since
 cell areas vary across a curvilinear grid; `CoverageWindow` is `f64`
 already, and the exact footprint rounds to `f32` only to match what
-`burn` gave rwarp 0.2. Recommendation: `f64` edges in a controlledburn
-0.3.0 if the C++ sibling can follow; otherwise document it.
+`burn` gave rwarp 0.2. Decided in controlledburn 0.3.0: edges stay `f32`
+(about 6e-8 of a cell), documented; decision N6 in
+[decisions.md](decisions.md).
 
 ### Property tests
 

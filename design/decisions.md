@@ -23,7 +23,7 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 | N3 | folds other than tripolar | refused at construction | refuse for coverage |
 | N4 | `mesh` public or crate-private | public, documented unstable | public, unstable |
 | N5 | robust predicates | plain `f64`, no snapping yet | plain `f64`, snap first |
-| N6 | `f64` edge fractions in controlledburn | `f32` in `burn`, `f64` in `CoverageWindow` | `f64` in controlledburn 0.3.0 |
+| N6 | `f64` edge fractions in controlledburn | `f32` in `burn`, `f64` in `CoverageWindow` | decided: `f32`, documented (0.3.0) |
 | C1 | weight index types | `u32` per axis | settled; confirm |
 | C2 | default normalisation | `FracArea` | `FracArea`, documented |
 | C3 | `warp()` built on `exact_weights` | shares the `Lattice` | settled; confirm |
@@ -124,7 +124,13 @@ implemented yet, and no property test has failed without it.
 | **A. Plain `f64` with snapping first, adaptive only if tests fail** (recommended) | fast; simple; cut points are already placed by edge parameter, so shared edges agree bitwise | correctness rests on the property tests finding the bad cases |
 | B. Adaptive-precision `orient2d` (Shewchuk) from the start | provably consistent orientation | slower in the hot path; a dependency (or a port) in rwarp; doesn't remove the need to place cut points consistently |
 
-## N6. `f64` edge fractions in controlledburn
+## N6. `f64` edge fractions in controlledburn (decided)
+
+**Decided in controlledburn 0.3.0 (hypertidy/controlledburn-rs#23): option B.**
+Edge fractions are computed in `f64` and stored as `f32`, about 6e-8 of a
+cell, and controlledburn's contract chapter and `GridEdge` say so. Where
+`f64` matters, `CoverageWindow` gives it over a window. rwarp's exact
+footprint keeps rounding to `f32` to match `burn`.
 
 This is controlledburn's decision; it is listed here because the
 curvilinear front end makes it visible. `burn`'s edge table stores
@@ -134,8 +140,8 @@ cell.
 
 | option | for | against |
 |---|---|---|
-| **A. `f64` edges in controlledburn 0.3.0** (recommended, if the C++ sibling can follow) | one precision end to end; the exact footprint can drop its `f32` rounding | output type change (0.3.0); twice the memory for the edge table; the C++/R/Python package must change in step |
-| B. Keep `f32`, document it | no churn | the front end's exactness is capped at about 1e-7 of each cell |
+| A. `f64` edges in controlledburn 0.3.0 | one precision end to end; the exact footprint can drop its `f32` rounding | output type change (0.3.0); twice the memory for the edge table; the C++/R/Python package must change in step |
+| **B. Keep `f32`, document it** (chosen) | no churn | the front end's exactness is capped at about 1e-7 of each cell |
 | C. Generic over the float type | both | complexity in a crate that is dependency-free and small on purpose |
 
 ## C1. Weight index types

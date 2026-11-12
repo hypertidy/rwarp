@@ -2,6 +2,19 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## 0.4.0 (unreleased)
+
+### Changed
+
+- controlledburn 0.3.1 (from 0.2.4). Breaking for rwarp because its types
+  are in rwarp's API (`weights::Measure`, and `Geometry`, `BurnOptions` and
+  `BurnResult` in `QuadMesh::burn` and `Rectilinear::burn`). Options are
+  `#[non_exhaustive]` in 0.3, so build them with `BurnOptions::coverage()`
+  and the `with_*` methods. A multi-part geometry now gets one record per
+  cell in a mesh burn (`merge_parts`, on by default); `BurnOptions::parity`
+  keeps one per part. Cutlines burn each polygon separately and are
+  unchanged. Otherwise the test suite gives the same results as on 0.2.4.
+
 ## 0.3.3 (unreleased)
 
 ### Changed

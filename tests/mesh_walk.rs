@@ -639,3 +639,26 @@ fn points_and_refusals() {
         .is_err());
     assert!(Rectilinear::new(vec![0.0, 1.0, 1.0], vec![0.0, 1.0]).is_err());
 }
+
+#[test]
+fn multipolygon_parts_merge_per_cell() {
+    // controlledburn 0.3: a multi-part geometry gets one record per cell
+    // (`merge_parts`, on by default); `BurnOptions::parity` keeps one per part
+    let m = mesh(lattice(4, 3, |i, j| [i, j]));
+    let sq = |x0: f64, x1: f64| polygon(&[vec![[x0, 1.2], [x1, 1.2], [x1, 1.8], [x0, 1.8]]]);
+    let parts: Vec<Polygon> = [sq(1.1, 1.4), sq(1.6, 1.9)]
+        .into_iter()
+        .map(|g| match g {
+            Geometry::Polygon(p) => p,
+            _ => unreachable!(),
+        })
+        .collect();
+    let g = [Geometry::MultiPolygon(parts)];
+    let merged = m.burn(&g, BurnOptions::coverage()).unwrap();
+    let split = m
+        .burn(&g, BurnOptions::parity(controlledburn::BurnMode::Coverage))
+        .unwrap();
+    assert_eq!((merged.edges.len(), split.edges.len()), (1, 2));
+    assert!((merged.edges[0].fraction as f64 - 0.36).abs() < 1e-6);
+    assert_eq!(dense(&merged, 4, 3), dense(&split, 4, 3));
+}
