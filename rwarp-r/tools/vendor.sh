@@ -16,7 +16,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../src/rust"
 rm -rf vendor vendor.tar.xz
-cargo vendor --locked --versioned-dirs vendor > /dev/null 2>&1
+# stdout is the source-replacement config (vendor-config.toml has it); keep errors
+cargo vendor --locked --versioned-dirs vendor > /dev/null
 
 for d in vendor/*/; do
   rm -rf "${d}tests" "${d}benches" "${d}examples" "${d}docs" "${d}doc" "${d}.github"
