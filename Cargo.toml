@@ -1,6 +1,6 @@
 [package]
 name = "rwarp"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 # rwarp itself (f32::next_up in Sample::step_off) and the default `proj`
 # backend. The optional `proj4rs` backend needs whatever proj4rs needs,
@@ -38,7 +38,7 @@ proj4rs = { version = "0.3.0", default-features = false, features = ["crs-defini
 vaster = { version = "0.2.0" }
 # Exact coverage fractions for the exact-overlap area footprint. Pure Rust,
 # no dependencies, builds for wasm.
-controlledburn = "0.2.4"
+controlledburn = "0.3.1"
 half = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
