@@ -2,7 +2,7 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
-## 0.4.0 (unreleased)
+## 0.4.1 (unreleased)
 
 ### Added
 
@@ -16,6 +16,8 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   threads, and no faster past 8, as one geometry is never split (the
   largest, 19% of the vertices, takes 0.33 s alone).
   `examples/mesh_burn_par.rs` times it.
+
+## 0.4.0 (2026-11-12)
 
 ### Changed
 
