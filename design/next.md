@@ -27,7 +27,7 @@ This file is a snapshot, so replace it rather than append to it.
   0.24 s on 8. It goes no faster after that, because the largest polygon
   takes 0.33 s alone and one geometry is never split. With one thread
   it stays on the calling thread, so it works on wasm.
-- **This PR** moves rwarp-r's `Cargo.lock` to rwarp 0.3.3. Main's
+- **#60** moves rwarp-r's `Cargo.lock` to rwarp 0.3.3. Main's
   R-CMD-check has failed since 2026-11-08 because the lock pinned 0.3.2
   while `Cargo.toml` asked for 0.3.3, and `cargo vendor --locked`
   refuses that. `tools/vendor.sh` used to discard cargo's error output,
@@ -35,7 +35,7 @@ This file is a snapshot, so replace it rather than append to it.
 
 ## Next, in order
 
-1. Merge this PR and #59, tag `v0.4.0`, and publish 0.4.1 when ready.
+1. Merge #60 and #59, tag `v0.4.0`, and publish 0.4.1 when ready.
 2. **rwarp-r on rwarp 0.4.x**, when R should get controlledburn 0.3 or
    `burn_par`: bump `rwarp-r/src/rust/Cargo.toml`, run
    `cargo update -p rwarp`, and commit the lock. The lock and the
