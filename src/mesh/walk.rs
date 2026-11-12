@@ -618,7 +618,9 @@ impl QuadMesh {
     /// run in parallel: walking the rings into the mesh's index space, on
     /// contiguous chunks of the geometries of about equal vertex counts,
     /// and the burn, with [`controlledburn::burn_par`]. One geometry is
-    /// never split, and small inputs stay on the calling thread.
+    /// never split, and small inputs stay on the calling thread, as does
+    /// everything with `threads = 1` (so `burn` needs no threads, as on
+    /// wasm).
     pub fn burn_par(
         &self,
         geoms: &[Geometry],
@@ -694,7 +696,12 @@ pub(crate) fn burn_with(
     };
     // up to 8 chunks per thread, taken in turn, so a chunk holding one
     // large geometry doesn't hold up the rest
-    let chunks = vertex_chunks(geoms, threads * 8);
+    // one thread: no chunks, no spawn (so `burn` works without threads, on wasm)
+    let chunks = if threads == 1 {
+        vec![(0, geoms.len())]
+    } else {
+        vertex_chunks(geoms, threads * 8)
+    };
     let mapped: Vec<Result<Mapped, String>> = if chunks.len() <= 1 {
         vec![map_geoms(geoms, 0, nrow, ring, cell)]
     } else {
