@@ -15,7 +15,7 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   keeps one per part. Cutlines burn each polygon separately and are
   unchanged. Otherwise the test suite gives the same results as on 0.2.4.
 
-## 0.3.3 (unreleased)
+## 0.3.3 (2026-11-12)
 
 ### Changed
 
