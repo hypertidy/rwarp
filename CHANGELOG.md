@@ -2,7 +2,22 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
-## 0.4.0 (unreleased)
+## 0.4.1 (unreleased)
+
+### Added
+
+- `QuadMesh::burn_par` and `Rectilinear::burn_par`: the mesh burns on up to
+  `threads` threads (0 for all available), with the same result as `burn`,
+  record for record. The ring walk into index space runs on contiguous
+  chunks of the geometries of about equal vertex counts, taken in turn by
+  the threads, and the burn uses controlledburn's `burn_par`. Natural Earth
+  10m land (6,837 polygons, 446,175 vertices) onto a warped 1440 x 720
+  mesh: 1.16 s with `burn`; 0.58 s, 0.31 s and 0.24 s at 2, 4 and 8
+  threads, and no faster past 8, as one geometry is never split (the
+  largest, 19% of the vertices, takes 0.33 s alone).
+  `examples/mesh_burn_par.rs` times it.
+
+## 0.4.0 (2026-11-12)
 
 ### Changed
 
@@ -15,7 +30,7 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   keeps one per part. Cutlines burn each polygon separately and are
   unchanged. Otherwise the test suite gives the same results as on 0.2.4.
 
-## 0.3.3 (unreleased)
+## 0.3.3 (2026-11-12)
 
 ### Changed
 
