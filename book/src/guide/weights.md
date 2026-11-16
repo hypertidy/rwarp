@@ -164,14 +164,18 @@ columns.
   north-up source of at most 360 degrees once it has the source size
   (`with_source_size`, which also gives GDAL's `CENTER_LONG`); a
   transformer that does not report it gets no unwrapping, and such cells
-  are wrong as before.
+  are wrong as before. A geolocation source with `with_lon_wrap(true)` is
+  handled the same way in its world coordinates, a turn being 360
+  degrees.
 - **Geolocation sources need whole cells.** `GeolocArrays::world_cells()`
   says whether a source is measured in world coordinates, and if not, why.
   It isn't for arrays with a missing sample, arrays that fold (cells of
-  both orientations, as where a scanning swath's scans overlap), or, for
-  now, arrays that cross the antimeridian with `lon_wrap`. Those are
-  measured in source pixel space as before, which on a curved grid is off
-  by about 1% of a cell along each outline. The choice is made once per
+  both orientations, as where a scanning swath's scans overlap), or, with
+  `lon_wrap`, a swath over a pole (its longitudes don't unwrap
+  consistently) or one spanning more than 360 degrees. Arrays that cross
+  the antimeridian are fine. Those it isn't for are measured in source
+  pixel space as before, which on a curved grid is off by about 1% of a
+  cell along each outline. The choice is made once per
   set of arrays, so every chunk of a warp uses the same measure.
 - **Destination cells are what a transformer describes.** A curvilinear
   target works through `GenImgGeolocTransformer` with its bilinear cell

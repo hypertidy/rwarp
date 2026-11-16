@@ -398,8 +398,9 @@ pub struct GeolocArrays {
     nrow: usize,
     opts: GeolocOptions,
     index: InverseIndex,
-    /// [`GeolocArrays::world_cells`], computed on first use.
-    cells: OnceLock<Result<(), String>>,
+    /// [`GeolocArrays::world_cells`], computed on first use, with the
+    /// longitudes unwrapped by continuity when they cross the antimeridian.
+    cells: OnceLock<Result<Option<Vec<f64>>, String>>,
 }
 
 impl GeolocArrays {
@@ -522,6 +523,16 @@ impl GeolocArrays {
     /// into -180..180: continuous across a square that crosses the
     /// antimeridian, and beyond the arrays' edge.
     fn pixel_line_to_xy_raw(&self, gpix: f64, gline: f64) -> Option<(f64, f64)> {
+        self.pixel_line_to_xy_in(&self.x, gpix, gline)
+    }
+
+    /// [`GeolocArrays::pixel_line_to_xy_raw`] with the X samples `xs` in
+    /// place of the arrays' own.
+    fn pixel_line_to_xy_in(&self, xs: &[f64], gpix: f64, gline: f64) -> Option<(f64, f64)> {
+        let get = |ix: usize, iy: usize| {
+            let k = iy * self.ncol + ix;
+            (xs[k], self.y[k])
+        };
         let nx = self.ncol as i64;
         let ny = self.nrow as i64;
         // C's static_cast<int> of a clamped non-negative double truncates.
@@ -529,14 +540,14 @@ impl GeolocArrays {
         let mut iy = gline.clamp(0.0, (ny - 1) as f64) as i64;
 
         for _attempt in 0..2 {
-            let (x00, y00) = self.get(ix as usize, iy as usize);
+            let (x00, y00) = get(ix as usize, iy as usize);
             if self.is_missing(x00) {
                 return None;
             }
             if ix + 1 < nx && iy + 1 < ny {
-                let (x10, y10) = self.get(ix as usize + 1, iy as usize);
-                let (x01, y01) = self.get(ix as usize, iy as usize + 1);
-                let (x11, y11) = self.get(ix as usize + 1, iy as usize + 1);
+                let (x10, y10) = get(ix as usize + 1, iy as usize);
+                let (x01, y01) = get(ix as usize, iy as usize + 1);
+                let (x11, y11) = get(ix as usize + 1, iy as usize + 1);
                 if !self.is_missing(x10) && !self.is_missing(x01) && !self.is_missing(x11) {
                     let x10a = self.shift_geo_x(x00, x10);
                     let x01a = self.shift_geo_x(x00, x01);
@@ -564,14 +575,14 @@ impl GeolocArrays {
                 ix -= 1;
                 iy -= 1;
                 continue;
-            } else if ix + 1 < nx && !self.is_missing(self.get(ix as usize + 1, iy as usize).0) {
-                let (x10, y10) = self.get(ix as usize + 1, iy as usize);
+            } else if ix + 1 < nx && !self.is_missing(get(ix as usize + 1, iy as usize).0) {
+                let (x10, y10) = get(ix as usize + 1, iy as usize);
                 let fx = gpix - ix as f64;
                 let gx = x00 + fx * (self.shift_geo_x(x00, x10) - x00);
                 let gy = y00 + fx * (y10 - y00);
                 return Some((gx, gy));
-            } else if iy + 1 < ny && !self.is_missing(self.get(ix as usize, iy as usize + 1).0) {
-                let (x01, y01) = self.get(ix as usize, iy as usize + 1);
+            } else if iy + 1 < ny && !self.is_missing(get(ix as usize, iy as usize + 1).0) {
+                let (x01, y01) = get(ix as usize, iy as usize + 1);
                 let fy = gline - iy as f64;
                 let gx = x00 + fy * (self.shift_geo_x(x00, x01) - x00);
                 let gy = y00 + fy * (y01 - y00);
@@ -715,20 +726,45 @@ impl GeolocArrays {
     /// four centres (as [`QuadMesh::from_centres`]); GDAL's model bends
     /// each pixel side where it crosses a line of samples.
     ///
+    /// With [`GeolocOptions::lon_wrap`], longitudes are unwrapped by
+    /// continuity first, so arrays that cross the antimeridian have whole
+    /// cells too: each sample is moved by whole turns to within 180
+    /// degrees of the one before it (along each row, and down the first
+    /// column). Outlines are unwrapped the same way and measured at every
+    /// whole turn that reaches the cells
+    /// ([`SourceCells::lon_wrap`]).
+    ///
     /// The fallback measures what the exact footprint measured before:
     /// the outline taken through [`GeolocArrays::geo_to_pixel`] and
     /// joined straight in source pixel space, off by about 1% of a cell
     /// along the outline on a curved grid. It is used when the arrays
     ///
     /// - have a missing sample (the mesh would have a hole),
-    /// - cross the antimeridian with [`GeolocOptions::lon_wrap`], or
+    /// - with [`GeolocOptions::lon_wrap`], have longitudes that do not
+    ///   unwrap consistently (two neighbours 180 degrees or more apart
+    ///   after unwrapping, as for a swath over a pole) or span more than
+    ///   360 degrees, or
     /// - have a square of samples that is a bow-tie, or squares of both
     ///   orientations (a fold, as where a scanning swath's scans overlap).
     pub fn world_cells(&self) -> Result<(), &str> {
-        self.cells.get_or_init(|| self.check_cells()).as_ref().map(|_| ()).map_err(|e| e.as_str())
+        self.cells().as_ref().map(|_| ()).map_err(|e| e.as_str())
     }
 
-    fn check_cells(&self) -> Result<(), String> {
+    fn cells(&self) -> &Result<Option<Vec<f64>>, String> {
+        self.cells.get_or_init(|| self.check_cells())
+    }
+
+    /// The X samples cells are made from: the unwrapped longitudes, or the
+    /// arrays' own.
+    fn cell_x(&self) -> Result<&[f64], String> {
+        match self.cells() {
+            Ok(Some(ux)) => Ok(ux),
+            Ok(None) => Ok(&self.x),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    fn check_cells(&self) -> Result<Option<Vec<f64>>, String> {
         let (nx, ny) = (self.ncol, self.nrow);
         for iy in 0..ny {
             for ix in 0..nx {
@@ -738,17 +774,40 @@ impl GeolocArrays {
                 }
             }
         }
-        if self.opts.lon_wrap {
-            let jump = |a: (usize, usize), b: (usize, usize)| (self.get(a.0, a.1).0 - self.get(b.0, b.1).0).abs() > 180.0;
-            for iy in 0..ny {
-                for ix in 0..nx {
-                    if (ix + 1 < nx && jump((ix, iy), (ix + 1, iy))) || (iy + 1 < ny && jump((ix, iy), (ix, iy + 1))) {
-                        return Err(format!("the arrays cross the antimeridian at sample (row {iy}, col {ix})"));
-                    }
+        let ux = if self.opts.lon_wrap { self.unwrapped_x()? } else { None };
+        validate_corners(nx - 1, ny - 1, ux.as_deref().unwrap_or(&self.x), &self.y)?;
+        Ok(ux)
+    }
+
+    /// The X samples unwrapped by continuity, `None` if none moved.
+    fn unwrapped_x(&self) -> Result<Option<Vec<f64>>, String> {
+        let (nx, ny) = (self.ncol, self.nrow);
+        let mut ux = self.x.clone();
+        let mut moved = false;
+        for k in 1..nx * ny {
+            let prev = if k % nx == 0 { ux[k - nx] } else { ux[k - 1] };
+            let v = ux[k] - ((ux[k] - prev) / 360.0).round() * 360.0;
+            moved |= v != ux[k];
+            ux[k] = v;
+        }
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let k = iy * nx + ix;
+                let far = |m: usize| (ux[m] - ux[k]).abs() >= 180.0;
+                if (ix + 1 < nx && far(k + 1)) || (iy + 1 < ny && far(k + nx)) {
+                    return Err(format!(
+                        "the longitudes do not unwrap consistently at sample (row {iy}, col {ix}), as round a pole"
+                    ));
                 }
+                lo = lo.min(ux[k]);
+                hi = hi.max(ux[k]);
             }
         }
-        validate_corners(nx - 1, ny - 1, &self.x, &self.y).map(|_| ())
+        if hi - lo > 360.0 {
+            return Err(format!("the longitudes span more than 360 degrees ({lo} to {hi}) once unwrapped"));
+        }
+        Ok(moved.then_some(ux))
     }
 
     /// Raster pixel/line to fractional position in the arrays.
@@ -766,14 +825,14 @@ impl GeolocArrays {
     /// [`GeolocArrays::world_cells`] does, or when a cell of the window
     /// (one beyond the arrays, extrapolated) is a bow-tie or folds.
     pub fn window_mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String> {
-        self.world_cells().map_err(str::to_string)?;
+        let xs = self.cell_x()?;
         let n = (ncol + 1) * (nrow + 1);
         let (mut x, mut y) = (Vec::with_capacity(n), Vec::with_capacity(n));
         for j in 0..=nrow {
             for i in 0..=ncol {
                 let (gp, gl) = self.raster_to_array((col_off + i) as f64, (row_off + j) as f64);
                 let (gx, gy) = self
-                    .pixel_line_to_xy_raw(gp, gl)
+                    .pixel_line_to_xy_in(xs, gp, gl)
                     .ok_or_else(|| format!("raster corner ({}, {}) has no position", col_off + i, row_off + j))?;
                 x.push(gx);
                 y.push(gy);
@@ -791,6 +850,10 @@ impl SourceCells for GeolocArrays {
 
     fn mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String> {
         self.window_mesh(col_off, row_off, ncol, nrow)
+    }
+
+    fn lon_wrap(&self) -> bool {
+        self.opts.lon_wrap
     }
 }
 
@@ -981,6 +1044,10 @@ impl SourceCells for GenImgGeolocTransformer {
             PixelGeo::Geoloc(g) => g.window_mesh(col_off, row_off, ncol, nrow),
             PixelGeo::Affine { .. } => Err("the source is affine: its pixels are unit squares".to_string()),
         }
+    }
+
+    fn lon_wrap(&self) -> bool {
+        matches!(&self.src, PixelGeo::Geoloc(g) if g.opts.lon_wrap)
     }
 }
 

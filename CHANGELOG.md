@@ -19,9 +19,19 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     area now sums to the outline's area to 2e-13 (relative). The old
     measure was off by up to 3e-3 on a polar-sector grid, and 6e-3 on a
     curved longitude/latitude grid to polar stereographic.
-  - Fallback: arrays with a missing sample, arrays that fold, and arrays
-    that cross the antimeridian with `lon_wrap` keep the old measure,
-    decided once per set of arrays (`GeolocArrays::world_cells`).
+  - Across the antimeridian (#72): with `lon_wrap`, the arrays'
+    longitudes are unwrapped by continuity, so cells across the seam are
+    whole. Each outline is unwrapped too and walked at each whole turn
+    that reaches the cells, and one that goes round a pole is closed
+    along latitude 90 or -90. The same swath stored with its seam in
+    different places gives the same weights (to 1e-11, the rounding of
+    areas at longitude 180), and weight times cell area sums to the
+    outline's area across the seam.
+  - Fallback: arrays with a missing sample, arrays that fold, and, with
+    `lon_wrap`, arrays whose longitudes don't unwrap consistently (a
+    swath over a pole) or span more than 360 degrees keep the old
+    measure, decided once per set of arrays
+    (`GeolocArrays::world_cells`).
   - Values change for exact-footprint warps and weights from geolocation
     sources. Point kernels, the GDAL box footprint and affine sources are
     unchanged bit for bit. rwarp-r doesn't expose geolocation sources.
@@ -69,7 +79,8 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   geolocation arrays on the source side, and `GeolocArrays` on its own,
   report it when `GeolocArrays::world_cells()` is `Ok`;
   `ApproxTransformer` passes it through, with `dst_to_world`
-  unapproximated.
+  unapproximated. `SourceCells::lon_wrap` (default `false`) says world x
+  is longitude that wraps.
 - `GeolocArrays::world_cells`, whether the exact footprint measures a
   source with these arrays in world coordinates (and if not, why), and
   `GeolocArrays::window_mesh`, a source window's cells.

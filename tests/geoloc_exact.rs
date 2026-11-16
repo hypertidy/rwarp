@@ -11,8 +11,13 @@
 //! geolocation arrays gives the affine path's weights; the same cells
 //! given at another step, convention or window give the same weights.
 //!
-//! The CRS step is the identity (no backend needed) except in the last
-//! test.
+//! Across the antimeridian (#72): the same swath with its longitudes
+//! stored from anywhere gives the weights of the swath with nothing
+//! wrapped; the clip, generator 8 and sharing out hold across the seam;
+//! and a destination pixel round the pole is closed along it.
+//!
+//! The CRS step is the identity, or an analytic one, (no backend needed)
+//! except in `a_curvilinear_lonlat_source_to_a_polar_grid`.
 
 use std::collections::HashMap;
 
@@ -421,12 +426,17 @@ fn arrays_without_whole_cells_fall_back_to_source_pixels() {
     // a fold: a column of samples moved back over its neighbour
     let fold = |i: f64, j: f64| if i == 12.0 { sector(10.5, j) } else { sector(i, j) };
     check(arrays(fold, W + 1, H + 1, GeolocOptions::default()), "both orientations");
-    // longitudes across the antimeridian
-    let lonlat = |i: f64, j: f64| {
-        let lon = 170.0 + 0.5 * i;
-        [if lon > 180.0 { lon - 360.0 } else { lon }, -60.0 + 0.5 * j]
+    // longitudes round a pole: a grid centred on the north pole
+    let polar = |i: f64, j: f64| {
+        let (u, v) = (i - 20.3, j - 15.4);
+        [v.atan2(u).to_degrees(), 90.0 - 0.3 * u.hypot(v)]
     };
-    check(arrays(lonlat, W + 1, H + 1, GeolocOptions::default().with_lon_wrap(true)), "antimeridian");
+    check(arrays(polar, W + 1, H + 1, GeolocOptions::default().with_lon_wrap(true)), "unwrap consistently");
+    // longitudes over more than a turn
+    let long = |i: f64, j: f64| [-180.0 + 10.0 * i, -60.0 + 0.5 * j];
+    check(arrays(long, W + 1, H + 1, GeolocOptions::default().with_lon_wrap(true)), "more than 360");
+    // without lon_wrap the same longitudes are planar: whole cells
+    assert!(arrays(long, W + 1, H + 1, GeolocOptions::default()).world_cells().is_ok());
 }
 
 #[test]
@@ -557,5 +567,342 @@ fn a_curvilinear_lonlat_source_to_a_polar_grid() {
         assert!(inside > 200);
         assert!(worst < 1e-11, "{worst}");
         assert!(worst_old > 1e-5, "{worst_old}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Across the antimeridian (#72)
+// ---------------------------------------------------------------------------
+
+/// The identity on longitude and latitude, returning longitudes in
+/// -180..180 as PROJ does.
+struct Wrap;
+
+impl CrsTransform for Wrap {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        Some(((x + 180.0).rem_euclid(360.0) - 180.0, y))
+    }
+}
+
+/// A curved longitude/latitude swath over the antimeridian, its
+/// longitudes continuous (171 to 194).
+fn swath(i: f64, j: f64) -> [f64; 2] {
+    [172.0 + 0.4 * i + 0.15 * j + 0.6 * (j / 7.0).sin(), -40.0 + 0.35 * j + 0.8 * (i / 9.0).sin()]
+}
+
+/// Longitude `x` stored in `lo..lo + 360`.
+fn stored(x: f64, lo: f64) -> f64 {
+    lo + (x - lo).rem_euclid(360.0)
+}
+
+/// The swath's samples at raster pixel corners, or at centres, with
+/// longitudes stored from `lo`.
+fn swath_arrays(lo: f64, centre: bool, lon_wrap: bool) -> GeolocArrays {
+    let opts = GeolocOptions::default().with_lon_wrap(lon_wrap);
+    let at = move |i: f64, j: f64| {
+        let p = if centre { swath(i + 0.5, j + 0.5) } else { swath(i, j) };
+        [stored(p[0], lo), p[1]]
+    };
+    if centre {
+        arrays(at, W, H, opts.with_convention(GeolocConvention::PixelCenter))
+    } else {
+        arrays(at, W + 1, H + 1, opts)
+    }
+}
+
+/// 36 x 36 destination cells of 0.75 degrees, slightly rotated, over the
+/// swath and beyond it, across the antimeridian (longitude 168.5 to 196).
+const SN: usize = 36;
+const SEAM_GT: [f64; 6] = [168.5, 0.75, 0.02, -24.0, 0.015, -0.75];
+
+fn seam_geoloc(g: GeolocArrays, crs: impl CrsTransform + 'static) -> GenImgGeolocTransformer {
+    GenImgGeolocTransformer::with_backend(PixelGeo::Geoloc(g), PixelGeo::affine(SEAM_GT).unwrap(), Box::new(crs), Box::new(Id))
+}
+
+/// The weights over the swath stored with its longitudes from `lo`,
+/// destination longitudes returned in -180..180.
+fn seam_weights(lo: f64, centre: bool, densify: usize) -> Weights {
+    let g = swath_arrays(lo, centre, true);
+    assert!(g.world_cells().is_ok(), "{:?}", g.world_cells());
+    exact_weights(&seam_geoloc(g, Wrap), &GridWindow::new(W, H), SN, SN, &WeightOptions::new(densify))
+}
+
+#[test]
+fn the_seam_can_be_anywhere_in_the_arrays() {
+    // the reference: longitudes continuous on both sides, nothing wraps
+    for centre in [false, true] {
+        let g = swath_arrays(0.0, centre, false);
+        let reference = exact_weights(&seam_geoloc(g, Id), &GridWindow::new(W, H), SN, SN, &WeightOptions::new(2));
+        let want = table(&reference);
+        for lo in [-180.0, 175.0, 185.0, 0.0, -200.0] {
+            // jumps between neighbours along the rows of stored samples
+            let jumps = (0..H)
+                .flat_map(|j| (0..W - 1).map(move |i| (i as f64, j as f64)))
+                .filter(|&(i, j)| (stored(swath(i + 1.0, j)[0], lo) - stored(swath(i, j)[0], lo)).abs() > 180.0)
+                .count();
+            let w = seam_weights(lo, centre, 2);
+            let d = max_diff(&table(&w), &want);
+            let mut da: f64 = 0.0;
+            for (a, b) in w.dst_area.iter().zip(&reference.dst_area) {
+                assert_eq!(a.is_nan(), b.is_nan());
+                if !a.is_nan() {
+                    da = da.max((a - b).abs() / b);
+                }
+            }
+            eprintln!(
+                "centre {centre}, stored from {lo}: {jumps} jumps, {} entries ({} without wrapping), max |frac diff| {d:.1e}, |area diff| {da:.1e}",
+                w.len(),
+                reference.len()
+            );
+            // longitudes near 180 (and 535 stored from 175) against cells
+            // of 0.4 degrees: areas lose about 1e-11 to cancellation, as
+            // the reference does against an exact clip
+            assert!(d < 5e-11, "{d}");
+            assert!(da < 1e-12, "{da}");
+            assert_eq!(jumps > 0, [-180.0, 175.0, 185.0].contains(&lo), "stored from {lo}");
+        }
+    }
+}
+
+
+/// `p` moved so that `o` is the origin, to keep areas of small cells far
+/// from it exact.
+fn local(p: &[[f64; 2]], o: [f64; 2]) -> Vec<[f64; 2]> {
+    p.iter().map(|q| [q[0] - o[0], q[1] - o[1]]).collect()
+}
+
+fn swath_cell(sr: usize, sc: usize) -> [[f64; 2]; 4] {
+    let (i, j) = (sc as f64, sr as f64);
+    [swath(i, j), swath(i + 1.0, j), swath(i + 1.0, j + 1.0), swath(i, j + 1.0)]
+}
+
+fn seam_pixel(r: usize, c: usize) -> [[f64; 2]; 4] {
+    let (y, x) = (r as f64, c as f64);
+    [dst_corner(SEAM_GT, x, y), dst_corner(SEAM_GT, x + 1.0, y), dst_corner(SEAM_GT, x + 1.0, y + 1.0), dst_corner(SEAM_GT, x, y + 1.0)]
+}
+
+#[test]
+fn every_weight_across_the_seam_is_the_clipped_area() {
+    let w = seam_weights(-180.0, false, 2);
+    let got = table(&w);
+    let (mut worst, mut worst_area, mut across): (f64, f64, usize) = (0.0, 0.0, 0);
+    for r in 0..SN {
+        for c in 0..SN {
+            let p = seam_pixel(r, c);
+            let crosses = p.iter().any(|q| q[0] < 180.0) && p.iter().any(|q| q[0] > 180.0);
+            for sr in 0..H {
+                for sc in 0..W {
+                    let q = swath_cell(sr, sc);
+                    let o = q[0];
+                    let f = area(&clip(&local(&q, o), &local(&p, o))).abs() / area(&local(&q, o)).abs();
+                    let g = got.get(&(r as u32, c as u32, sr as u32, sc as u32)).copied().unwrap_or(0.0);
+                    if crosses && g > 0.0 {
+                        across += 1;
+                    }
+                    worst = worst.max((f - g).abs());
+                }
+            }
+        }
+    }
+    for k in 0..w.len() {
+        let q = swath_cell(w.src_row[k] as usize, w.src_col[k] as usize);
+        let a = area(&local(&q, q[0])).abs();
+        worst_area = worst_area.max((w.src_area(k) - a).abs() / a);
+    }
+    eprintln!("{} entries, {across} for pixels across 180: max |weight - clip| {worst:.1e}, cell areas {worst_area:.1e}", w.len());
+    assert!(across > 100);
+    assert!(worst < 5e-11, "{worst}");
+    assert!(worst_area < 1e-11, "{worst_area}");
+}
+
+#[test]
+fn generator_8_holds_across_the_seam() {
+    // for a pixel inside the swath, weight times cell area sums to the
+    // outline's area: the destination cell's, a parallelogram
+    let det = (SEAM_GT[1] * SEAM_GT[5] - SEAM_GT[2] * SEAM_GT[4]).abs();
+    for centre in [false, true] {
+        let w = seam_weights(-180.0, centre, 2);
+        let sum = covered(&w);
+        // inside: every entry away from the swath's edge cells
+        let (mut any, mut deep) = (vec![false; SN * SN], vec![true; SN * SN]);
+        for k in 0..w.len() {
+            let d = w.dst_row[k] as usize * SN + w.dst_col[k] as usize;
+            any[d] = true;
+            let (r, c) = (w.src_row[k] as usize, w.src_col[k] as usize);
+            if r == 0 || c == 0 || r + 1 >= H || c + 1 >= W {
+                deep[d] = false;
+            }
+        }
+        let (mut inside, mut across, mut worst) = (0, 0, 0.0f64);
+        for r in 0..SN {
+            for c in 0..SN {
+                let k = r * SN + c;
+                assert!((w.dst_area[k] - det).abs() < 1e-12 * det, "({r}, {c}): outline area {} vs {det}", w.dst_area[k]);
+                if any[k] && deep[k] {
+                    inside += 1;
+                    let p = seam_pixel(r, c);
+                    if p.iter().any(|q| q[0] < 180.0) && p.iter().any(|q| q[0] > 180.0) {
+                        across += 1;
+                    }
+                    worst = worst.max((sum[k] - det).abs() / det);
+                }
+            }
+        }
+        eprintln!("centre {centre}: {inside} pixels inside, {across} across 180: max relative error {worst:.1e}");
+        assert!(inside > 100 && across >= 8, "{inside}, {across}");
+        assert!(worst < 1e-11, "{worst}");
+    }
+}
+
+#[test]
+fn swath_cells_are_shared_out_whole_across_the_seam() {
+    // every swath cell is inside the destination: its weights sum to 1
+    for centre in [false, true] {
+        let w = seam_weights(-180.0, centre, 2);
+        let mut sum = vec![0.0; W * H];
+        for k in 0..w.len() {
+            sum[w.src_row[k] as usize * W + w.src_col[k] as usize] += w.frac[k];
+        }
+        let worst = sum.iter().fold(0.0f64, |m, s| m.max((s - 1.0).abs()));
+        eprintln!("centre {centre}: max |sum - 1| over {} swath cells {worst:.1e}", W * H);
+        assert!(worst < 1e-11, "{worst}");
+    }
+}
+
+#[test]
+fn source_windows_split_the_weights_across_the_seam() {
+    // the swath crosses 180 near column 20; windows on either side of it,
+    // and across it
+    let t = seam_geoloc(swath_arrays(-180.0, false, true), Wrap);
+    let opts = WeightOptions::new(2);
+    let whole = exact_weights(&t, &GridWindow::new(W, H), SN, SN, &opts);
+    for windows in [
+        vec![(0, 0, 20, H), (20, 0, W - 20, H)],
+        vec![(0, 0, W, 13), (0, 13, 25, H - 13), (25, 13, W - 25, H - 13)],
+    ] {
+        let mut parts: Table = HashMap::new();
+        for &(col_off, row_off, ncol, nrow) in &windows {
+            let w = exact_weights(&t, &GridWindow::new(ncol, nrow).with_offset(col_off, row_off), SN, SN, &opts);
+            assert_eq!(w.dst_area, whole.dst_area, "the outline's area does not depend on the window");
+            for (k, v) in table(&w) {
+                assert!(parts.insert(k, v).is_none());
+            }
+        }
+        let d = max_diff(&table(&whole), &parts);
+        eprintln!("{windows:?}: max difference {d:.1e}");
+        assert!(d < 1e-12, "{d}");
+    }
+}
+
+/// The destination near the north pole: world `(x, y)` in degrees of
+/// colatitude, `x` towards longitude 0, to longitude (-180..180) and
+/// latitude.
+struct Polar;
+
+impl CrsTransform for Polar {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        Some((y.atan2(x).to_degrees(), 90.0 - x.hypot(y)))
+    }
+}
+
+struct PolarInv;
+
+impl CrsTransform for PolarInv {
+    fn convert(&self, lon: f64, lat: f64) -> Option<(f64, f64)> {
+        let (s, c) = lon.to_radians().sin_cos();
+        Some(((90.0 - lat) * c, (90.0 - lat) * s))
+    }
+}
+
+/// A swath near the pole across the antimeridian, longitude 110 to 200
+/// and latitude 82 to 89.6, stored in -180..180.
+fn polar_swath(i: f64, j: f64) -> [f64; 2] {
+    [stored(110.0 + 2.25 * i + 0.5 * (j / 5.0).sin(), -180.0), 82.0 + 0.25 * j + 0.1 * (i / 6.0).sin()]
+}
+
+/// 21 x 21 destination pixels of 1 degree of colatitude, the pole at the
+/// centre of pixel (10, 10).
+const PN: usize = 21;
+const POLAR_GT: [f64; 6] = [-10.5, 1.0, 0.0, 10.5, 0.0, -1.0];
+
+fn polar_geoloc() -> GenImgGeolocTransformer {
+    let g = arrays(polar_swath, W + 1, H + 1, GeolocOptions::default().with_lon_wrap(true));
+    assert!(g.world_cells().is_ok(), "{:?}", g.world_cells());
+    GenImgGeolocTransformer::with_backend(PixelGeo::Geoloc(g), PixelGeo::affine(POLAR_GT).unwrap(), Box::new(Polar), Box::new(PolarInv))
+}
+
+#[test]
+fn a_destination_pixel_round_the_pole_is_closed_along_it() {
+    let t = polar_geoloc();
+    for densify in [1, 4] {
+        let w = exact_weights(&t, &GridWindow::new(W, H), PN, PN, &WeightOptions::new(densify));
+        // every swath cell is inside the destination: its weights sum to 1,
+        // the pole pixel's share included
+        let mut sum = vec![0.0; W * H];
+        let (mut pole, mut west, mut east) = (0, false, false);
+        for k in 0..w.len() {
+            sum[w.src_row[k] as usize * W + w.src_col[k] as usize] += w.frac[k];
+            if (w.dst_row[k], w.dst_col[k]) == (10, 10) {
+                pole += 1;
+                // its outline is unwrapped from longitude 135 (column 11.1
+                // of the swath), so it reaches the swath at two turns, one
+                // either side
+                west |= w.src_col[k] < 11;
+                east |= w.src_col[k] > 11;
+            }
+        }
+        assert!(west && east);
+        let worst = sum.iter().fold(0.0f64, |m, s| m.max((s - 1.0).abs()));
+        // the pole pixel is the region between its outline and latitude
+        // 90. Its four corners are at colatitude h sqrt 2 (h = 0.5): with
+        // densify 1 the region is 360 by that. Densified, it nears the
+        // curve's, 8 ln(1 + sqrt 2) h square degrees per radian, from
+        // above (colatitude is convex in longitude along each side).
+        let h = 0.5;
+        let corners = 360.0 * h * 2f64.sqrt();
+        let curve = 8.0 * (1.0 + 2f64.sqrt()).ln() * h * 180.0 / std::f64::consts::PI;
+        let a = w.dst_area[10 * PN + 10];
+        eprintln!(
+            "densify {densify}: {} entries, {pole} for the pole pixel, max |sum - 1| {worst:.1e}; pole pixel area {a:.3} (corners {corners:.3}, curve {curve:.3})",
+            w.len()
+        );
+        assert!(pole > 10, "{pole}");
+        assert!(worst < 1e-11, "{worst}");
+        if densify == 1 {
+            assert!((a - corners).abs() < 1e-12 * corners, "{a} vs {corners}");
+        } else {
+            assert!(a > curve && a < curve + 0.1 * (corners - curve), "{a}: not between {curve} and {corners}");
+        }
+    }
+}
+
+#[test]
+fn warp_reduces_the_same_weights_across_the_seam_and_round_the_pole() {
+    for (t, n) in [(seam_geoloc(swath_arrays(-180.0, false, true), Wrap), SN), (polar_geoloc(), PN)] {
+        let opts = WarpOptions::new(ResampleAlg::Average)
+            .with_footprint(Footprint::Exact { densify: 2 })
+            .with_src_nodata(Nodata::None);
+        let mut data = Vec::with_capacity(W * H * 2);
+        for r in 0..H {
+            for c in 0..W {
+                data.push(((r * 7 + c * 13) % 17) as f64 + 0.25 * c as f64);
+                data.push(42.0);
+            }
+        }
+        let buf = SourceBuffer { data: &data, ncol: W, nrow: H, nbands: 2, col_off: 0, row_off: 0 };
+        let out: Vec<f64> = warp(&t, &buf, n, n, &opts);
+        let w = exact_weights(&t, &GridWindow::new(W, H), n, n, &WeightOptions::warp_compatible(2));
+        let applied: Vec<f64> = w.apply(&buf, Normalization::FracArea, &ApplyOptions::new());
+        let mut set = 0;
+        for k in 0..n * n {
+            if out[2 * k].is_finite() && out[2 * k] != 0.0 {
+                set += 1;
+                assert!((out[2 * k + 1] - 42.0).abs() < 1e-12, "constant field gives {}", out[2 * k + 1]);
+            }
+            assert_eq!(out[2 * k].to_bits(), applied[2 * k].to_bits(), "pixel {k}: {} vs {}", out[2 * k], applied[2 * k]);
+            assert_eq!(out[2 * k + 1].to_bits(), applied[2 * k + 1].to_bits());
+        }
+        eprintln!("{n} x {n}: {set} pixels with values, all the same bits as Weights::apply");
+        assert!(set > 30);
     }
 }

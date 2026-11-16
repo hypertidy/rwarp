@@ -105,9 +105,12 @@
 //! [`GenImgProjTransformer`](crate::transform::GenImgProjTransformer)
 //! does once it has the source size). Without it, a destination cell whose
 //! outline crosses the source's wrap column folds across the whole source
-//! width, and its weights are wrong. Over source world cells this is not
-//! yet done: geolocation arrays that cross the antimeridian fall back to
-//! source pixel space ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)).
+//! width, and its weights are wrong. Over source world cells the same is
+//! done in world coordinates, a turn being 360 degrees, when the cells'
+//! longitudes wrap
+//! ([`SourceCells::lon_wrap`](crate::transform::SourceCells::lon_wrap));
+//! geolocation arrays over a pole fall back to source pixel space
+//! ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)).
 //! The spherical measure takes cell edges straight in
 //! source pixel space (rhumb lines on a longitude/latitude source), not
 //! great circles as ESMF does; see `design/conservative.md` and

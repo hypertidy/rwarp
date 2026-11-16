@@ -195,6 +195,16 @@ pub trait SourceCells {
     /// computed point by point, so neighbouring windows share their edge
     /// exactly.
     fn mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String>;
+
+    /// Whether world x is longitude in degrees, periodic with 360, as for
+    /// geolocation arrays with
+    /// [`GeolocOptions::lon_wrap`](crate::geoloc_transform::GeolocOptions::lon_wrap).
+    /// An outline that crosses the antimeridian is then unwrapped and
+    /// measured at each whole turn that reaches the cells, and one that
+    /// goes round a pole is closed along latitude 90 or -90.
+    fn lon_wrap(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
