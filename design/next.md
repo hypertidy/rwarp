@@ -15,7 +15,8 @@ This file is a snapshot, so replace it rather than append to it.
 | controlledburn | 0.3.1 | 2026-11-12 | `relate_cells` (0.3.0: `burn_par`, `burn_window`, `merge_parts`, `f32` edges kept) |
 | bigcurve (crate) | 0.3.0 | 2026-11-04 | |
 
-`v0.4.0` is not tagged yet: `git tag v0.4.0 6a4c337`, then push the tag.
+`v0.4.0` was tagged on 2026-11-16 (annotated, on `6a4c337`, the commit
+the crate was published from).
 
 ## Open
 
@@ -28,16 +29,20 @@ This file is a snapshot, so replace it rather than append to it.
   faster after that, because the largest polygon takes 0.33 s alone and
   one geometry is never split. With one thread it stays on the calling
   thread, so it works on wasm.
-- **#60** moves rwarp-r's `Cargo.lock` to rwarp 0.3.3. Main's
-  R-CMD-check has failed since 2026-11-08 because the lock pinned 0.3.2
-  while `Cargo.toml` asked for 0.3.3, and `cargo vendor --locked`
-  refuses that. `tools/vendor.sh` used to discard cargo's error output,
-  so the log showed only exit code 101. Now it keeps the errors.
+- **#60**, merged 2026-11-16, moved rwarp-r's `Cargo.lock` to rwarp
+  0.3.3. Main's R-CMD-check had failed since 2026-11-08 because the lock
+  pinned 0.3.2 while `Cargo.toml` asked for 0.3.3, and
+  `cargo vendor --locked` refuses that. `tools/vendor.sh` used to discard
+  cargo's error output, so the log showed only exit code 101. Now it
+  keeps the errors. Main's R-CMD-check passes again.
+- **#61**, merged 2026-11-16, and its follow-up: softer landing pages for
+  the book and the R README (the usual tools first, then rwarp's
+  equivalents, then when you might reach for rwarp), and stale pages
+  fixed.
 
 ## Next, in order
 
-1. Merge #60, tag `v0.4.0`, and publish 0.4.1 (#59's `burn_par`) when
-   ready.
+1. Publish 0.4.1 (#59's `burn_par`) when ready.
 2. **rwarp-r on rwarp 0.4.x**, when R should get controlledburn 0.3 or
    `burn_par`: bump `rwarp-r/src/rust/Cargo.toml`, run
    `cargo update -p rwarp`, and commit the lock. The lock and the
