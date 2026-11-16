@@ -1,25 +1,24 @@
 ---
 title: "GHRSST SST: Reproject to Antarctic Polar Stereographic"
-output: rmarkdown::html_vignette
-vignette: >
-  %\VignetteIndexEntry{GHRSST SST: Reproject to Antarctic Polar Stereographic}
-  %\VignetteEngine{knitr::rmarkdown}
-  %\VignetteEncoding{UTF-8}
 ---
 
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(
   collapse = TRUE, comment = "#>",
-  eval = identical(Sys.getenv("VWARP_VIGNETTES"), "true")
+  fig.path = "figures/ghrsst-polar-", dpi = 144
 )
 ```
 
 ## Overview
 
-This vignette reprojects a NASA GHRSST MUR v2 Sea Surface Temperature COG
+This article reprojects a NASA GHRSST MUR v2 Sea Surface Temperature COG
 from its native `EPSG:4326` (geographic) to `EPSG:3412`
 (NSIDC Antarctic Polar Stereographic), covering a 1000 km x 1000 km region
-centred at 60 degS / 0 degE.
+centred at 52 degS / 0 degE, across the Antarctic Polar Front.
+
+This article reads from the network (the MUR archive on Source
+Cooperative), so it is precomputed: the output below was made when the
+article was last knitted (see the end), not when the site was built.
 
 It also demonstrates the **byte-ref read path**: instead of using GDAL to
 read the source, we show how the same `read_fn` interface accepts a custom
@@ -51,17 +50,17 @@ cat("Source dimensions:", src_dim, "\n")
 cat("Source pixel size:", src_gt[2], "x", abs(src_gt[6]), "degrees\n")
 ```
 
-## Destination: Antarctic tile at 25 km resolution
+## Destination: Antarctic tile at 10 km resolution
 
 ```{r destination}
 dst_crs    <- "EPSG:3412"
 
-## Centre of interest: 0 degE, 60 degS
-center_ll  <- cbind(0, -60)
+## Centre of interest: 0 degE, 52 degS
+center_ll  <- cbind(0, -52)
 center_3412 <- reproj_xy(center_ll, target = dst_crs, source = "EPSG:4326")
 cat("Center in EPSG:3412:", round(center_3412, 0), "\n")
 
-## 1000 km x 1000 km tile, 25 km pixels -> 40 x 40 grid
+## 1000 km x 1000 km tile, 10 km pixels -> 100 x 100 grid
 tile_radius <- 500000   # metres
 dst_ext <- c(
   center_3412[1] - tile_radius,
@@ -69,7 +68,7 @@ dst_ext <- c(
   center_3412[2] - tile_radius,
   center_3412[2] + tile_radius
 )
-dst_dim <- c(40L, 40L)
+dst_dim <- c(100L, 100L)
 dst_gt  <- extent_dim_to_gt(dst_ext, dst_dim)
 
 cat("Destination extent (EPSG:3412):", round(dst_ext), "\n")
@@ -108,7 +107,7 @@ result_gdal <- warp_exec(
   src_crs   = src_crs, src_gt = src_gt,
   dst_crs   = dst_crs, dst_gt = dst_gt,
   dst_size  = dst_dim,
-  nodata    = nodata
+  src_nodata = nodata, dst_nodata = nodata
 )
 
 ## Scale factor: MUR SST is stored as int16, scale 0.001 + offset 298.15 -> Celsius
@@ -124,9 +123,9 @@ cat("SST range (Celsius):", round(range(sst_celsius, na.rm = TRUE), 2), "\n")
 if (requireNamespace("ximage", quietly = TRUE)) {
   ximage::ximage(
     sst_celsius, dst_ext,
-    main = "MUR SST 2025-11-26 | EPSG:3412 | 25 km",
+    main = "MUR SST 2025-11-26 | EPSG:3412 | 10 km",
     col  = rev(hcl.colors(256, "RdYlBu")),
-    zlim = c(-2, 25)
+    zlim = range(sst_celsius, na.rm = TRUE), asp = 1
   )
 }
 ds$close()
@@ -171,3 +170,10 @@ result_byteref <- warp_exec(
 
 This is the key architectural property of rwarp: the warp kernel and the data
 source are fully decoupled.
+
+
+## Built with
+
+Knitted on `r format(Sys.Date())` with the rwarp R package
+`r packageVersion("rwarp")`, reading through gdalraster
+`r packageVersion("gdalraster")` (`r sub(",.*", "", gdalraster::gdal_version()[1])`).

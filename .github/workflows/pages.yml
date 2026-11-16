@@ -104,8 +104,10 @@ jobs:
       - name: Install rwarp-r dependencies
         # pkg.sysreqs = FALSE: prevent pak from apt-installing libgdal-dev /
         # libproj-dev which would shadow the /usr/local builds in the image.
-        # vaster and ximage are needed for vignettes; pkgdown/quarto/knitr are
-        # already in the image but listed for explicitness.
+        # gdalraster, vapour (sst.tif), vaster and ximage are needed for the
+        # vignettes and examples; pkgdown/quarto/knitr are already in the
+        # image but listed for explicitness. The network articles in
+        # vignettes/articles/ are precomputed and run nothing here.
         working-directory: rwarp-r
         run: |
           Rscript -e "
@@ -118,7 +120,7 @@ jobs:
             Sys.setenv(PKG_SYSREQS = 'false')
             pak::pkg_install(
               c('pkgdown', 'quarto', 'knitr', 'rmarkdown',
-                'vaster', 'ximage', 'gdalraster', 'remotes'),
+                'vaster', 'ximage', 'gdalraster', 'vapour', 'remotes'),
               ask = FALSE, upgrade = FALSE
             )
           "

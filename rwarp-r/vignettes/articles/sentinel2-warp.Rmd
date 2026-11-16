@@ -1,23 +1,13 @@
 ---
 title: "Sentinel-2: two UTM zones onto one grid"
-output: rmarkdown::html_vignette
-vignette: >
-  %\VignetteIndexEntry{Sentinel-2: two UTM zones onto one grid}
-  %\VignetteEngine{knitr::rmarkdown}
-  %\VignetteEncoding{UTF-8}
 ---
 
-```{r setup, include = FALSE}
-knitr::opts_chunk$set(
-  collapse = TRUE, comment = "#>",
-  eval = identical(Sys.getenv("VWARP_VIGNETTES"), "true")
-)
-```
+
 
 Sentinel-2 tiles come in the UTM zone they fall in, so an area that crosses
 a zone boundary arrives in two coordinate systems. Meridian 144 degrees
 east, the line between zones 54 and 55, runs through the Great Ocean Road
-in Victoria, Australia. This vignette takes the two tiles from one overpass
+in Victoria, Australia. This article takes the two tiles from one overpass
 (3 February 2026), tile 54HYC in zone 54 and 55HBT in zone 55, and warps
 three bands of each, as floating-point surface reflectance, onto one grid:
 GDA94 / Australian Albers (EPSG:3577) at 100 m.
@@ -28,12 +18,15 @@ Here each tile is planned and warped with rwarp, the two results are
 combined the way gdalwarp combines its inputs, and the end compares that
 with gdalwarp's own mosaic of the same sources.
 
-The vignette reads from the network (Element 84's Earth Search catalogue of
-Sentinel-2 on AWS), so its code runs only with `VWARP_VIGNETTES=true`.
+This article reads from the network (Element 84's Earth Search catalogue
+of Sentinel-2 on AWS), so it is precomputed: the output below was made when
+the article was last knitted (see the end), not when the site was built.
 
-```{r libraries}
+
+``` r
 library(rwarp)
 library(gdalraster)
+#> GDAL 3.14.0dev-9bb42f5a7b-dirty (released 2026-11-11), GEOS 3.12.1, PROJ 9.8.1
 ```
 
 ## The two tiles
@@ -49,7 +42,8 @@ an ordinary raster. gdalwarp picks an overview by itself when it
 downsamples (`-ovr AUTO`); rwarp warps whatever `read_fn` reads, so the
 choice is made here, in the source path.
 
-```{r sources}
+
+``` r
 base <- paste0("/vsicurl/https://e84-earth-search-sentinel-data.s3.",
                "us-west-2.amazonaws.com/sentinel-2-c1-l2a")
 scenes <- c(
@@ -73,6 +67,9 @@ info <- lapply(src, function(ds) list(
 t(sapply(info, function(i) c(crs = srs_get_name(i$crs),
                              pixel = round(i$gt[2], 2),
                              size = paste(i$dim, collapse = " x "))))
+#>       crs                     pixel   size         
+#> 54HYC "WGS 84 / UTM zone 54S" "79.97" "1373 x 1373"
+#> 55HBT "WGS 84 / UTM zone 55S" "79.97" "1373 x 1373"
 ```
 
 ## One destination grid
@@ -80,7 +77,8 @@ t(sapply(info, function(i) c(crs = srs_get_name(i$crs),
 A longitude/latitude box across the zone boundary, taken into Albers and
 snapped to 100 m:
 
-```{r destination}
+
+``` r
 dst_crs <- "EPSG:3577"
 res     <- 100
 ll  <- c(143.3, 144.8, -38.9, -38.05)   # xmin, xmax, ymin, ymax
@@ -90,6 +88,7 @@ ext <- c(floor(ext[1] / res), ceiling(ext[2] / res),
 dst_dim <- as.integer(round(c(ext[2] - ext[1], ext[4] - ext[3]) / res))
 dst_gt  <- c(ext[1], res, 0, ext[4], 0, -res)
 dst_dim
+#> [1] 1403 1056
 ```
 
 ## A plan for each tile
@@ -103,7 +102,8 @@ see it, three bands worked as Float64 with nodata, and using gdalwarp's
 rules for splitting and for the kernel scale (see "Planning as gdalwarp
 does" in `?warp_plan`).
 
-```{r plan}
+
+``` r
 alg <- "cubic"
 plans <- lapply(info, function(i) {
   warp_plan(i$crs, i$gt, i$dim, dst_crs, dst_gt,
@@ -115,6 +115,16 @@ do.call(rbind, lapply(names(plans), function(s) {
   ch <- unlist(plans[[s]], recursive = FALSE)
   cbind(tile = s, do.call(rbind, lapply(ch, as.data.frame)))
 }))
+#>    tile dst_xoff dst_yoff dst_xsize dst_ysize src_xoff src_yoff src_xsize
+#> 1 54HYC        0        0       701      1056        0        0       872
+#> 2 54HYC      701        0       702      1056      786        0       587
+#> 3 55HBT        0        0       701      1056        0        0       623
+#> 4 55HBT      701        0       702      1056      450        0       923
+#>   src_ysize fill_ratio   scale_x   scale_y
+#> 1      1373  0.9015818 0.8064517 0.7925960
+#> 2      1373  0.6083330 0.8064513 0.7925959
+#> 3      1373  0.5733413 0.8061403 0.7922899
+#> 4      1373  0.8526005 0.8061404 0.7922903
 ```
 
 Three Float64 bands and their nodata masks take 195 bits a pixel, and this
@@ -139,7 +149,8 @@ here, and by up to 93 DN with cubic at 50 m).
 row-major, one after another. Here it also turns the integers into
 reflectance, with NaN for nodata, so the warp works on doubles.
 
-```{r read-fn}
+
+``` r
 reader <- function(ds) {
   function(xoff, yoff, xsize, ysize) {
     dn <- unlist(lapply(ds, function(d) d$read(1L, xoff, yoff, xsize, ysize,
@@ -153,7 +164,8 @@ reader <- function(ds) {
 
 ## Warp each tile, then combine
 
-```{r warp}
+
+``` r
 warped <- lapply(names(scenes), function(s) {
   i <- info[[s]]
   warp_exec(plans[[s]], reader(src[[s]]), i$crs, i$gt, dst_crs, dst_gt,
@@ -161,24 +173,29 @@ warped <- lapply(names(scenes), function(s) {
 })
 names(warped) <- names(scenes)
 str(warped[["54HYC"]])
+#>  num [1:1056, 1:1403, 1:3] NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN ...
 ```
 
 Each result is an array `c(nrow, ncol, 3)` of reflectance, `NaN` where the
 tile doesn't reach (`is.na()` is `TRUE` there). gdalwarp, given several inputs, warps them in order and
 each one writes over the destination wherever it has a value. The same here:
 
-```{r mosaic}
+
+``` r
 mosaic <- warped[["54HYC"]]
 later  <- !is.na(warped[["55HBT"]])
 mosaic[later] <- warped[["55HBT"]][later]
 c(`54HYC` = mean(!is.na(warped[["54HYC"]])),
   `55HBT` = mean(!is.na(warped[["55HBT"]])),
   mosaic  = mean(!is.na(mosaic)))
+#>     54HYC     55HBT    mosaic 
+#> 0.7356341 0.7509193 0.9074710
 ```
 
 Each tile sits at its own angle in Albers:
 
-```{r plot-tiles, fig.width = 7.5, fig.height = 3.4}
+
+``` r
 stretch <- function(a) {
   a[] <- pmin(1, pmax(0, a / 0.18))^(1 / 1.6)
   a
@@ -188,18 +205,29 @@ for (s in names(warped)) {
   ximage::ximage(stretch(warped[[s]]), ext, asp = 1, axes = FALSE,
                  main = paste(s, "in EPSG:3577"))
 }
+```
+
+![plot of chunk plot-tiles](figures/sentinel2-warp-plot-tiles-1.jpeg)
+
+``` r
 par(op)
 ```
 
 and together they fill the box apart from its corners. The dashed line is
 144 E, the boundary between the zones:
 
-```{r plot-mosaic, fig.width = 7.5, fig.height = 6}
+
+``` r
 op <- par(mar = c(1, 1, 2, 1))
 ximage::ximage(stretch(mosaic), ext, asp = 1, axes = FALSE,
                main = "54HYC and 55HBT, 3 February 2026")
 lines(reproj::reproj_xy(cbind(144, seq(-38.95, -38, by = 0.05)),
                         dst_crs, source = "EPSG:4326"), lty = 2, col = "white")
+```
+
+![plot of chunk plot-mosaic](figures/sentinel2-warp-plot-mosaic-1.jpeg)
+
+``` r
 par(op)
 ```
 
@@ -211,7 +239,8 @@ doesn't round to integers. gdalwarp warps the integers and the reflectance
 scaling comes after; the kernels are weighted means, so that order gives the
 same values up to rounding.
 
-```{r gdalwarp}
+
+``` r
 vrt <- vapply(scenes, function(s) {
   f <- tempfile(fileext = ".vrt")
   buildVRT(f, vapply(bands, function(b) src_path(s, b), ""),
@@ -234,7 +263,9 @@ for (b in seq_along(bands)) {
 g$close()
 
 identical(is.na(mosaic), is.na(gd))   # the same pixels have data
+#> [1] TRUE
 max(abs(mosaic - gd), na.rm = TRUE)   # and the same values, to rounding
+#> [1] 9.964252e-12
 ```
 
 ## Warp again without reading again
@@ -246,7 +277,8 @@ the step `warp_exec()` runs for each chunk. Here that's the window all of
 55HBT's chunks need, read once, and each chunk warped from it with its own
 kernel scale:
 
-```{r buffer}
+
+``` r
 chs <- plans[["55HBT"]][[1]]
 i   <- info[["55HBT"]]
 lo  <- c(min(sapply(chs, `[[`, "src_xoff")), min(sapply(chs, `[[`, "src_yoff")))
@@ -268,16 +300,18 @@ again <- function(resample) {
   out
 }
 identical(again("cubic"), warped[["55HBT"]])
+#> [1] TRUE
 
 ## how far nearest neighbour and averaging are from cubic, in reflectance
 sapply(c(near = "near", average = "average"), function(r) {
   stats::quantile(abs(again(r) - warped[["55HBT"]]), c(0.5, 0.99), na.rm = TRUE)
 })
+#>             near      average
+#> 50% 0.0009483756 0.0006150333
+#> 99% 0.0239033324 0.0112726711
 ```
 
-```{r close, include = FALSE}
-for (ds in src) for (d in ds) d$close()
-```
+
 
 ## HLS
 
@@ -286,3 +320,10 @@ zones, so the same steps apply: a plan per tile, a `read_fn` that scales the
 bands (HLS stores reflectance as `dn * 0.0001` with -9999 for nodata), and
 the tiles combined in order. HLS is served from NASA's LP DAAC and needs an
 Earthdata login for GDAL to read it.
+
+
+## Built with
+
+Knitted on 2026-11-16 with the rwarp R package
+0.1.0.9000, reading through gdalraster
+2.7.0.9004 (GDAL 3.14.0dev-9bb42f5a7b-dirty).

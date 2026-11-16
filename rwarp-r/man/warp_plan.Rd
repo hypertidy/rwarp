@@ -137,12 +137,11 @@ chunk.
 }
 
 \examples{
-\dontrun{
-library(vaster)
-
-src_gt  <- extent_dim_to_gt(c(-180, 180, -90, 90), c(36000L, 18000L))
-dst_ext <- c(-20037508, 20037508, -20037508, 20037508)
-dst_gt  <- extent_dim_to_gt(dst_ext, c(512L, 512L))
+## a global 0.01 degree source onto one 512 x 512 Web Mercator tile:
+## geometry only, nothing is read
+src_gt <- c(-180, 0.01, 0, 90, 0, -0.01)
+w      <- 20037508.34
+dst_gt <- c(-w, 2 * w / 512, 0, w, 0, -2 * w / 512)
 
 plan <- warp_plan(
   src_crs  = "EPSG:4326",
@@ -152,9 +151,16 @@ plan <- warp_plan(
   dst_gt   = dst_gt,
   dst_size = c(512L, 512L)
 )
-length(plan)               # 1 normally; 2 at the antimeridian
-plan[[1]][[1]]$fill_ratio  # how much of the dst tile is covered
-}
+length(plan[[1]])          # chunks
+str(plan[[1]][[1]])        # source window, fill ratio, kernel scale
+
+## as gdalwarp would plan it for three Float32 bands with nodata
+plan_g <- warp_plan("EPSG:4326", src_gt, c(36000L, 18000L), "EPSG:3857",
+                    dst_gt, dst_size = c(512L, 512L), nbands = 3L,
+                    working_type = "Float32", src_nodata = TRUE,
+                    min_fill_ratio = 0.5, min_dst_size = 100L,
+                    scale_origin = "output", split_antimeridian = FALSE)
+length(plan_g[[1]])
 }
 \seealso{
 \code{\link[=warp_exec]{warp_exec()}}, \code{\link[=warp_resample]{warp_resample()}}

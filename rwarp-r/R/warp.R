@@ -27,11 +27,10 @@
 #' @seealso [warp_plan()], [warp_resample()]
 #' @export
 #' @examples
-#' \dontrun{
-#' library(vaster)
-#' src_gt  <- extent_dim_to_gt(c(-180, 180, -90, 90), c(3600L, 1800L))
-#' dst_ext <- c(-20037508, 20037508, -20037508, 20037508)
-#' dst_gt  <- extent_dim_to_gt(dst_ext, c(256L, 256L))
+#' ## a global 0.1 degree source and a 256 x 256 Web Mercator grid
+#' src_gt <- c(-180, 0.1, 0, 90, 0, -0.1)
+#' w      <- 20037508.34
+#' dst_gt <- c(-w, 2 * w / 256, 0, w, 0, -2 * w / 256)
 #'
 #' coords <- pixel_transform(
 #'   src_crs = "EPSG:4326", src_gt = src_gt,
@@ -40,7 +39,10 @@
 #' )
 #' # Proportion of destination pixels with valid source coordinates
 #' mean(!is.na(coords$src_x))
-#' }
+#' # the source row each destination row samples: Mercator stretches the
+#' # poles, so rows near the top and bottom sample far apart in latitude
+#' plot(coords$src_y[seq(1, by = 256, length.out = 256)], type = "l",
+#'      xlab = "destination row", ylab = "source row")
 pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
   stopifnot(
     is.character(src_crs), length(src_crs) == 1L,
@@ -161,12 +163,11 @@ has_nodata <- function(x) !is.null(x) && !isFALSE(x)
 #' @seealso [warp_exec()], [warp_resample()]
 #' @export
 #' @examples
-#' \dontrun{
-#' library(vaster)
-#'
-#' src_gt  <- extent_dim_to_gt(c(-180, 180, -90, 90), c(36000L, 18000L))
-#' dst_ext <- c(-20037508, 20037508, -20037508, 20037508)
-#' dst_gt  <- extent_dim_to_gt(dst_ext, c(512L, 512L))
+#' ## a global 0.01 degree source onto one 512 x 512 Web Mercator tile:
+#' ## geometry only, nothing is read
+#' src_gt <- c(-180, 0.01, 0, 90, 0, -0.01)
+#' w      <- 20037508.34
+#' dst_gt <- c(-w, 2 * w / 512, 0, w, 0, -2 * w / 512)
 #'
 #' plan <- warp_plan(
 #'   src_crs  = "EPSG:4326",
@@ -176,9 +177,16 @@ has_nodata <- function(x) !is.null(x) && !isFALSE(x)
 #'   dst_gt   = dst_gt,
 #'   dst_size = c(512L, 512L)
 #' )
-#' length(plan)               # 1 normally; 2 at the antimeridian
-#' plan[[1]][[1]]$fill_ratio  # how much of the dst tile is covered
-#' }
+#' length(plan[[1]])          # chunks
+#' str(plan[[1]][[1]])        # source window, fill ratio, kernel scale
+#'
+#' ## as gdalwarp would plan it for three Float32 bands with nodata
+#' plan_g <- warp_plan("EPSG:4326", src_gt, c(36000L, 18000L), "EPSG:3857",
+#'                     dst_gt, dst_size = c(512L, 512L), nbands = 3L,
+#'                     working_type = "Float32", src_nodata = TRUE,
+#'                     min_fill_ratio = 0.5, min_dst_size = 100L,
+#'                     scale_origin = "output", split_antimeridian = FALSE)
+#' length(plan_g[[1]])
 warp_plan <- function(
     src_crs, src_gt, src_dim,
     dst_crs, dst_gt,
@@ -305,7 +313,25 @@ warp_plan <- function(
 #' @seealso [warp_plan()], [warp_resample()]
 #' @export
 #' @examples
+#' ## a smooth global field held in memory, warped to south polar
+#' ## stereographic: read_fn returns any window of it, row-major
+#' src_gt <- c(-180, 1, 0, 90, 0, -1)
+#' lon <- seq(-179.5, 179.5)
+#' lat <- seq(89.5, -89.5)
+#' z <- outer(lat, lon, function(la, lo)
+#'   cos(la * pi / 180) * (1 + 0.3 * sin(3 * lo * pi / 180)))
+#' read_fn <- function(xoff, yoff, xsize, ysize) {
+#'   as.vector(t(z[yoff + seq_len(ysize), xoff + seq_len(xsize), drop = FALSE]))
+#' }
+#'
+#' dst_gt <- c(-5e6, 50000, 0, 5e6, 0, -50000)
+#' plan <- warp_plan("EPSG:4326", src_gt, c(360L, 180L), "EPSG:3031", dst_gt,
+#'                   dst_size = c(200L, 200L), resample = "bilinear")
+#' x <- warp_exec(plan, read_fn, "EPSG:4326", src_gt, "EPSG:3031", dst_gt)
+#' image(t(x[nrow(x):1, ]), asp = 1, axes = FALSE, col = hcl.colors(64))
+#'
 #' \dontrun{
+#' ## a remote COG, read with gdalraster
 #' library(gdalraster)
 #' library(vaster)
 #'

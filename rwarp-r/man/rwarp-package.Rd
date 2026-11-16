@@ -11,6 +11,7 @@ Provides R bindings to the rwarp Rust crate: a GDAL-style raster warp pipeline i
 \seealso{
 Useful links:
 \itemize{
+  \item \url{https://hypertidy.github.io/rwarp/r/}
   \item \url{https://github.com/hypertidy/rwarp}
   \item Report bugs at \url{https://github.com/hypertidy/rwarp/issues}
 }

@@ -27,6 +27,6 @@ Suggests:
     vaster
 Config/rextendr/version: 0.5.0
 VignetteBuilder: knitr
-URL: https://github.com/hypertidy/rwarp
+URL: https://hypertidy.github.io/rwarp/r/, https://github.com/hypertidy/rwarp
 BugReports: https://github.com/hypertidy/rwarp/issues
 Config/roxygen2/version: 8.1.1

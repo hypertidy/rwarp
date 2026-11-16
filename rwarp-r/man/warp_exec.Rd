@@ -98,7 +98,25 @@ The data type follows what \code{read_fn} returns: an integer vector warps as
 The output is the same type.
 }
 \examples{
+## a smooth global field held in memory, warped to south polar
+## stereographic: read_fn returns any window of it, row-major
+src_gt <- c(-180, 1, 0, 90, 0, -1)
+lon <- seq(-179.5, 179.5)
+lat <- seq(89.5, -89.5)
+z <- outer(lat, lon, function(la, lo)
+  cos(la * pi / 180) * (1 + 0.3 * sin(3 * lo * pi / 180)))
+read_fn <- function(xoff, yoff, xsize, ysize) {
+  as.vector(t(z[yoff + seq_len(ysize), xoff + seq_len(xsize), drop = FALSE]))
+}
+
+dst_gt <- c(-5e6, 50000, 0, 5e6, 0, -50000)
+plan <- warp_plan("EPSG:4326", src_gt, c(360L, 180L), "EPSG:3031", dst_gt,
+                  dst_size = c(200L, 200L), resample = "bilinear")
+x <- warp_exec(plan, read_fn, "EPSG:4326", src_gt, "EPSG:3031", dst_gt)
+image(t(x[nrow(x):1, ]), asp = 1, axes = FALSE, col = hcl.colors(64))
+
 \dontrun{
+## a remote COG, read with gdalraster
 library(gdalraster)
 library(vaster)
 

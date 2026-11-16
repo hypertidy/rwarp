@@ -1,45 +1,73 @@
 url: https://hypertidy.github.io/rwarp/r/
 
+# The package is in rwarp-r/ of the crate's repository: source links need
+# the subdirectory.
+repo:
+  url:
+    home: https://github.com/hypertidy/rwarp/
+    source: https://github.com/hypertidy/rwarp/blob/main/rwarp-r/
+    issue: https://github.com/hypertidy/rwarp/issues/
+    user: https://github.com/
+
 template:
   bootstrap: 5
+  light-switch: true
+  bslib:
+    primary: "#1d5f8a"
 
 navbar:
   structure:
-    left:  [intro, reference, articles]
-    right: [rust-book, github]
+    left:  [intro, reference, articles, news]
+    right: [search, rust, github, lightswitch]
   components:
-    rust-book:
-      text: "Rust docs"
-      href: https://hypertidy.github.io/rwarp/
+    rust:
+      text: Rust crate
+      menu:
+        - text: The rwarp book
+          href: https://hypertidy.github.io/rwarp/
+        - text: API reference (rustdoc)
+          href: https://hypertidy.github.io/rwarp/api/rwarp/
+        - text: Browser demo (WebAssembly)
+          href: https://hypertidy.github.io/rwarp/demo/
+        - text: rwarp on crates.io
+          href: https://crates.io/crates/rwarp
 
 home:
   links:
-    - text: "rwarp Rust crate"
-      href: https://crates.io/crates/rwarp
-    - text: "Full documentation (book)"
+    - text: The rwarp book (Rust crate)
       href: https://hypertidy.github.io/rwarp/
+    - text: rwarp on crates.io
+      href: https://crates.io/crates/rwarp
 
 reference:
-  - title: "Warp pipeline"
-    desc: "Plan source windows, execute reads, and resample."
+  - title: Warp pipeline
+    desc: >
+      Plan the source windows a destination needs, with no I/O; run the plan
+      with your own read function; or warp one window you already hold.
     contents:
       - warp_plan
       - warp_exec
       - warp_buffer
-  - title: "Utilities"
-    desc: "Pixel coordinate transforms and CRS diagnostics."
+  - title: Utilities
+    desc: Pixel coordinate transforms and CRS diagnostics.
     contents:
       - pixel_transform
       - crs_describe
-  - title: "Deprecated"
+  - title: Deprecated
     contents:
       - warp_resample
 
 articles:
-  - title: "Worked examples"
-    navbar: ~
+  - title: Showcases
+    navbar: Showcases
+    desc: >
+      Real data from the network, warped and checked against gdalwarp. These
+      are precomputed: see `vignettes/articles/precompute.R`.
     contents:
-      - sentinel2-warp
-      - ghrsst-polar
+      - articles/sentinel2-warp
+      - articles/ghrsst-polar
+  - title: How it works
+    navbar: How it works
+    contents:
       - plan-inspect
       - crs-strings

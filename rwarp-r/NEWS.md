@@ -1,5 +1,25 @@
 # rwarp (development version)
 
+* The website (<https://hypertidy.github.io/rwarp/r/>) is fuller: a Get
+  started article, grouped articles, the changelog, a light/dark switch,
+  and source links that work. The `sentinel2-warp` and `ghrsst-polar`
+  articles read from the network, so they are now website-only and
+  precomputed (`vignettes/articles/precompute.R`) instead of installed
+  vignettes that ran only with `VWARP_VIGNETTES=true`. The `ghrsst-polar`
+  example moved to 52 S, across the Antarctic Polar Front, at 10 km.
+
+* New vignette, `vignette("rwarp")`: plan and warp `sst.tif` from vapour
+  onto polar stereographic, plot the plan's chunks, and match gdalwarp
+  (offline).
+
+* `plan-inspect`'s antimeridian example now crosses the antimeridian, and
+  shows the source windows the split reads against gdalwarp's full-width
+  strip.
+
+* The examples of `warp_plan()`, `warp_exec()` and `pixel_transform()` run
+  (offline, nothing read from the network); the remote examples stay in
+  `\dontrun{}`.
+
 * `warp_plan()` can plan as gdalwarp plans (#67). New arguments describe the
   warp's working memory as gdalwarp counts it: `nbands`, `working_type`,
   `src_nodata`, `dst_nodata` (whether there's nodata; defaults to
