@@ -13,14 +13,53 @@ This folder is the R package rwarp, bindings to the rwarp Rust crate in the root
 of this repository: a GDAL-style warp pipeline
 implemented in pure Rust using the proj crate for coordinate transforms.
 
-The design has the same feature set in mind as `vapour::gdal_raster_data()` and
-the `gdal_raster_*` family, with a pipeline where:
+## The usual way to do this
 
-- The **chunk plan** (source windows, fill ratios) is computed first and can
-  be inspected or cached before any I/O is performed.
-- The **read function** is user-supplied and swappable: GDAL, HTTP byte-ref
-  COG tiles, Zarr chunks, or any other source all use the same interface.
-- The warp kernel itself is pure Rust (no GDAL warp dependency).
+Most raster reprojection in R goes through GDAL's warper:
+`terra::project()`, `gdalraster::warp()`, `vapour::gdal_raster_data()`,
+`sf::gdal_utils("warp")` and `stars::st_warp(use_gdal = TRUE)`. These are
+good defaults. They read and write almost any format, they have been used
+on a great deal of data, and they warp a file into a file, or into a raster
+object, in one call. If they already do what you need, there is no reason
+to change.
+
+## The same things in rwarp
+
+rwarp's arguments follow gdalwarp's options, so what you know carries over:
+
+| You may know it as | In rwarp |
+|---|---|
+| `-t_srs`, `-te`, `-ts` (the target grid) | `dst_crs`, `dst_gt`, `dst_size` (`vaster::extent_dim_to_gt()` makes `dst_gt` from an extent and dimension) |
+| `-r near`, `bilinear`, `cubic`, `cubicspline`, `lanczos`, `average`, `mode`, `min`, `max`, `med`, `rms` | `resample` |
+| `-et 0.125` | `max_error` in `warp_exec()` |
+| `-srcnodata`, `-dstnodata`, `-wo UNIFIED_SRC_NODATA` | `src_nodata`, `dst_nodata`, `band_nodata` in `warp_exec()` |
+| a source alpha band (`-srcalpha`) | `mask_band` in `warp_exec()` |
+| `-wo MODE_TIES` | `mode_ties` in `warp_exec()` |
+| `-wo SOURCE_EXTRA`, `-wo XSCALE`, `-wo YSCALE` | `resample_padding`, `scaling`, `scale` in `warp_plan()` |
+
+## When you might reach for rwarp
+
+GDAL's warper plans, reads, maps coordinates and resamples in one call.
+rwarp keeps those steps apart, which helps in a few situations:
+
+- **You want to know what a warp will read before it reads anything.**
+  `warp_plan()` lists each chunk's source window and fill ratio with no
+  I/O, so you can count the reads, cache the plan, or run the chunks
+  yourself in a tiled loop.
+- **Your pixels don't come through GDAL**, or not only through it. The
+  read function is yours: GDAL, HTTP byte-ref COG tiles, Zarr chunks, or
+  any other source all use the same interface.
+- **You want gdalwarp's results with the steps in view.** The warp kernel
+  is pure Rust (no GDAL warp dependency), checked against gdalwarp's
+  output.
+
+The usual tools stay the simpler choice for warping files into files, or
+into a terra or stars object. The Rust crate also has cutlines, geolocation
+arrays and conservative weights that this package doesn't bind yet. For
+cutlines and geolocation arrays in R, gdalwarp's `-cutline` and `-geoloc`
+are there through `gdalraster::warp()` or `sf::gdal_utils()`. The usual
+tools and rwarp also work side by side: the quick start below reads with
+gdalraster and warps with rwarp.
 
 ## Installation
 
@@ -64,7 +103,7 @@ result <- warp_exec(
     as.integer(ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize)),
   src_crs = src_crs, src_gt = src_gt,
   dst_crs = dst_crs, dst_gt = dst_gt,
-  dst_size = dst_dim, nodata = -32768L
+  dst_size = dst_dim, src_nodata = -32768L, dst_nodata = -32768L
 )
 ximage::ximage(result, dst_ext)
 ds$close()
@@ -120,9 +159,9 @@ Use `crs_describe()` to diagnose any string.
 ## Related packages
 
 - [rwarp](https://crates.io/crates/rwarp) — the underlying Rust crate
-- [cogcache](https://github.com/hypertidy/cogcache) — earlier R prototype
+- [cogcache](https://github.com/rgdal-dev/cogcache) — earlier R prototype
   (wariirp -> cogcache -> rwarp provenance chain)
-- [vapour](https://github.com/hypertidy/vapour) — GDAL bindings this aims
-  — raster I/O package; vapour and rwarp work alongside each other
+- [vapour](https://github.com/hypertidy/vapour) — GDAL raster I/O and
+  warping; vapour and rwarp work alongside each other
 - [gdalraster](https://usdaforestservice.github.io/gdalraster/) — GDAL R
   bindings used in examples

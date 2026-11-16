@@ -52,9 +52,8 @@ It exposes `warp_plan()`, `warp_exec()`, `warp_resample()`,
 `pixel_transform()` and `crs_describe()`. The plan/execute split and
 the user-supplied read function work the same way as in the Rust API.
 
-A [Python package](python-package.md) in `rwarp-py/` exposes the same
-API via [PyO3](https://pyo3.rs/), with NumPy arrays as the pixel buffer
-type. It is in early development.
+A [Python package](python-package.md) is planned, with the same API via
+[PyO3](https://pyo3.rs/) and NumPy arrays as the pixel buffer type.
 
 ## Using rwarp in your project
 

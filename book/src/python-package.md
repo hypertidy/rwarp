@@ -1,13 +1,11 @@
 # Python package
 
-The [`rwarp-py/`](https://github.com/hypertidy/rwarp/tree/main/rwarp-py)
-subdirectory of this repository is a Python package, also named **rwarp**,
-that exposes the same planning and resampling pipeline via
-[PyO3](https://pyo3.rs/).
+A Python package, also named **rwarp**, is planned. It would expose the
+same planning and resampling pipeline via [PyO3](https://pyo3.rs/).
 
-> **Status**: the Python bindings are in early development. The directory
-> structure is in place; function signatures and packaging are being
-> finalised. Feedback on the API shape is welcome via
+> **Status**: planned, not started. There is no `rwarp-py/` in the
+> repository yet; this page sketches the intended API and packaging.
+> Feedback on the API shape is welcome via
 > [issues](https://github.com/hypertidy/rwarp/issues).
 
 ## Planned install
@@ -16,7 +14,8 @@ that exposes the same planning and resampling pipeline via
 pip install rwarp
 ```
 
-Or from source (requires a Rust toolchain >= 1.75 and maturin):
+Or from source, once `rwarp-py/` exists (requires a Rust toolchain >= 1.86
+and maturin):
 
 ```sh
 cd rwarp-py
@@ -81,12 +80,12 @@ grid = result.reshape(dst_dim[1], dst_dim[0])
 ## Why PyO3
 
 [PyO3](https://pyo3.rs/) compiles the same Rust core to a Python extension
-module. The warp kernel and the planning geometry are identical to the R
-package and the WebAssembly build; only the FFI layer differs.
+module. The warp kernel and the planning geometry would be identical to the
+R package and the WebAssembly build; only the FFI layer differs.
 
-NumPy arrays pass in and out without copying: the read function returns a
-NumPy array and `warp_exec` returns one, so the data stays in Rust-managed
-memory and Python sees a view.
+NumPy arrays are meant to pass in and out without copying: the read
+function returns a NumPy array and `warp_exec` returns one, so the data
+stays in Rust-managed memory and Python sees a view.
 
 ## Integration ideas
 
@@ -112,7 +111,6 @@ result = rwarp.warp_exec(plan, read_fn=read_fn, ...)
 
 ## Source and issues
 
-The Python package lives in
-[`rwarp-py/`](https://github.com/hypertidy/rwarp/tree/main/rwarp-py).
+The Python package will live in `rwarp-py/` in this repository.
 Issues and contributions are welcome at
 [github.com/hypertidy/rwarp](https://github.com/hypertidy/rwarp).
