@@ -61,6 +61,7 @@
 //! once and reused across tiles.
 
 use crate::crs::{crs_pair, is_geographic_degrees, CrsTransform};
+use crate::mesh::QuadMesh;
 use vaster::inv_geotransform;
 // ---------------------------------------------------------------------------
 // Transformer trait
@@ -102,6 +103,19 @@ pub trait Transformer {
     /// and one around a pole does not close. `None` (the default) when the
     /// source does not wrap, or the transformer does not know.
     fn source_wrap(&self) -> Option<SourceWrap> {
+        None
+    }
+
+    /// The source's cells in its own world coordinates, for the same area
+    /// methods. `None` (the default) when source pixels are unit squares
+    /// of a planar world, as for any affine source: the outline is then
+    /// measured in source pixel space. With `Some`, the outline is built in
+    /// source world coordinates ([`SourceCells::dst_to_world`]) and walked
+    /// onto the source window's cells ([`SourceCells::mesh`]) under the
+    /// equal-area map, so weights are fractions of each cell's world area.
+    /// Geolocation sources report it
+    /// ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)).
+    fn source_cells(&self) -> Option<&dyn SourceCells> {
         None
     }
 
@@ -163,6 +177,24 @@ impl SourceWrap {
     pub fn new(period: f64, pole_rows: [f64; 2]) -> Self {
         SourceWrap { period, pole_rows }
     }
+}
+
+/// A source whose pixels are cells in its own world coordinates; see
+/// [`Transformer::source_cells`].
+pub trait SourceCells {
+    /// Destination pixel/line to source world coordinates, in place: the
+    /// transformer's `dst_to_src` pipeline without its last step, the
+    /// source's world-to-pixel map. Per-point success, as
+    /// [`Transformer::transform`].
+    fn dst_to_world(&self, x: &mut [f64], y: &mut [f64]) -> Vec<bool>;
+
+    /// The cells of the source window of `ncol` by `nrow` pixels at
+    /// `(col_off, row_off)`: a mesh whose corner `(j, i)` is the world
+    /// position of source pixel corner `(col_off + i, row_off + j)`, so
+    /// mesh cell `(row, col)` is window pixel `(row, col)`. Corners are
+    /// computed point by point, so neighbouring windows share their edge
+    /// exactly.
+    fn mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String>;
 }
 
 // ---------------------------------------------------------------------------

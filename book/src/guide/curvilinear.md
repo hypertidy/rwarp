@@ -153,6 +153,23 @@ assert!(!res.edges.is_empty());
 
 The module is unstable until a second consumer uses it.
 
+## Area methods from a swath
+
+The exact footprint (`Footprint::Exact`, and `exact_weights`) measures a
+geolocation source with these cells. Each target pixel's outline goes to
+the source's world coordinates and is walked onto a `QuadMesh` of the
+source window. Each pixel is the quadrilateral through the positions of
+its four corners. So weights are fractions of each source pixel's world
+area, and `Average` weights each pixel by its world area. With
+`TopLeftCorner` samples at whole-number steps that is GDAL's bilinear
+model exactly. With `PixelCenter` the corners are the means of four
+centres, as `from_centres` makes them.
+
+`GeolocArrays::world_cells()` says whether this applies to a set of
+arrays: not with a missing sample, not where the swath folds, and not yet
+across the antimeridian. Those fall back to source pixel space. Point
+kernels are unchanged.
+
 ## Other differences from GDAL
 
 - rwarp treats NaN samples as missing, as well as the X array's nodata

@@ -25,6 +25,7 @@
 //! (bigcurve; `design/curvilinear-frontend.md`, section 5).
 
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use controlledburn::{
@@ -33,6 +34,72 @@ use controlledburn::{
 };
 
 use super::{orient, CellMap, QuadMesh, UNIT};
+
+/// A multiplicative hash for cell numbers (as rustc's `FxHasher`): the
+/// flood's set of seen cells is small and hot, and needs no protection
+/// against chosen keys.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+type CellSet = HashSet<usize, BuildHasherDefault<CellHasher>>;
+
+/// The cells a flood has seen: a short list, moved into a hash set if it
+/// grows (a flood along a long segment).
+#[derive(Default)]
+struct Seen {
+    small: Vec<usize>,
+    big: CellSet,
+}
+
+impl Seen {
+    fn clear(&mut self) {
+        self.small.clear();
+        self.big.clear();
+    }
+
+    /// Whether `k` is new (and now seen).
+    fn insert(&mut self, k: usize) -> bool {
+        if self.big.is_empty() {
+            if self.small.contains(&k) {
+                return false;
+            }
+            if self.small.len() < 32 {
+                self.small.push(k);
+                return true;
+            }
+            self.big.extend(self.small.drain(..));
+        }
+        self.big.insert(k)
+    }
+}
+
+/// Buffers the segments of one ring reuse.
+#[derive(Default)]
+struct Scratch {
+    seen: Seen,
+    stack: Vec<(usize, usize)>,
+    pieces: Vec<Piece>,
+}
 
 /// Gaps in segment parameter smaller than this join two pieces (the two
 /// sides of a vertex the segment passes through can give `t` an ulp apart).
@@ -205,27 +272,36 @@ impl QuadMesh {
     /// Clip segment `a b` by triangle `k` of cell `(row, col)`. Returns the
     /// parameter interval (possibly empty, `t0 == t1`, for a touch) and the
     /// edges that bound it, `None` where the interval ends at `a` or `b`.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// `q` and `x` are the cell's corners and split centre; each edge's
+    /// ends are taken from them in its canonical direction, as
+    /// [`QuadMesh::edge_world`] gives them.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn clip(
         &self,
+        q: &[[f64; 2]; 4],
+        x: [f64; 2],
         row: usize,
         col: usize,
         k: usize,
         a: [f64; 2],
         b: [f64; 2],
     ) -> Option<(f64, Option<Edge>, f64, Option<Edge>)> {
-        let q = self.corners(row, col);
-        let x = self.cells[row * self.ncol + col].centre;
         let k1 = (k + 1) % 4;
+        let side = match k {
+            0 => (q[0], q[1]),
+            1 => (q[1], q[2]),
+            2 => (q[3], q[2]),
+            _ => (q[0], q[3]),
+        };
         let edges = [
-            (Edge::Spoke { row, col, j: k }, q[k1]),
-            (Edge::Side { row, col, k }, x),
-            (Edge::Spoke { row, col, j: k1 }, q[k]),
+            (Edge::Spoke { row, col, j: k }, (x, q[k]), q[k1]),
+            (Edge::Side { row, col, k }, side, x),
+            (Edge::Spoke { row, col, j: k1 }, (x, q[k1]), q[k]),
         ];
         let (mut t0, mut t1) = (0.0f64, 1.0f64);
         let (mut e0, mut e1) = (None, None);
-        for (e, opp) in edges {
-            let (p0, p1) = self.edge_world(e);
+        for (e, (p0, p1), opp) in edges {
             let sigma = orient(p0, p1, opp);
             if sigma == 0.0 {
                 return None;
@@ -254,16 +330,15 @@ impl QuadMesh {
         (t0 <= t1).then_some((t0, e0, t1, e1))
     }
 
-    /// Whether segment `a b` meets the bounding box of cell `(row, col)`.
-    fn meets_box(&self, row: usize, col: usize, a: [f64; 2], b: [f64; 2]) -> bool {
-        let q = self.corners(row, col);
+    /// Whether segment `a b` meets the bounding box of corners `q`.
+    fn meets_box(q: &[[f64; 2]; 4], a: [f64; 2], b: [f64; 2]) -> bool {
         let (mut x0, mut x1, mut y0, mut y1) = (
             f64::INFINITY,
             f64::NEG_INFINITY,
             f64::INFINITY,
             f64::NEG_INFINITY,
         );
-        for p in q {
+        for p in q.iter() {
             x0 = x0.min(p[0]);
             x1 = x1.max(p[0]);
             y0 = y0.min(p[1]);
@@ -282,10 +357,10 @@ impl QuadMesh {
         ia: Option<[f64; 2]>,
         ib: Option<[f64; 2]>,
         seeds: &[(usize, usize)],
-        seen: &mut HashSet<usize>,
-        out: &mut Vec<Piece>,
+        scratch: &mut Scratch,
     ) {
-        let mut stack: Vec<(usize, usize)> = Vec::new();
+        let Scratch { seen, stack, pieces: out } = scratch;
+        stack.clear();
         for &s in seeds {
             if seen.insert(s.0 * self.ncol + s.1) {
                 stack.push(s);
@@ -293,11 +368,14 @@ impl QuadMesh {
         }
         while let Some((r, c)) = stack.pop() {
             let mut touched = false;
-            if self.cells[r * self.ncol + c].area2 == 0.0 {
-                touched = self.meets_box(r, c, a, b);
-            } else {
+            let q = self.corners(r, c);
+            let cell = &self.cells[r * self.ncol + c];
+            if cell.area2 == 0.0 {
+                touched = Self::meets_box(&q, a, b);
+            } else if Self::meets_box(&q, a, b) {
+                // (a segment that misses the cell's box misses the cell)
                 for k in 0..4 {
-                    let Some((t0, e0, t1, e1)) = self.clip(r, c, k, a, b) else {
+                    let Some((t0, e0, t1, e1)) = self.clip(&q, cell.centre, r, c, k, a, b) else {
                         continue;
                     };
                     touched = true;
@@ -331,28 +409,25 @@ impl QuadMesh {
         }
     }
 
-    /// The boundary cells whose outer side segment `a b` meets.
+    /// The boundary cells whose outer side segment `a b` meets, in the
+    /// order of the outer sides ([`QuadMesh::boundary_side`]), found
+    /// through the sides' bucket index.
     fn boundary_seeds(&self, a: [f64; 2], b: [f64; 2]) -> Vec<(usize, usize)> {
-        let (nc, nr) = (self.ncol, self.nrow);
+        let mut near = Vec::new();
+        self.boundary_sides_near([a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])], &mut near);
         let mut out = Vec::new();
-        let mut test = |row: usize, col: usize, k: usize| {
+        for o in near {
+            let (row, col, k) = self.boundary_side(o);
             let (p, q) = self.edge_world(Edge::Side { row, col, k });
             if segments_meet(a, b, p, q) {
                 out.push((row, col));
             }
-        };
-        for c in 0..nc {
-            test(0, c, 0);
-            test(nr - 1, c, 2);
-        }
-        for r in 0..nr {
-            test(r, 0, 3);
-            test(r, nc - 1, 1);
         }
         out
     }
 
-    /// The pieces of segment `a b` inside the mesh, in order along it.
+    /// The pieces of segment `a b` inside the mesh, in order along it,
+    /// left in `scratch.pieces`.
     fn segment_pieces(
         &self,
         a: [f64; 2],
@@ -360,18 +435,24 @@ impl QuadMesh {
         ia: Option<[f64; 2]>,
         ib: Option<[f64; 2]>,
         hint: Option<(usize, usize)>,
-    ) -> Vec<Piece> {
-        let mut seen = HashSet::new();
-        let mut pieces = Vec::new();
-        let start: Vec<(usize, usize)> = self.locate(a, hint).into_iter().collect();
-        self.flood(a, b, ia, ib, &start, &mut seen, &mut pieces);
+        scratch: &mut Scratch,
+    ) {
+        scratch.seen.clear();
+        scratch.pieces.clear();
+        let start = self.locate(a, hint);
+        let start = match &start {
+            Some(s) => std::slice::from_ref(s),
+            None => &[],
+        };
+        self.flood(a, b, ia, ib, start, scratch);
+        let pieces = &mut scratch.pieces;
         pieces.sort_by(|p, q| p.t0.total_cmp(&q.t0).then(p.t1.total_cmp(&q.t1)));
         // Complete when the pieces join from 0 to 1; otherwise the segment
         // leaves the mesh (or starts outside it), and may come back in
         // through any boundary side.
         let mut reach = 0.0;
         let mut complete = !pieces.is_empty() && pieces[0].t0 <= T_EPS;
-        for p in &pieces {
+        for p in pieces.iter() {
             if p.t0 > reach + T_EPS {
                 complete = false;
             }
@@ -379,10 +460,9 @@ impl QuadMesh {
         }
         if !complete || reach < 1.0 - T_EPS {
             let seeds = self.boundary_seeds(a, b);
-            self.flood(a, b, ia, ib, &seeds, &mut seen, &mut pieces);
-            pieces.sort_by(|p, q| p.t0.total_cmp(&q.t0).then(p.t1.total_cmp(&q.t1)));
+            self.flood(a, b, ia, ib, &seeds, scratch);
+            scratch.pieces.sort_by(|p, q| p.t0.total_cmp(&q.t0).then(p.t1.total_cmp(&q.t1)));
         }
-        pieces
     }
 
     /// Position along the mesh boundary (0 to `2 (ncol + nrow)`, clockwise
@@ -484,12 +564,13 @@ impl QuadMesh {
         }
         // walk
         let mut nodes: Vec<Node> = Vec::new();
+        let mut scratch = Scratch::default();
         for k in 0..n {
             let k1 = (k + 1) % n;
             let (a, b) = (pts[k], pts[k1]);
-            let pieces = self.segment_pieces(a, b, vidx[k], vidx[k1], vcell[k].or(hint));
+            self.segment_pieces(a, b, vidx[k], vidx[k1], vcell[k].or(hint), &mut scratch);
             let mut cur = 0.0f64;
-            for p in &pieces {
+            for p in &scratch.pieces {
                 if p.t1 <= cur + T_EPS {
                     continue;
                 }
@@ -578,8 +659,14 @@ impl QuadMesh {
             path.push(re.world);
             let (be, br) = (self.beta(idx), self.beta(re.idx.unwrap_or(idx)));
             let mut best: Option<(i64, Vec<i64>)> = None;
-            for forward in [true, false] {
-                let corners = self.arc(be, br, forward);
+            // leaving and coming back at the same boundary point (a ring
+            // that only touches the mesh there): both arcs are the whole
+            // boundary, so the empty arc is a candidate too
+            let mut arcs = vec![self.arc(be, br, true), self.arc(be, br, false)];
+            if be == br {
+                arcs.push(Vec::new());
+            }
+            for corners in arcs {
                 let mut lp = path.clone();
                 lp.extend(corners.iter().rev().map(|&b| self.boundary_corner(b).1));
                 let w = winding(&lp, p0).abs();
@@ -595,7 +682,9 @@ impl QuadMesh {
                 break;
             }
         }
-        Ok(dedup(out))
+        // fewer than three points: the ring only touches the mesh
+        let out = dedup(out);
+        Ok(if out.len() < 3 { Vec::new() } else { out })
     }
 
     /// Burn world geometries onto the mesh: controlledburn's tables with

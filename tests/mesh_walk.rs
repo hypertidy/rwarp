@@ -472,6 +472,36 @@ fn rings_around_and_beside_the_mesh() {
 }
 
 #[test]
+fn rings_that_only_touch_the_mesh_at_one_point() {
+    // a rotated grid (integer corners) and squares outside it with one
+    // vertex exactly on a wall: they leave and re-enter the mesh at the
+    // same point, so the boundary arc between is empty, not the whole
+    // boundary
+    let m = mesh(lattice(40, 30, |i, j| [700.0 + 30.0 * i + 7.0 * j, 2000.0 - 5.0 * i - 40.0 * j]));
+    let on_top = [748.0, 1992.0]; // (1.6, 0) in index space
+    let on_left = [700.0 + 7.0 * 12.5, 2000.0 - 40.0 * 12.5]; // (0, 12.5)
+    // each wall's direction, and the outward side (from row 0 up, from
+    // column 0 back)
+    for (p, wall, out) in [(on_top, [30.0, -5.0], [5.0, 30.0]), (on_left, [7.0, -40.0], [-40.0, -7.0])] {
+        let ring = vec![
+            p,
+            [p[0] + out[0] + 0.5 * wall[0], p[1] + out[1] + 0.5 * wall[1]],
+            [p[0] + out[0] - 0.5 * wall[0], p[1] + out[1] - 0.5 * wall[1]],
+        ];
+        for r in [ring.clone(), ring.iter().rev().copied().collect()] {
+            assert!(m.ring_to_index(&r).unwrap().is_empty(), "{r:?}: {:?}", m.ring_to_index(&r));
+            let mut win = CoverageWindow::default();
+            assert!(!m.cover_ring(&r, &mut win).unwrap());
+        }
+    }
+    // a ring around the whole mesh that touches its corner: every cell full
+    let corner = [700.0, 2000.0];
+    let around = vec![corner, [700.0 + 1500.0, 2000.0 + 100.0], [700.0 + 1500.0, 2000.0 - 1500.0], [700.0 - 100.0, 2000.0 - 1500.0]];
+    let d = dense(&m.burn(&[polygon(&[around])], BurnOptions::coverage()).unwrap(), m.ncol(), m.nrow());
+    assert!(d.iter().all(|&v| (v - 1.0).abs() < 1e-6), "{:?}", d.iter().cloned().fold(f64::INFINITY, f64::min));
+}
+
+#[test]
 fn steering_through_corners_centres_and_along_sides() {
     let m = mesh(jittered(3, 0.2));
     let q = |r: usize, c: usize| m.corners(r, c);

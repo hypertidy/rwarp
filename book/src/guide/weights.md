@@ -29,7 +29,8 @@ pixel), so anything rwarp can warp it can make weights for.
 | `dst_row`, `dst_col` | entry | target cell, full-grid indices (offsets applied) |
 | `src_row`, `src_col` | entry | source cell, full-grid indices |
 | `frac` | entry | area of the overlap as a fraction of the source cell, unrounded `f64` |
-| `dst_area` | target cell | area of the target cell's outline, in source cells; `NaN` if it failed to transform |
+| `dst_area` | target cell | area of the target cell's outline, in source cells (in world units for a geolocation source); `NaN` if it failed to transform |
+| `src_cell_area` | entry | for a geolocation source, the source cell's world area; empty otherwise |
 | `dst_off`, `dst_size` | | the target window the weights are for |
 
 Areas are measured in source pixel space, where a source cell has area 1.
@@ -38,14 +39,30 @@ CRS, up to a constant. Target cells have edges straight in target pixel
 space, each split into `densify` segments whose end points go through the
 transformer exactly.
 
+A geolocation source (geolocation arrays on the source side of
+`GenImgGeolocTransformer`) is measured in its own world coordinates
+instead, since its pixels are not the same size there. The outline's
+points go to source world coordinates and are joined by straight lines
+there. Each source pixel is the quadrilateral through its corners' world
+positions, and the outline is walked onto those cells as
+`QuadMesh::burn` walks a polygon. `frac` is then a fraction of the
+cell's world area, `Weights::src_area(k)` is that area, and `dst_area`
+is the outline's world area. This is planar area in the arrays'
+coordinates: square degrees for longitude and latitude, true area for
+arrays in an equal-area CRS. Arrays whose cells are not whole fall back
+to source pixel space; see [Limits](#limits).
+
 `frac` is relative to the source cell, not the target, so it doesn't depend
 on how the target is normalised. `dst_area` gives either normalisation:
 
-- **`Normalization::FracArea`**: `S = frac / (sum of frac over the target
-  cell)`, the area-weighted mean over the part of the cell that has
+With `a` the source cell's area (`Weights::src_area`, 1 in source pixel
+space):
+
+- **`Normalization::FracArea`**: `S = frac a / (sum of frac a over the
+  target cell)`, the area-weighted mean over the part of the cell that has
   source. This is what `warp()` computes. In ESMF it's `fracarea`; in
   xESMF, `conserve_normed`.
-- **`Normalization::DestArea`**: `S = frac / dst_area`. A cell half off the
+- **`Normalization::DestArea`**: `S = frac a / dst_area`. A cell half off the
   source gets half the weight, so `sum(value * dst_area)` over the target
   equals the integral of the source over the region the target covers.
   ESMF `destarea`, xESMF `conserve`.
@@ -135,7 +152,8 @@ columns.
 
 ## Limits
 
-- **Planar areas** in source pixel space. ESMF measures on the sphere with
+- **Planar areas** in source pixel space, or in a geolocation source's
+  world coordinates. ESMF measures on the sphere with
   great-circle edges. A spherical measure is planned (design/conservative.md,
   stage 3).
 - **The antimeridian needs the transformer to say the source wraps.** A
@@ -147,6 +165,14 @@ columns.
   (`with_source_size`, which also gives GDAL's `CENTER_LONG`); a
   transformer that does not report it gets no unwrapping, and such cells
   are wrong as before.
-- **Destination cells are what a transformer describes.** Curvilinear grids
-  work through `GenImgGeolocTransformer` with its bilinear cell definition.
-  Cells from corner bounds and meshes are later stages.
+- **Geolocation sources need whole cells.** `GeolocArrays::world_cells()`
+  says whether a source is measured in world coordinates, and if not, why.
+  It isn't for arrays with a missing sample, arrays that fold (cells of
+  both orientations, as where a scanning swath's scans overlap), or, for
+  now, arrays that cross the antimeridian with `lon_wrap`. Those are
+  measured in source pixel space as before, which on a curved grid is off
+  by about 1% of a cell along each outline. The choice is made once per
+  set of arrays, so every chunk of a warp uses the same measure.
+- **Destination cells are what a transformer describes.** A curvilinear
+  target works through `GenImgGeolocTransformer` with its bilinear cell
+  definition. Cells from corner bounds and meshes are later stages.

@@ -139,6 +139,8 @@ pub struct QuadMesh {
     sign: f64,
     cells: Vec<Cell>,
     buckets: OnceLock<Buckets>,
+    /// The outer sides in a bucket grid, for where a segment enters.
+    sides: OnceLock<Buckets>,
 }
 
 impl QuadMesh {
@@ -159,56 +161,18 @@ impl QuadMesh {
         y: Vec<f64>,
         map: CellMap,
     ) -> Result<Self, String> {
-        if ncol == 0 || nrow == 0 {
-            return Err(format!(
-                "a mesh needs at least one cell, got {ncol} x {nrow}"
-            ));
-        }
-        let n = (ncol + 1) * (nrow + 1);
-        if x.len() != n || y.len() != n {
-            return Err(format!(
-                "corner arrays have {} and {} values, expected (ncol + 1) * (nrow + 1) = {n}",
-                x.len(),
-                y.len()
-            ));
-        }
-        if let Some(k) = x.iter().chain(&y).position(|v| !v.is_finite()) {
-            return Err(format!("corner value {} is not finite", k % n));
-        }
+        let sign = validate_corners(ncol, nrow, &x, &y)?;
         let mut mesh = QuadMesh {
             ncol,
             nrow,
             x,
             y,
             map,
-            sign: 1.0,
+            sign,
             cells: Vec::with_capacity(ncol * nrow),
             buckets: OnceLock::new(),
+            sides: OnceLock::new(),
         };
-
-        let (mut pos, mut neg) = (0usize, 0usize);
-        for r in 0..nrow {
-            for c in 0..ncol {
-                let q = mesh.corners(r, c);
-                if bow_tie(&q) {
-                    return Err(format!(
-                        "cell (row {r}, col {c}) is a bow-tie: two opposite sides cross"
-                    ));
-                }
-                let a2 = shoelace2(&q);
-                if a2 > 0.0 {
-                    pos += 1;
-                } else if a2 < 0.0 {
-                    neg += 1;
-                }
-            }
-        }
-        if pos > 0 && neg > 0 {
-            return Err(format!(
-                "cells have both orientations ({pos} one way, {neg} the other): the mesh folds over itself"
-            ));
-        }
-        mesh.sign = if neg > 0 { -1.0 } else { 1.0 };
 
         for r in 0..nrow {
             for c in 0..ncol {
@@ -558,6 +522,97 @@ impl QuadMesh {
     fn buckets(&self) -> &Buckets {
         self.buckets.get_or_init(|| Buckets::new(self))
     }
+
+    /// Outer side number `o` as `(row, col, k)`, numbered as
+    /// [`QuadMesh::boundary_side_count`] says.
+    pub(crate) fn boundary_side(&self, o: usize) -> (usize, usize, usize) {
+        let (nc, nr) = (self.ncol, self.nrow);
+        if o < 2 * nc {
+            if o % 2 == 0 { (0, o / 2, 0) } else { (nr - 1, o / 2, 2) }
+        } else {
+            let o = o - 2 * nc;
+            if o % 2 == 0 { (o / 2, 0, 3) } else { (o / 2, nc - 1, 1) }
+        }
+    }
+
+    /// The number of outer sides: for each column the top then the
+    /// bottom side, then for each row the left then the right side.
+    pub(crate) fn boundary_side_count(&self) -> usize {
+        2 * (self.ncol + self.nrow)
+    }
+
+    /// The outer sides whose bounding box may meet the box `[x0, y0, x1,
+    /// y1]`, in ascending order, each once.
+    pub(crate) fn boundary_sides_near(&self, bx: [f64; 4], out: &mut Vec<usize>) {
+        let b = self.sides.get_or_init(|| {
+            let boxes: Vec<[f64; 4]> = (0..self.boundary_side_count())
+                .map(|o| {
+                    let (row, col, k) = self.boundary_side(o);
+                    let q = self.corners(row, col);
+                    let (p, r) = (q[k], q[(k + 1) % 4]);
+                    [p[0].min(r[0]), p[1].min(r[1]), p[0].max(r[0]), p[1].max(r[1])]
+                })
+                .collect();
+            Buckets::from_boxes(&boxes)
+        });
+        out.clear();
+        let (c0, r0) = b.bucket(bx[0], bx[1]);
+        let (c1, r1) = b.bucket(bx[2], bx[3]);
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                let k = r * b.nx + c;
+                out.extend(b.cells[b.offsets[k] as usize..b.offsets[k + 1] as usize].iter().map(|&o| o as usize));
+            }
+        }
+        if r1 > r0 || c1 > c0 {
+            out.sort_unstable();
+            out.dedup();
+        }
+    }
+}
+
+/// [`QuadMesh::from_corners`]'s checks on row-major corner arrays of
+/// `(nrow + 1) * (ncol + 1)` values, without building the mesh: lengths,
+/// finite values, no bow-tie, one orientation. The orientation of every
+/// cell with area on success (+1 or -1).
+pub(crate) fn validate_corners(ncol: usize, nrow: usize, x: &[f64], y: &[f64]) -> Result<f64, String> {
+    if ncol == 0 || nrow == 0 {
+        return Err(format!("a mesh needs at least one cell, got {ncol} x {nrow}"));
+    }
+    let n = (ncol + 1) * (nrow + 1);
+    if x.len() != n || y.len() != n {
+        return Err(format!(
+            "corner arrays have {} and {} values, expected (ncol + 1) * (nrow + 1) = {n}",
+            x.len(),
+            y.len()
+        ));
+    }
+    if let Some(k) = x.iter().chain(y).position(|v| !v.is_finite()) {
+        return Err(format!("corner value {} is not finite", k % n));
+    }
+    let w = ncol + 1;
+    let at = |j: usize, i: usize| [x[j * w + i], y[j * w + i]];
+    let (mut pos, mut neg) = (0usize, 0usize);
+    for r in 0..nrow {
+        for c in 0..ncol {
+            let q = [at(r, c), at(r, c + 1), at(r + 1, c + 1), at(r + 1, c)];
+            if bow_tie(&q) {
+                return Err(format!("cell (row {r}, col {c}) is a bow-tie: two opposite sides cross"));
+            }
+            let a2 = shoelace2(&q);
+            if a2 > 0.0 {
+                pos += 1;
+            } else if a2 < 0.0 {
+                neg += 1;
+            }
+        }
+    }
+    if pos > 0 && neg > 0 {
+        return Err(format!(
+            "cells have both orientations ({pos} one way, {neg} the other): the mesh folds over itself"
+        ));
+    }
+    Ok(if neg > 0 { -1.0 } else { 1.0 })
 }
 
 /// Twice the signed area of a quadrilateral.
@@ -732,12 +787,10 @@ struct Buckets {
 impl Buckets {
     fn new(mesh: &QuadMesh) -> Self {
         let n = mesh.ncol * mesh.nrow;
-        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         let boxes: Vec<[f64; 4]> = (0..n)
             .map(|k| {
                 let q = mesh.corners(k / mesh.ncol, k % mesh.ncol);
-                let b = q
-                    .iter()
+                q.iter()
                     .fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |b, p| {
                         [
                             b[0].min(p[0]),
@@ -745,14 +798,23 @@ impl Buckets {
                             b[2].max(p[0]),
                             b[3].max(p[1]),
                         ]
-                    });
-                x0 = x0.min(b[0]);
-                y0 = y0.min(b[1]);
-                x1 = x1.max(b[2]);
-                y1 = y1.max(b[3]);
-                b
+                    })
             })
             .collect();
+        Self::from_boxes(&boxes)
+    }
+
+    /// A bucket grid of about `sqrt(n)` by `sqrt(n)` over `n` boxes `[x0,
+    /// y0, x1, y1]`, each listed in every bucket its box meets.
+    fn from_boxes(boxes: &[[f64; 4]]) -> Self {
+        let n = boxes.len();
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for b in boxes {
+            x0 = x0.min(b[0]);
+            y0 = y0.min(b[1]);
+            x1 = x1.max(b[2]);
+            y1 = y1.max(b[3]);
+        }
         let side = ((n as f64).sqrt().ceil() as usize).clamp(1, 4096);
         let (nx, ny) = (side, side);
         let w = ((x1 - x0) / nx as f64).max(f64::MIN_POSITIVE);
@@ -772,7 +834,7 @@ impl Buckets {
             let (c1, r1) = b.bucket(bx[2], bx[3]);
             (c0, r0, c1, r1)
         };
-        for bx in &boxes {
+        for bx in boxes {
             let (c0, r0, c1, r1) = range(&b, bx);
             for r in r0..=r1 {
                 for c in c0..=c1 {

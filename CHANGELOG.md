@@ -4,7 +4,49 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ## Unreleased
 
+### Changed
+
+- The exact footprint (`Footprint::Exact`, `exact_weights`) over a
+  geolocation source measures in the source's world coordinates (#36,
+  stage 3 of `design/curvilinear-frontend.md`). Each destination pixel's
+  outline goes to source world coordinates and is walked onto the source
+  window's cells under the equal-area map. Each source pixel is the
+  quadrilateral through its corners' positions. So weights are fractions
+  of each cell's world area, and `Average` and `Mode` weight each source
+  pixel by its world area. Before, the outline went through the inverse
+  geolocation transform and was measured in source pixel space.
+  - Effect: for a destination pixel inside the source, weight times cell
+    area now sums to the outline's area to 2e-13 (relative). The old
+    measure was off by up to 3e-3 on a polar-sector grid, and 6e-3 on a
+    curved longitude/latitude grid to polar stereographic.
+  - Fallback: arrays with a missing sample, arrays that fold, and arrays
+    that cross the antimeridian with `lon_wrap` keep the old measure,
+    decided once per set of arrays (`GeolocArrays::world_cells`).
+  - Values change for exact-footprint warps and weights from geolocation
+    sources. Point kernels, the GDAL box footprint and affine sources are
+    unchanged bit for bit. rwarp-r doesn't expose geolocation sources.
+  - Speed: 3 to 9 times the old measure at densify 2 (4 to 6 microseconds
+    a pixel in the timings for #36).
+- `exact_weights_with`'s `CellWeights` gains `src_area`, each entry's
+  source cell measure.
+- The mesh walk (`QuadMesh::ring_to_index`, and so `burn`, `burn_par` and
+  `cover_ring`) is 4 to 30 times faster, with the same output bit for bit
+  (checked over 17,806 rings). The changes:
+  - outer sides are found through a bucket index, instead of every outer
+    side being tested for each segment that leaves the mesh;
+  - a cell is clipped only if the segment meets its bounding box;
+  - the flood's buffers are reused along a ring.
+  Natural Earth 10m land onto the warped 1440 x 720 mesh of
+  `examples/mesh_burn_par.rs` now takes 0.24 s with `burn` (1.15 s
+  before), and 0.06 s at 8 threads (0.23 s).
+
 ### Fixed
+
+- `QuadMesh::ring_to_index` for a ring that touches the mesh at a single
+  boundary point from outside: it left and re-entered at the same point,
+  and the walk closed it along the whole boundary, so `burn` and
+  `cover_ring` covered every cell. Now the ring misses the mesh. A ring
+  around the whole mesh that touches it at one point still covers it.
 
 - The exact footprint (`Footprint::Exact`, `exact_weights`) across a
   geographic source's antimeridian and around a pole (#36, the cases #11's
@@ -19,6 +61,21 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `Transformer::source_cells` and `transform::SourceCells`: a transformer
+  reports a source whose pixels are cells in its own world coordinates.
+  It provides the map from destination pixels to source world coordinates
+  (`dst_to_world`) and the cells of a source window (`mesh`), for the
+  exact footprint. Default `None`. `GenImgGeolocTransformer` with
+  geolocation arrays on the source side, and `GeolocArrays` on its own,
+  report it when `GeolocArrays::world_cells()` is `Ok`;
+  `ApproxTransformer` passes it through, with `dst_to_world`
+  unapproximated.
+- `GeolocArrays::world_cells`, whether the exact footprint measures a
+  source with these arrays in world coordinates (and if not, why), and
+  `GeolocArrays::window_mesh`, a source window's cells.
+- `Weights::src_cell_area`: each entry's source cell area, for a
+  geolocation source (empty otherwise, and not serialised when empty).
+  `Weights::src_area` uses it.
 - `Transformer::source_wrap` and `transform::SourceWrap`: a transformer
   reports a source that wraps in longitude (its period in source pixels
   and the rows of the poles), for the exact footprint. Default `None`;
