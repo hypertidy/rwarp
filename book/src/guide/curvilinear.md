@@ -165,10 +165,16 @@ area, and `Average` weights each pixel by its world area. With
 model exactly. With `PixelCenter` the corners are the means of four
 centres, as `from_centres` makes them.
 
+With `with_lon_wrap(true)`, a swath across the antimeridian works the
+same way. Its longitudes are unwrapped by continuity, so cells across the
+seam are whole, and so is each destination pixel's outline. A destination
+pixel round a pole is closed along latitude 90 or -90. Where the arrays
+store their seam makes no difference to the weights, beyond rounding.
+
 `GeolocArrays::world_cells()` says whether this applies to a set of
-arrays: not with a missing sample, not where the swath folds, and not yet
-across the antimeridian. Those fall back to source pixel space. Point
-kernels are unchanged.
+arrays: not with a missing sample, not where the swath folds, and not for
+a swath over a pole, whose longitudes don't unwrap consistently. Those
+fall back to source pixel space. Point kernels are unchanged.
 
 ## Other differences from GDAL
 

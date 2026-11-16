@@ -388,9 +388,9 @@ on by default, fall back where the cells are not whole):
   non-planar `WeightOptions::measure` is refused.
 - **Fallback.** `GeolocArrays::world_cells()` decides once, from the
   whole arrays: no missing sample, no fold (both orientations), no
-  bow-tie, no antimeridian crossing with `lon_wrap`. Otherwise the exact
-  footprint measures in source pixel space as before, so chunks never mix
-  measures.
+  bow-tie, and with `lon_wrap` longitudes that unwrap consistently
+  within 360 degrees. Otherwise the exact footprint measures in source
+  pixel space as before, so chunks never mix measures.
 
 The measure is planar in the arrays' coordinates: square degrees for
 longitude and latitude, true area for arrays in an equal-area CRS.
@@ -400,10 +400,36 @@ to 6e-3), tiling, affine as geoloc, steps, conventions, windows,
 fallbacks, `warp()` against `Weights::apply` bit for bit, and a curved
 longitude/latitude grid to polar stereographic.
 
-Next (stage 3b, its own issue): longitude/latitude arrays across the
-antimeridian, with corners unwrapped by continuity and the outline walked
-at offsets -360, 0 and +360, merged as in `Cover::Pieces`. Swaths over a
-pole stay on the fallback.
+Across the antimeridian (stage 3b, #72), built:
+
+- **Cells.** With `lon_wrap`, `world_cells()` unwraps the arrays'
+  longitudes once by continuity (each sample within 180 degrees of the
+  one before it along its row, and of the one above it down the first
+  column) and keeps them. Corners are interpolated from the unwrapped
+  samples, so every window's mesh is continuous and all windows share
+  the same longitudes. The arrays are refused (fallback) if two
+  neighbours are still 180 degrees or more apart (round a pole) or the
+  samples span more than 360.
+- **Outlines.** `SourceCells::lon_wrap` gives the lattice a wrap of 360
+  with poles at latitude ±90, and the outline is unwrapped as in source
+  pixel space (#70): closed along the nearer pole if it goes round one,
+  then walked at each whole turn at which its longitudes meet the mesh's,
+  two or more merged as `Cover::Pieces`. This also covers a swath near
+  the seam that doesn't cross it, whose outlines may.
+- **Weights.** `warp()`'s `Cover::Pieces` branch weights by cell area
+  as the window branch does.
+
+Tested in `tests/geoloc_exact.rs`: the same swath with its longitudes
+stored from -180, 175, 185, 0 and -200, both conventions, against the
+swath with nothing wrapped (to 1.1e-11, the cancellation in areas at
+longitude 180 against 0.4 degree cells, which the unwrapped reference
+shows against an exact clip too); each weight across the seam against a
+clip in local coordinates (2.5e-12); generator 8 across the seam (3e-12);
+every swath cell shared out whole; windows split at the seam; a
+destination pixel round the pole (conservation 6e-15, its area exactly
+360 by the corners' colatitude at densify 1), reaching the swath at two
+turns; `warp()` against `Weights::apply` bit for bit on both. Swaths over
+a pole stay on the fallback.
 
 What is shared between the two uses is all in rwarp: `QuadMesh`, the
 walk, the equal-area map, the periodic and fold handling. What each
@@ -469,7 +495,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 |---|---|---|
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
-| 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b) | generator 8; the antimeridian cases from #11's comparison |
+| 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
 | 4 | `PeriodicCols`, `Tripolar` for the polygon front end | generators 5 and 6 |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping folds, swath gaps (mesh holes), approx (cell-centre) mode | |

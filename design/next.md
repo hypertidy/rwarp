@@ -64,10 +64,10 @@ This file is a snapshot, so replace it rather than append to it.
    comparison onto ocean grids). N1 (#43) is decided (coverage uses
    `EqualArea` on every mesh). #36 is built in two PRs: the antimeridian
    and pole handling of the exact footprint (#70), then the equal-area
-   footprint for geolocation sources (on by default, falling back where
-   the arrays' cells are not whole). Geolocation sources across the
-   antimeridian are stage 3b, their own issue. #37 also waits on N3 and
-   N4.
+   footprint for geolocation sources (#71: on by default, falling back
+   where the arrays' cells are not whole). Geolocation sources across the
+   antimeridian (stage 3b, #72) are built too; swaths over a pole stay on
+   the fallback. #37 also waits on N3 and N4.
 4. **Decisions waiting on the maintainer**: N2 to N5 (#44 to #47) and C1
    to C4 (#48 to #51). N1 (2026-11-16) and N6 (`f32` edges,
    controlledburn 0.3.0) are decided.
