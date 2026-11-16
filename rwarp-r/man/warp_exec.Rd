@@ -12,7 +12,7 @@ warp_exec(
   dst_crs,
   dst_gt,
   dst_size = attr(plan, "dst_size"),
-  nbands = 1L,
+  nbands = attr(plan, "nbands"),
   resample = attr(plan, "resample"),
   src_nodata = NA,
   dst_nodata = NA,
@@ -44,7 +44,8 @@ chunk fetcher, or anything else.}
 \item{dst_size}{Integer \code{c(ncol, nrow)} of the planned window.  Default:
 the plan's.}
 
-\item{nbands}{Number of bands \code{read_fn} returns.  Default \code{1L}.}
+\item{nbands}{Number of bands \code{read_fn} returns.  Default: the plan's
+\code{nbands} (see \code{\link[=warp_plan]{warp_plan()}}), or \code{1L}.}
 
 \item{resample}{Resampling method (see \code{\link[=warp_plan]{warp_plan()}}).  Default: the
 method the plan was made for.  Planning for one method and warping with

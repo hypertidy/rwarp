@@ -97,11 +97,19 @@ dst_dim
 Each tile is a different source in a different CRS, so each gets its own
 plan against the same destination. No pixels are read yet.
 
+The plans are made as gdalwarp makes its own, so that the comparison at the
+end holds pixel for pixel. That means describing the warp as gdalwarp will
+see it, three bands worked as Float64 with nodata, and using gdalwarp's
+rules for splitting and for the kernel scale (see "Planning as gdalwarp
+does" in `?warp_plan`).
+
 ```{r plan}
 alg <- "cubic"
 plans <- lapply(info, function(i) {
   warp_plan(i$crs, i$gt, i$dim, dst_crs, dst_gt,
-            dst_size = dst_dim, resample = alg)
+            dst_size = dst_dim, resample = alg,
+            nbands = length(bands), working_type = "Float64", src_nodata = 0,
+            min_fill_ratio = 0.5, min_dst_size = 100L, scale_origin = "output")
 })
 do.call(rbind, lapply(names(plans), function(s) {
   ch <- unlist(plans[[s]], recursive = FALSE)
@@ -109,12 +117,21 @@ do.call(rbind, lapply(names(plans), function(s) {
 }))
 ```
 
-Both plans are one chunk, and each reads its whole tile: the box reaches
-past the tile on every side. `fill_ratio` is the share of the source area
-the destination maps onto that the tile actually has, about two thirds
-here, since much of the box lies beyond each tile. `scale_x` and `scale_y`
-are near 0.8, the 80 m overview going to 100 m: the cubic kernel widens to
-match, as gdalwarp's does when it downsamples.
+Three Float64 bands and their nodata masks take 195 bits a pixel, and this
+destination with a tile's source doesn't fit gdalwarp's default 64 MB of
+working memory in one piece, so each plan splits it into a left and a right
+half. Each half reads only the part of the tile it needs. `fill_ratio` is
+the share of the source area a chunk maps onto that the tile actually has,
+lowest for the left half of 55HBT's plan, much of which lies beyond the
+tile's west edge, in zone 54. `scale_x` and `scale_y` are near 0.8, the 80 m overview going
+to 100 m: the cubic kernel widens to match, as gdalwarp's does when it
+downsamples, and each chunk estimates its own.
+
+With `warp_plan()`'s defaults the plan would be one chunk per tile, with
+one estimate of the kernel scale for the whole destination. That reads the
+same pixels, but it isn't how gdalwarp would warp this, and for some kernels
+and sizes the values differ from gdalwarp's (by up to 1 DN with lanczos
+here, and by up to 93 DN with cubic at 50 m).
 
 ## Reading three bands as reflectance
 
@@ -194,13 +211,6 @@ doesn't round to integers. gdalwarp warps the integers and the reflectance
 scaling comes after; the kernels are weighted means, so that order gives the
 same values up to rounding.
 
-One more option: `-wm 512`. With three Float64 bands and their nodata masks,
-gdalwarp's default 64 MB of working memory is too little for this
-destination in one piece, so it would split it into chunks, and estimate the
-kernel's widening for each chunk separately. `warp_plan()` plans for a
-working memory of one byte per pixel, so here it makes one chunk. Giving
-gdalwarp the memory to do the same compares like with like.
-
 ```{r gdalwarp}
 vrt <- vapply(scenes, function(s) {
   f <- tempfile(fileext = ".vrt")
@@ -212,7 +222,7 @@ out <- tempfile(fileext = ".tif")
 warp(unname(vrt), out, t_srs = dst_crs, quiet = TRUE, cl_arg = c(
   "-te", ext[c(1, 3, 2, 4)], "-ts", dst_dim, "-r", alg,
   "-ot", "Float64", "-srcnodata", "0", "-dstnodata", "0",
-  "-ovr", "NONE", "-wm", "512"))
+  "-ovr", "NONE"))
 
 g  <- new(GDALRaster, out)
 gd <- array(NA_real_, dim(mosaic))
@@ -230,20 +240,32 @@ max(abs(mosaic - gd), na.rm = TRUE)   # and the same values, to rounding
 ## Warp again without reading again
 
 `warp_exec()` reads through `read_fn` every time it runs. To try other
-kernels, or to warp the same pixels onto other grids, read the window once
-and give it to `warp_buffer()`. The plan for 55HBT is one chunk, so its
-window is everything the warp needs:
+kernels without reading again, read once and give the pixels to
+`warp_buffer()`, which warps one source window into one destination window:
+the step `warp_exec()` runs for each chunk. Here that's the window all of
+55HBT's chunks need, read once, and each chunk warped from it with its own
+kernel scale:
 
 ```{r buffer}
-ch  <- plans[["55HBT"]][[1]][[1]]
+chs <- plans[["55HBT"]][[1]]
 i   <- info[["55HBT"]]
-win <- reader(src[["55HBT"]])(ch$src_xoff, ch$src_yoff,
-                              ch$src_xsize, ch$src_ysize)
+lo  <- c(min(sapply(chs, `[[`, "src_xoff")), min(sapply(chs, `[[`, "src_yoff")))
+hi  <- c(max(sapply(chs, function(ch) ch$src_xoff + ch$src_xsize)),
+         max(sapply(chs, function(ch) ch$src_yoff + ch$src_ysize)))
+win <- reader(src[["55HBT"]])(lo[1], lo[2], hi[1] - lo[1], hi[2] - lo[2])
+
 again <- function(resample) {
-  warp_buffer(win, i$crs, i$gt, dst_crs, dst_gt, dst_size = dst_dim,
-              src_off = c(ch$src_xoff, ch$src_yoff),
-              src_size = c(ch$src_xsize, ch$src_ysize), src_dim = i$dim,
-              resample = resample)
+  out <- array(NaN, c(dst_dim[2], dst_dim[1], length(bands)))
+  for (ch in chs) {
+    rows <- ch$dst_yoff + seq_len(ch$dst_ysize)
+    cols <- ch$dst_xoff + seq_len(ch$dst_xsize)
+    out[rows, cols, ] <- warp_buffer(
+      win, i$crs, i$gt, dst_crs, dst_gt,
+      dst_off = c(ch$dst_xoff, ch$dst_yoff), dst_size = c(ch$dst_xsize, ch$dst_ysize),
+      src_off = lo, src_size = hi - lo, src_dim = i$dim, resample = resample,
+      scaling = "fixed", scale = c(ch$scale_x, ch$scale_y))
+  }
+  out
 }
 identical(again("cubic"), warped[["55HBT"]])
 

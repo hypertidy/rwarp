@@ -18,7 +18,13 @@ warp_plan(
   resample = "near",
   scaling = c("widen", "point", "fixed"),
   scale = NULL,
-  split_antimeridian = TRUE
+  split_antimeridian = TRUE,
+  nbands = 1L,
+  working_type = "Byte",
+  src_nodata = FALSE,
+  dst_nodata = src_nodata,
+  memory_limit = 64,
+  scale_origin = c("chunk", "output")
 )
 }
 \arguments{
@@ -27,10 +33,12 @@ source raster.}
 
 \item{dst_crs, dst_gt}{CRS and geotransform of the destination raster.}
 
-\item{dst_off}{Integer \code{c(col_off, row_off)} origin of the destination
-window (0-based).  Default \code{c(0L, 0L)}.}
+\item{dst_off}{\code{c(col_off, row_off)} origin of the destination window
+(0-based).  Default \code{c(0L, 0L)}.}
 
-\item{dst_size}{Integer \code{c(ncol, nrow)} of the destination window.}
+\item{dst_size}{\code{c(ncol, nrow)} of the destination window.  Sizes and
+offsets are whole numbers, integer or double (as
+\code{GDALRaster$getRasterXSize()} gives them).}
 
 \item{resample_padding}{Extra source pixels added to every side of each
 source window (gdalwarp's \verb{-wo SOURCE_EXTRA}).  \code{NULL} (the default) is
@@ -65,6 +73,29 @@ where source x jumps, into compact windows either side. That reads the
 two edges of the source instead of a full-width strip (the few columns
 at the jump read a small window at each edge). gdalwarp does not split.
 Default \code{TRUE}; \code{FALSE} is gdalwarp's plan.}
+
+\item{nbands, working_type}{The number of bands and the data type the warp
+works in (gdalwarp's \code{-wt}; by default GDAL takes the widest of the
+source and destination types): one of \code{"Byte"}, \code{"Int8"}, \code{"UInt16"},
+\code{"Int16"}, \code{"UInt32"}, \code{"Int32"}, \code{"UInt64"}, \code{"Int64"}, \code{"Float16"},
+\code{"Float32"}, \code{"Float64"}.  With \code{src_nodata}, \code{dst_nodata} and
+\code{memory_limit} they set how much working memory a chunk takes, as
+gdalwarp counts it, and so where the destination splits.  Default \code{1L}
+and \code{"Byte"}.  \code{\link[=warp_exec]{warp_exec()}} takes \code{nbands} from the plan by default.}
+
+\item{src_nodata, dst_nodata}{Whether the source and destination have
+nodata, which gives each band a validity mask in the working memory:
+\code{TRUE} or \code{FALSE}, or the value given to \code{\link[=warp_exec]{warp_exec()}} (\code{NULL} is none,
+any value is nodata).  \code{dst_nodata} defaults to \code{src_nodata}, as gdalwarp
+gives the destination the source's nodata.  Default \code{FALSE}.}
+
+\item{memory_limit}{Working memory a chunk may take before it is split,
+in MB (gdalwarp's \code{-wm}).  Default \code{64}.}
+
+\item{scale_origin}{Where each chunk's kernel scale is estimated:
+\code{"chunk"} (the default) over the chunk itself, \code{"output"} as gdalwarp
+does, over a window of the chunk's size at the destination's top-left
+corner.  It matters only when the destination splits.}
 }
 \value{
 A list holding one chunk list, itself a list of chunk objects with
@@ -72,8 +103,8 @@ fields:
 \code{dst_xoff}, \code{dst_yoff}, \code{dst_xsize}, \code{dst_ysize},
 \code{src_xoff}, \code{src_yoff}, \code{src_xsize}, \code{src_ysize},
 \code{fill_ratio}, \code{scale_x}, \code{scale_y} (the kernel scale for the chunk).
-Attributes \code{src_dim}, \code{dst_off}, \code{dst_size}, \code{resample} and \code{scaling} record what
-it was planned for.
+Attributes \code{src_dim}, \code{dst_off}, \code{dst_size}, \code{nbands}, \code{resample} and
+\code{scaling} record what it was planned for.
 
 \code{fill_ratio} is GDAL's: the area of the source window (whole pixels,
 clamped to the source) over the area of the unrounded extent the
@@ -93,6 +124,18 @@ plan can be inspected before any I/O is performed, and the execution step
 \code{\link[=warp_exec]{warp_exec()}} accepts any read function — GDAL, byte-ref COG tiles, Zarr,
 etc.
 }
+\section{Planning as gdalwarp does}{
+
+The chunks matter to the output, not only to memory: with \code{scaling = "widen"} each chunk widens the kernel by its own estimate.  To get
+gdalwarp's chunks, and so its values, describe the warp as gdalwarp sees
+it and use its rules: \code{nbands}, \code{working_type}, \code{src_nodata} and
+\code{memory_limit} as for the gdalwarp call, \code{min_fill_ratio = 0.5},
+\code{min_dst_size = 100L}, \code{scale_origin = "output"} and
+\code{split_antimeridian = FALSE}.  The defaults instead plan for one byte per
+pixel, never split on fill ratio and estimate each chunk's scale over the
+chunk.
+}
+
 \examples{
 \dontrun{
 library(vaster)

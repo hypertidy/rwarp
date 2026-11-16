@@ -139,6 +139,22 @@ plan[[1]] <- Filter(function(ch) ch$fill_ratio >= 0.05, plan[[1]])
 result <- warp_exec(plan, read_fn = read_fn, ...)
 ```
 
+The chunks matter to the values, not only to memory: when the kernel
+widens to downsample, each chunk estimates its own scale. By default
+`warp_plan()` plans for one byte per pixel of working memory and never
+splits on fill ratio, so a destination that gdalwarp splits can be one
+chunk here. To get gdalwarp's chunks, and its values, describe the warp as
+gdalwarp sees it and use its rules:
+
+```r
+plan <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+                  dst_size = dst_dim, resample = "cubic",
+                  nbands = 3, working_type = "Float64", src_nodata = 0,
+                  memory_limit = 64,                  # gdalwarp -wm
+                  min_fill_ratio = 0.5, min_dst_size = 100L,
+                  scale_origin = "output", split_antimeridian = FALSE)
+```
+
 ## CRS diagnostics
 
 `crs_describe()` calls PROJ directly and returns every string form PROJ

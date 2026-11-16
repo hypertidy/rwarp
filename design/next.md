@@ -70,14 +70,13 @@ This file is a snapshot, so replace it rather than append to it.
    deprecated `warp::warp_resample` shim, is deprecated. The Sentinel-2
    showcase (#55) is the `sentinel2-warp` vignette: two UTM zones, three
    float bands, onto EPSG:3577, equal to gdalwarp's mosaic to 1e-11.
-   What it found: R's `warp_plan()` plans with the crate's default
-   working memory (one byte per pixel) and `min_fill_ratio = 0`, so for
-   several Float64 bands with nodata gdalwarp splits a destination that
-   the plan keeps whole, and its per-chunk kernel scale then differs (93
-   DN at 50 m). The vignette gives gdalwarp `-wm 512`. Exposing the
-   crate's `ChunkOptions::with_pixel_cost`, `memory_limit` and
-   `ScaleOrigin::Output` in `warp_plan()` would let the plan match
-   gdalwarp's chunks without that.
+   It found that R's `warp_plan()` couldn't describe gdalwarp's working
+   memory, so for several Float64 bands with nodata its chunks, and so
+   its kernel scales, differed from gdalwarp's (93 DN at 50 m). #67 adds
+   `nbands`, `working_type`, `src_nodata`, `dst_nodata`, `memory_limit`
+   and `scale_origin`: with gdalwarp's rules the chunks are gdalwarp's
+   (2 and 2 at 100 m, 15 and 19 at 50 m) and the vignette matches without
+   `-wm`.
 
 ## Parked
 

@@ -139,6 +139,67 @@ test_that("scaling = \"point\" matches gdalwarp -wo XSCALE=1 -wo YSCALE=1", {
   }
 })
 
+test_that("planned as gdalwarp plans, a destination gdalwarp splits matches it", {
+  skip_if_not_installed("gdalraster")
+  ## three Float64 bands with nodata, UTM to Albers, downsampling 100 m to
+  ## 130 m: at -wm 1 gdalwarp warps it in 5 or 6 chunks, and each chunk
+  ## widens the kernel by its own estimate, so the chunks must be gdalwarp's
+  n <- 300L
+  u_gt  <- c(700000, 100, 0, 5800000, 0, -100)
+  u_crs <- "EPSG:32754"
+  a_crs <- "EPSG:3577"
+  a_dim <- c(260L, 260L)
+  a_ext <- c(992000, 1025800, -4221800, -4188000)
+  a_gt  <- c(a_ext[1], 130, 0, a_ext[4], 0, -130)
+  xy <- expand.grid(x = seq_len(n), y = seq_len(n))
+  f <- tempfile(fileext = ".tif")
+  gdalraster::create("GTiff", f, n, n, 3L, "Float64", options = "COMPRESS=NONE")
+  ds <- methods::new(gdalraster::GDALRaster, f, read_only = FALSE)
+  ds$setGeoTransform(u_gt)
+  ds$setProjection(gdalraster::srs_to_wkt(u_crs))
+  for (b in 1:3) {
+    set.seed(b)
+    v <- 1000 + 300 * sin(xy$x / (9 + b)) * cos(xy$y / 13) + stats::rnorm(n * n, sd = 30)
+    v[xy$x %in% 40:70 & xy$y %in% 200:240] <- -9999
+    ds$write(b, 0, 0, n, n, v)
+    ds$setNoDataValue(b, -9999)
+  }
+  ds$close()
+  ds <- methods::new(gdalraster::GDALRaster, f)
+  on.exit(ds$close())
+  read3 <- function(xoff, yoff, xsize, ysize) {
+    unlist(lapply(1:3, function(b) ds$read(b, xoff, yoff, xsize, ysize, xsize, ysize)))
+  }
+  for (alg in c("bilinear", "cubic", "lanczos", "average")) {
+    out <- tempfile(fileext = ".tif")
+    gdalraster::warp(f, out, t_srs = a_crs, quiet = TRUE, cl_arg = c(
+      "-te", a_ext[c(1, 3, 2, 4)], "-ts", a_dim, "-r", alg, "-wm", "1"))
+    g <- methods::new(gdalraster::GDALRaster, out)
+    ref <- array(vapply(1:3, function(b) {
+      m <- matrix(g$read(b, 0, 0, a_dim[1], a_dim[2], a_dim[1], a_dim[2]),
+                  nrow = a_dim[2], byrow = TRUE)
+      m[m == -9999] <- NA
+      m
+    }, matrix(0, a_dim[2], a_dim[1])), c(a_dim[2], a_dim[1], 3L))
+    g$close()
+
+    plan <- warp_plan(u_crs, u_gt, c(n, n), a_crs, a_gt, dst_size = a_dim, resample = alg,
+                      nbands = 3, working_type = "Float64", src_nodata = -9999,
+                      memory_limit = 1, min_fill_ratio = 0.5, min_dst_size = 100L,
+                      scale_origin = "output", split_antimeridian = FALSE)
+    expect_gt(length(plan[[1]]), 1L, label = alg)
+    r <- warp_exec(plan, read3, u_crs, u_gt, a_crs, a_gt, src_nodata = -9999)
+    expect_identical(is.na(r), is.na(ref), label = alg)
+    expect_lt(max(abs(r - ref), na.rm = TRUE), 1e-8, label = alg)
+
+    ## the default plan is one chunk, with one scale: not gdalwarp's values
+    one <- warp_plan(u_crs, u_gt, c(n, n), a_crs, a_gt, dst_size = a_dim, resample = alg)
+    expect_length(one[[1]], 1L)
+    r1 <- warp_exec(one, read3, u_crs, u_gt, a_crs, a_gt, nbands = 3L, src_nodata = -9999)
+    expect_gt(max(abs(r1 - ref), na.rm = TRUE), 1, label = paste(alg, "default plan"))
+  }
+})
+
 test_that("multi-band raw data warps to an array and to a nativeRaster", {
   skip_if_not_installed("gdalraster")
   vals <- lapply(1:3, function(b) pmin(255, pmax(0, round(field(b) + 128))))

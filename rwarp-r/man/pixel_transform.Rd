@@ -18,7 +18,8 @@ pixel_transform(src_crs, src_gt, dst_crs, dst_gt, dst_dim)
 
 \item{dst_gt}{Geotransform of the destination raster.}
 
-\item{dst_dim}{Integer vector \code{c(ncol, nrow)} of the destination grid.}
+\item{dst_dim}{\code{c(ncol, nrow)} of the destination grid: whole numbers,
+integer or double.}
 }
 \value{
 A list with numeric vectors \code{src_x} and \code{src_y} of length
