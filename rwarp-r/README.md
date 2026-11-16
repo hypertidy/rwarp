@@ -179,5 +179,5 @@ Use `crs_describe()` to diagnose any string.
   (wariirp -> cogcache -> rwarp provenance chain)
 - [vapour](https://github.com/hypertidy/vapour) — GDAL raster I/O and
   warping; vapour and rwarp work alongside each other
-- [gdalraster](https://usdaforestservice.github.io/gdalraster/) — GDAL R
+- [gdalraster](https://firelab.github.io/gdalraster/) — GDAL R
   bindings used in examples
