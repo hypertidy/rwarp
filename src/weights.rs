@@ -88,9 +88,14 @@
 //!
 //! # Limits
 //!
-//! No antimeridian handling: a destination cell whose outline crosses the
-//! source's wrap column folds across the whole source width, and its
-//! weights are wrong. The spherical measure takes cell edges straight in
+//! Across a geographic source's seam the outline is unwrapped and measured
+//! at each whole-period offset, and one around a pole is closed along the
+//! pole's row, when the transformer reports the source's longitude period
+//! ([`Transformer::source_wrap`];
+//! [`GenImgProjTransformer`](crate::transform::GenImgProjTransformer)
+//! does once it has the source size). Without it, a destination cell whose
+//! outline crosses the source's wrap column folds across the whole source
+//! width, and its weights are wrong. The spherical measure takes cell edges straight in
 //! source pixel space (rhumb lines on a longitude/latitude source), not
 //! great circles as ESMF does; see `design/conservative.md` and
 //! `tests/esmf.rs` for the size of the difference.
@@ -402,14 +407,26 @@ pub fn exact_weights_with(
                 Cover::Failed => f64::NAN,
                 _ => measure.ring_area(&lat.rx, &lat.ry).abs(),
             };
-            if let Cover::Window { c0, r0, w } = cover {
-                for (k, &v) in lat.win.coverage().iter().enumerate() {
-                    if let Some(v) = opts.weight(v) {
-                        sr.push((src.row_off as i64 + r0 + (k / w) as i64) as u32);
-                        sc.push((src.col_off as i64 + c0 + (k % w) as i64) as u32);
-                        fr.push(v);
+            match cover {
+                Cover::Window { c0, r0, w } => {
+                    for (k, &v) in lat.win.coverage().iter().enumerate() {
+                        if let Some(v) = opts.weight(v) {
+                            sr.push((src.row_off as i64 + r0 + (k / w) as i64) as u32);
+                            sc.push((src.col_off as i64 + c0 + (k % w) as i64) as u32);
+                            fr.push(v);
+                        }
                     }
                 }
+                Cover::Pieces => {
+                    for &(pc, pr, v) in &lat.pieces {
+                        if let Some(v) = opts.weight(v) {
+                            sr.push((src.row_off as i64 + pr) as u32);
+                            sc.push((src.col_off as i64 + pc) as u32);
+                            fr.push(v);
+                        }
+                    }
+                }
+                Cover::Failed | Cover::Outside => {}
             }
             f(CellWeights {
                 dst_row, dst_col: (opts.dst_col_off + c) as u32, dst_area,

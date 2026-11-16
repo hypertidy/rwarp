@@ -94,6 +94,17 @@ pub trait Transformer {
         y: &mut [f64],
     ) -> Vec<bool>;
 
+    /// How the source wraps in longitude, in source pixels, for the area
+    /// methods that follow a destination pixel's outline
+    /// ([`Footprint::Exact`](crate::warp::Footprint::Exact) and
+    /// [`exact_weights`](crate::weights::exact_weights)): an outline that
+    /// crosses the source's seam comes back with x jumping by a period,
+    /// and one around a pole does not close. `None` (the default) when the
+    /// source does not wrap, or the transformer does not know.
+    fn source_wrap(&self) -> Option<SourceWrap> {
+        None
+    }
+
     /// Local Jacobian of the transform at a single point.
     ///
     /// Returns the 2×2 matrix:
@@ -133,6 +144,24 @@ pub trait Transformer {
         let dydy = (yq[0] - yq[1]) / (2.0 * h);
 
         Some([[dxdx, dxdy], [dydx, dydy]])
+    }
+}
+
+/// A source that wraps in longitude, in its own pixels; see
+/// [`Transformer::source_wrap`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct SourceWrap {
+    /// Source pixels per 360 degrees of longitude.
+    pub period: f64,
+    /// The (fractional) source rows of latitude 90 and -90.
+    pub pole_rows: [f64; 2],
+}
+
+impl SourceWrap {
+    /// A wrap of `period` pixels, with the poles at `pole_rows`.
+    pub fn new(period: f64, pole_rows: [f64; 2]) -> Self {
+        SourceWrap { period, pole_rows }
     }
 }
 
@@ -388,6 +417,22 @@ impl GenImgProjTransformer {
 }
 
 impl Transformer for GenImgProjTransformer {
+    /// A source wrapped around a centre longitude (see [`CenterLong`]),
+    /// north-up and at most 360 degrees wide: 360 degrees in its pixels,
+    /// and the rows of latitude 90 and -90. `None` otherwise, as when the
+    /// source size was not given ([`Self::with_source_size`]).
+    fn source_wrap(&self) -> Option<SourceWrap> {
+        self.center?;
+        let gt = &self.src_gt;
+        if gt[2] != 0.0 || gt[4] != 0.0 || gt[1] == 0.0 || gt[5] == 0.0 {
+            return None;
+        }
+        if self.src_size.is_some_and(|s| s[0] as f64 * gt[1].abs() > 360.0 + 1e-9) {
+            return None;
+        }
+        Some(SourceWrap::new(360.0 / gt[1].abs(), [(90.0 - gt[3]) / gt[5], (-90.0 - gt[3]) / gt[5]]))
+    }
+
     /// Transform coordinates through the three-step pipeline.
     ///
     /// When `dst_to_src = true` (the warp kernel path):

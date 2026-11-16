@@ -210,7 +210,7 @@
 //! covered (nearest likewise). There is no blending with the destination.
 
 use crate::cutline::{Cutline, CutlineRule, BAND_DENSITY_THRESHOLD, SRC_DENSITY_THRESHOLD};
-use crate::transform::{transform_scanline, Transformer};
+use crate::transform::{transform_scanline, SourceWrap, Transformer};
 
 /// Resampling algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,8 +323,12 @@ pub enum Footprint {
     /// with the source pixels (coverage fractions from
     /// [`controlledburn::CoverageWindow`], rounded to `f32`). With
     /// renormalisation over valid pixels this is first-order conservative
-    /// remapping. No antimeridian handling. The same overlaps, unrounded,
-    /// are available as a table from [`crate::weights::exact_weights`].
+    /// remapping. An outline across a geographic source's seam is
+    /// unwrapped and measured on both sides, and one around a pole closed
+    /// along the pole's row, when the transformer reports the source's
+    /// longitude period ([`Transformer::source_wrap`]). The same overlaps,
+    /// unrounded, are available as a table from
+    /// [`crate::weights::exact_weights`].
     Exact { densify: usize },
 }
 
@@ -2917,6 +2921,14 @@ pub(crate) struct Lattice {
     pub(crate) rx: Vec<f64>,
     pub(crate) ry: Vec<f64>,
     pub(crate) win: controlledburn::CoverageWindow,
+    /// How the source wraps in longitude ([`Transformer::source_wrap`]).
+    wrap: Option<SourceWrap>,
+    /// Scratch: the outline moved by whole periods.
+    sx: Vec<f64>,
+    /// Coverage of an outline measured at more than one period offset
+    /// ([`Cover::Pieces`]): `(col, row, fraction)` in buffer pixels, by
+    /// row then column, each cell once.
+    pub(crate) pieces: Vec<(i64, i64, f64)>,
 }
 
 /// What one destination pixel's exact footprint touches; see
@@ -2929,6 +2941,9 @@ pub(crate) enum Cover {
     /// Coverage of buffer pixels `c0..c0 + w` by `r0..` is in the window,
     /// row-major ([`controlledburn::CoverageWindow::coverage`]).
     Window { c0: i64, r0: i64, w: usize },
+    /// The outline reaches the buffer at more than one period offset (it
+    /// crosses the source's seam): its coverage is in [`Lattice::pieces`].
+    Pieces,
 }
 
 impl Lattice {
@@ -2941,6 +2956,7 @@ impl Lattice {
             top: LatticeLine::default(), bot: LatticeLine::default(), vert: LatticeLine::default(),
             level: LatticeLine::default(),
             rx: Vec::new(), ry: Vec::new(), win: controlledburn::CoverageWindow::default(),
+            wrap: transformer.source_wrap(), sx: Vec::new(), pieces: Vec::new(),
         };
         lat.fill_row_line(0);
         lat.bot.transform(transformer);
@@ -3014,24 +3030,120 @@ impl Lattice {
     /// or misses the buffer, its coverage over the buffer pixels under its
     /// bounding box (left in `win`). The window clamps pieces beyond its
     /// columns exactly, so the coverage is exact wherever the outline goes.
+    ///
+    /// For a source that wraps in longitude, the outline is unwrapped
+    /// across the seam first (and closed along the pole's row if it goes
+    /// around a pole), then measured at each whole-period offset at which
+    /// it reaches the buffer: once, as [`Cover::Window`], or more than once,
+    /// merged into [`Cover::Pieces`].
     pub(crate) fn cover(&mut self, c: usize, src_off: (f64, f64), (ncol, nrow): (i64, i64)) -> Cover {
         if !self.ring(c, src_off) { return Cover::Failed; }
+        if let Some(wrap) = self.wrap {
+            if !self.unwrap(wrap, src_off.1) { return Cover::Failed; }
+        }
         let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
         for (&x, &y) in self.rx.iter().zip(&self.ry) {
             minx = minx.min(x); maxx = maxx.max(x);
             miny = miny.min(y); maxy = maxy.max(y);
         }
         if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) { return Cover::Failed; }
-        let c0 = (minx.floor() as i64).max(0);
-        let c1 = (maxx.ceil() as i64).min(ncol);
         let r0 = (miny.floor() as i64).max(0);
         let r1 = (maxy.ceil() as i64).min(nrow);
-        if c0 >= c1 || r0 >= r1 { return Cover::Outside; }
-        let (w, h) = ((c1 - c0) as usize, (r1 - r0) as usize);
-        self.win.reset(c0, r0, w, h);
-        self.win.add_ring(&self.rx, &self.ry, 1.0);
-        self.win.resolve();
-        Cover::Window { c0, r0, w }
+        if r0 >= r1 { return Cover::Outside; }
+        let h = (r1 - r0) as usize;
+        // the whole-period offsets at which the outline reaches the buffer's
+        // columns: just 0 without a wrap
+        let p = self.wrap.map_or(0.0, |w| w.period);
+        let (k0, k1) = if p > 0.0 {
+            ((-maxx / p).floor() as i64 + 1, ((ncol as f64 - minx) / p).ceil() as i64 - 1)
+        } else {
+            (0, 0)
+        };
+        let cols = |k: i64| {
+            let s = k as f64 * p;
+            (((minx + s).floor() as i64).max(0), ((maxx + s).ceil() as i64).min(ncol))
+        };
+        let mut hits = [0i64; 4];
+        let mut n = 0;
+        for k in k0..=k1 {
+            let (c0, c1) = cols(k);
+            if c0 < c1 {
+                if n == hits.len() { return Cover::Failed; }
+                hits[n] = k;
+                n += 1;
+            }
+        }
+        match n {
+            0 => Cover::Outside,
+            1 => {
+                let k = hits[0];
+                if k != 0 {
+                    let s = k as f64 * p;
+                    for x in &mut self.rx { *x += s; }
+                }
+                let (c0, c1) = cols(k);
+                let w = (c1 - c0) as usize;
+                self.win.reset(c0, r0, w, h);
+                self.win.add_ring(&self.rx, &self.ry, 1.0);
+                self.win.resolve();
+                Cover::Window { c0, r0, w }
+            }
+            _ => {
+                self.pieces.clear();
+                for &k in &hits[..n] {
+                    let s = k as f64 * p;
+                    self.sx.clear();
+                    self.sx.extend(self.rx.iter().map(|x| x + s));
+                    let (c0, c1) = cols(k);
+                    let w = (c1 - c0) as usize;
+                    self.win.reset(c0, r0, w, h);
+                    self.win.add_ring(&self.sx, &self.ry, 1.0);
+                    for (i, &f) in self.win.resolve().iter().enumerate() {
+                        if f != 0.0 {
+                            self.pieces.push((c0 + (i % w) as i64, r0 + (i / w) as i64, f));
+                        }
+                    }
+                }
+                // by row then column; a cell two copies share (where the
+                // outline meets itself one period on) once, summed
+                self.pieces.sort_by_key(|&(c, r, _)| (r, c));
+                self.pieces.dedup_by(|b, a| {
+                    if (a.0, a.1) == (b.0, b.1) { a.2 += b.2; true } else { false }
+                });
+                Cover::Pieces
+            }
+        }
+    }
+
+    /// Unwrap the outline in `rx` across the source's seam, so that no
+    /// step moves by more than half a period. An outline around a pole
+    /// then comes back one period from where it started: close it along
+    /// the row of the pole it is nearest (in buffer pixels, the full
+    /// source's row less `row_off`), out and back at the period's two ends.
+    /// False for an outline that winds round more than once.
+    fn unwrap(&mut self, wrap: SourceWrap, row_off: f64) -> bool {
+        let p = wrap.period;
+        if !(p.is_finite() && p > 0.0) || self.rx.is_empty() { return true; }
+        let mut shift = 0.0;
+        let mut prev = self.rx[0];
+        for x in self.rx.iter_mut().skip(1) {
+            let raw = *x;
+            shift -= ((raw - prev) / p).round() * p;
+            prev = raw;
+            *x = raw + shift;
+        }
+        let net = shift - ((self.rx[0] - prev) / p).round() * p;
+        let turns = (net / p).round();
+        if turns == 0.0 { return true; }
+        if turns.abs() > 1.0 { return false; }
+        let near = |row: f64| self.ry.iter().map(|&y| (y - (row - row_off)).abs()).fold(f64::INFINITY, f64::min);
+        let [north, south] = wrap.pole_rows;
+        let pole = if near(north) <= near(south) { north } else { south } - row_off;
+        let (x0, y0) = (self.rx[0], self.ry[0]);
+        let x1 = x0 + turns * p;
+        self.rx.extend([x1, x1, x0]);
+        self.ry.extend([y0, pole, pole]);
+        true
     }
 }
 
@@ -3056,16 +3168,28 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
     let band_ok = &mut vec![false; img.nb];
     let (ncol, nrow) = (img.ncol as i64, img.nrow as i64);
     for c in 0..dst_ncol {
-        let Cover::Window { c0, r0, w } = lat.cover(c, src_off, (ncol, nrow)) else { continue };
-        let cov = lat.win.coverage();
-
         red.reset();
-        let at = |k: usize| ((r0 + (k / w) as i64) * ncol + c0 + (k % w) as i64) as usize;
-        for (k, &f) in cov.iter().enumerate() {
-            if f >= 1.0 - TOL { img.reduce(red, at(k), 1.0, band_ok); }
-        }
-        for (k, &f) in cov.iter().enumerate() {
-            if f > TOL && f < 1.0 - TOL { img.reduce(red, at(k), f as f32 as f64, band_ok); }
+        match lat.cover(c, src_off, (ncol, nrow)) {
+            Cover::Window { c0, r0, w } => {
+                let cov = lat.win.coverage();
+                let at = |k: usize| ((r0 + (k / w) as i64) * ncol + c0 + (k % w) as i64) as usize;
+                for (k, &f) in cov.iter().enumerate() {
+                    if f >= 1.0 - TOL { img.reduce(red, at(k), 1.0, band_ok); }
+                }
+                for (k, &f) in cov.iter().enumerate() {
+                    if f > TOL && f < 1.0 - TOL { img.reduce(red, at(k), f as f32 as f64, band_ok); }
+                }
+            }
+            Cover::Pieces => {
+                let at = |pc: i64, pr: i64| (pr * ncol + pc) as usize;
+                for &(pc, pr, f) in &lat.pieces {
+                    if f >= 1.0 - TOL { img.reduce(red, at(pc, pr), 1.0, band_ok); }
+                }
+                for &(pc, pr, f) in &lat.pieces {
+                    if f > TOL && f < 1.0 - TOL { img.reduce(red, at(pc, pr), f as f32 as f64, band_ok); }
+                }
+            }
+            Cover::Failed | Cover::Outside => continue,
         }
         red.write(&mut row_out[c * img.nb..(c + 1) * img.nb]);
     }

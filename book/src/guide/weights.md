@@ -138,10 +138,15 @@ columns.
 - **Planar areas** in source pixel space. ESMF measures on the sphere with
   great-circle edges. A spherical measure is planned (design/conservative.md,
   stage 3).
-- **No antimeridian handling.** A target cell whose outline crosses the
-  source's wrap column folds across the whole source width, and its weights
-  are wrong. Keep target grids clear of the source's seam for now, or use a
-  source that is continuous across the target.
+- **The antimeridian needs the transformer to say the source wraps.** A
+  target cell whose outline crosses a geographic source's seam is unwrapped
+  and measured on both sides of it, and one around a pole is closed along
+  the pole's row, when the transformer reports the source's longitude
+  period (`Transformer::source_wrap`). `GenImgProjTransformer` does for a
+  north-up source of at most 360 degrees once it has the source size
+  (`with_source_size`, which also gives GDAL's `CENTER_LONG`); a
+  transformer that does not report it gets no unwrapping, and such cells
+  are wrong as before.
 - **Destination cells are what a transformer describes.** Curvilinear grids
   work through `GenImgGeolocTransformer` with its bilinear cell definition.
   Cells from corner bounds and meshes are later stages.

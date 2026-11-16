@@ -235,8 +235,13 @@ pub enum Topology {
 
 ### The exact footprint at the antimeridian
 
-`Footprint::Exact` does not handle the antimeridian today. Two cases,
-both fixable in rwarp with no change to `CoverageWindow`:
+Built (stage 3, #36): `Lattice::cover` in `src/warp.rs`, for sources
+whose transformer reports `Transformer::source_wrap` (a wrapped
+geographic `GenImgProjTransformer`), tested in `tests/antimeridian.rs`.
+The pole is chosen as the one whose row the outline comes nearest, which
+needs no forward transform; a cell measured at two offsets is merged into
+one entry. Two cases, both fixed in rwarp with no change to
+`CoverageWindow`:
 
 - **Seam crossing.** A destination pixel straddling the source seam comes
   back with x jumping by about the source width. Unwrap the ring (shift

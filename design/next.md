@@ -62,8 +62,10 @@ This file is a snapshot, so replace it rather than append to it.
    footprint for geolocation sources, antimeridian), then stage 4 (#37:
    periodic and tripolar grids and CF bounds, which takes the ESMF
    comparison onto ocean grids). N1 (#43) is decided (coverage uses
-   `EqualArea` on every mesh), so #36 is unblocked; #37 also waits on N3
-   and N4.
+   `EqualArea` on every mesh). #36 is under way: the antimeridian and pole
+   handling of the exact footprint is the first PR; the equal-area
+   footprint for geolocation sources is next. #37 also waits on N3 and
+   N4.
 4. **Decisions waiting on the maintainer**: N2 to N5 (#44 to #47) and C1
    to C4 (#48 to #51). N1 (2026-11-16) and N6 (`f32` edges,
    controlledburn 0.3.0) are decided.
