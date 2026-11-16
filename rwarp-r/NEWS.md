@@ -1,5 +1,20 @@
 # rwarp (development version)
 
+* `warp_plan()` can plan as gdalwarp plans (#67). New arguments describe the
+  warp's working memory as gdalwarp counts it: `nbands`, `working_type`,
+  `src_nodata`, `dst_nodata` (whether there's nodata; defaults to
+  `src_nodata`) and `memory_limit` (gdalwarp's `-wm`, in MB). New
+  `scale_origin = "output"` estimates each chunk's kernel scale as gdalwarp
+  does. With these, `min_fill_ratio = 0.5` and `min_dst_size = 100L`, the
+  chunks are gdalwarp's, and so are the values where the kernel widens: the
+  `sentinel2-warp` vignette now matches gdalwarp at its default memory,
+  without `-wm`. The defaults are unchanged.
+
+* `warp_exec()` takes `nbands` from the plan by default.
+
+* `warp_plan()` and `pixel_transform()` accept sizes and offsets as
+  whole-number doubles, as `GDALRaster$getRasterXSize()` returns them.
+
 * The `sentinel2-warp` vignette is rewritten (#55): two Sentinel-2 tiles from
   one overpass, in UTM zones 54 and 55, warped as three bands of float
   reflectance onto Australian Albers (EPSG:3577), combined in order as

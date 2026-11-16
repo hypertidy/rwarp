@@ -17,7 +17,8 @@
 #'   `GDALRaster$getGeoTransform()` or `vaster::extent_dim_to_gt()`).
 #' @param dst_crs CRS of the destination raster.
 #' @param dst_gt Geotransform of the destination raster.
-#' @param dst_dim Integer vector `c(ncol, nrow)` of the destination grid.
+#' @param dst_dim `c(ncol, nrow)` of the destination grid: whole numbers,
+#'   integer or double.
 #'
 #' @return A list with numeric vectors `src_x` and `src_y` of length
 #'   `prod(dst_dim)`, in row-major order.  `NA` where the destination point
@@ -45,11 +46,24 @@ pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
     is.character(src_crs), length(src_crs) == 1L,
     is.numeric(src_gt),    length(src_gt)  == 6L,
     is.character(dst_crs), length(dst_crs) == 1L,
-    is.numeric(dst_gt),    length(dst_gt)  == 6L,
-    is.integer(dst_dim),   length(dst_dim) == 2L
+    is.numeric(dst_gt),    length(dst_gt)  == 6L
   )
+  dst_dim <- whole2(dst_dim, "dst_dim")
   .Call(wrap__pixel_transform, src_crs, src_gt, dst_crs, dst_gt, dst_dim)
 }
+
+## two whole numbers (a size or an offset), as integer: GDAL bindings give
+## raster sizes as doubles
+whole2 <- function(x, name) {
+  if (!is.numeric(x) || length(x) != 2L || anyNA(x) || any(x < 0) ||
+      any(x != round(x)) || any(x > .Machine$integer.max)) {
+    stop("`", name, "` must be two whole numbers, not negative", call. = FALSE)
+  }
+  as.integer(x)
+}
+
+## does a nodata argument mean a mask: FALSE/NULL no, TRUE or any value yes
+has_nodata <- function(x) !is.null(x) && !isFALSE(x)
 
 #' Plan the source windows needed for a destination raster window
 #'
@@ -62,9 +76,11 @@ pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
 #' @param src_crs,src_gt,src_dim CRS, geotransform, and `c(ncol, nrow)` of the
 #'   source raster.
 #' @param dst_crs,dst_gt CRS and geotransform of the destination raster.
-#' @param dst_off Integer `c(col_off, row_off)` origin of the destination
-#'   window (0-based).  Default `c(0L, 0L)`.
-#' @param dst_size Integer `c(ncol, nrow)` of the destination window.
+#' @param dst_off `c(col_off, row_off)` origin of the destination window
+#'   (0-based).  Default `c(0L, 0L)`.
+#' @param dst_size `c(ncol, nrow)` of the destination window.  Sizes and
+#'   offsets are whole numbers, integer or double (as
+#'   `GDALRaster$getRasterXSize()` gives them).
 #' @param resample_padding Extra source pixels added to every side of each
 #'   source window (gdalwarp's `-wo SOURCE_EXTRA`).  `NULL` (the default) is
 #'   gdalwarp's rule: none, or 10 when a sample point fails to transform.
@@ -92,14 +108,44 @@ pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
 #'   two edges of the source instead of a full-width strip (the few columns
 #'   at the jump read a small window at each edge). gdalwarp does not split.
 #'   Default `TRUE`; `FALSE` is gdalwarp's plan.
+#' @param nbands,working_type The number of bands and the data type the warp
+#'   works in (gdalwarp's `-wt`; by default GDAL takes the widest of the
+#'   source and destination types): one of `"Byte"`, `"Int8"`, `"UInt16"`,
+#'   `"Int16"`, `"UInt32"`, `"Int32"`, `"UInt64"`, `"Int64"`, `"Float16"`,
+#'   `"Float32"`, `"Float64"`.  With `src_nodata`, `dst_nodata` and
+#'   `memory_limit` they set how much working memory a chunk takes, as
+#'   gdalwarp counts it, and so where the destination splits.  Default `1L`
+#'   and `"Byte"`.  [warp_exec()] takes `nbands` from the plan by default.
+#' @param src_nodata,dst_nodata Whether the source and destination have
+#'   nodata, which gives each band a validity mask in the working memory:
+#'   `TRUE` or `FALSE`, or the value given to [warp_exec()] (`NULL` is none,
+#'   any value is nodata).  `dst_nodata` defaults to `src_nodata`, as gdalwarp
+#'   gives the destination the source's nodata.  Default `FALSE`.
+#' @param memory_limit Working memory a chunk may take before it is split,
+#'   in MB (gdalwarp's `-wm`).  Default `64`.
+#' @param scale_origin Where each chunk's kernel scale is estimated:
+#'   `"chunk"` (the default) over the chunk itself, `"output"` as gdalwarp
+#'   does, over a window of the chunk's size at the destination's top-left
+#'   corner.  It matters only when the destination splits.
+#'
+#' @section Planning as gdalwarp does:
+#' The chunks matter to the output, not only to memory: with `scaling =
+#' "widen"` each chunk widens the kernel by its own estimate.  To get
+#' gdalwarp's chunks, and so its values, describe the warp as gdalwarp sees
+#' it and use its rules: `nbands`, `working_type`, `src_nodata` and
+#' `memory_limit` as for the gdalwarp call, `min_fill_ratio = 0.5`,
+#' `min_dst_size = 100L`, `scale_origin = "output"` and
+#' `split_antimeridian = FALSE`.  The defaults instead plan for one byte per
+#' pixel, never split on fill ratio and estimate each chunk's scale over the
+#' chunk.
 #'
 #' @return A list holding one chunk list, itself a list of chunk objects with
 #'   fields:
 #'   `dst_xoff`, `dst_yoff`, `dst_xsize`, `dst_ysize`,
 #'   `src_xoff`, `src_yoff`, `src_xsize`, `src_ysize`,
 #'   `fill_ratio`, `scale_x`, `scale_y` (the kernel scale for the chunk).
-#'   Attributes `src_dim`, `dst_off`, `dst_size`, `resample` and `scaling` record what
-#'   it was planned for.
+#'   Attributes `src_dim`, `dst_off`, `dst_size`, `nbands`, `resample` and
+#'   `scaling` record what it was planned for.
 #'
 #'   `fill_ratio` is GDAL's: the area of the source window (whole pixels,
 #'   clamped to the source) over the area of the unrounded extent the
@@ -144,20 +190,39 @@ warp_plan <- function(
     resample         = "near",
     scaling          = c("widen", "point", "fixed"),
     scale            = NULL,
-    split_antimeridian = TRUE) {
+    split_antimeridian = TRUE,
+    nbands           = 1L,
+    working_type     = "Byte",
+    src_nodata       = FALSE,
+    dst_nodata       = src_nodata,
+    memory_limit     = 64,
+    scale_origin     = c("chunk", "output")) {
   resample <- match.arg(resample, c("near", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode", "min", "max", "med", "rms"))
   scaling  <- match.arg(scaling)
+  working_type <- match.arg(working_type, c("Byte", "UInt8", "Int8", "UInt16", "Int16",
+                                            "UInt32", "Int32", "UInt64", "Int64",
+                                            "Float16", "Float32", "Float64"))
+  scale_origin <- match.arg(scale_origin)
+  src_dim  <- whole2(src_dim, "src_dim")
+  dst_off  <- whole2(dst_off, "dst_off")
+  dst_size <- whole2(dst_size, "dst_size")
+  if (!is.numeric(nbands) || length(nbands) != 1L || is.na(nbands) ||
+      nbands < 1 || nbands != round(nbands)) {
+    stop("`nbands` must be a whole number, 1 or more", call. = FALSE)
+  }
+  nbands <- as.integer(nbands)
+  if (!is.numeric(memory_limit) || length(memory_limit) != 1L ||
+      !is.finite(memory_limit) || memory_limit <= 0) {
+    stop("`memory_limit` must be a positive number of MB", call. = FALSE)
+  }
   if (scaling == "fixed" && (is.null(scale) || length(scale) != 2L)) {
     stop("scaling = \"fixed\" needs scale = c(x, y)")
   }
   stopifnot(
     is.character(src_crs), length(src_crs) == 1L,
     is.numeric(src_gt),    length(src_gt)  == 6L,
-    is.integer(src_dim),   length(src_dim) == 2L,
     is.character(dst_crs), length(dst_crs) == 1L,
-    is.numeric(dst_gt),    length(dst_gt)  == 6L,
-    is.integer(dst_off),   length(dst_off) == 2L,
-    is.integer(dst_size),  length(dst_size) == 2L
+    is.numeric(dst_gt),    length(dst_gt)  == 6L
   )
   plan <- .Call(wrap__warp_plan,
     src_crs, src_gt, src_dim,
@@ -167,13 +232,16 @@ warp_plan <- function(
     as.double(min_fill_ratio),
     as.integer(min_dst_size),
     resample, scaling, as.double(if (is.null(scale)) numeric(0) else scale),
-    isTRUE(split_antimeridian)
+    isTRUE(split_antimeridian),
+    nbands, working_type, has_nodata(src_nodata), has_nodata(dst_nodata),
+    as.double(memory_limit) * 1024 * 1024, scale_origin
   )
   ## NULL (no chunk reads source) stays NULL, as before
   if (is.null(plan)) return(NULL)
   attr(plan, "src_dim")  <- src_dim
   attr(plan, "dst_off")  <- dst_off
   attr(plan, "dst_size") <- dst_size
+  attr(plan, "nbands")   <- nbands
   attr(plan, "resample") <- resample
   attr(plan, "scaling")  <- scaling
   plan
@@ -202,7 +270,8 @@ warp_plan <- function(
 #'   (as passed to [warp_plan()]).
 #' @param dst_size Integer `c(ncol, nrow)` of the planned window.  Default:
 #'   the plan's.
-#' @param nbands Number of bands `read_fn` returns.  Default `1L`.
+#' @param nbands Number of bands `read_fn` returns.  Default: the plan's
+#'   `nbands` (see [warp_plan()]), or `1L`.
 #' @param resample Resampling method (see [warp_plan()]).  Default: the
 #'   method the plan was made for.  Planning for one method and warping with
 #'   a wider one can clip kernels at window edges.
@@ -273,7 +342,7 @@ warp_exec <- function(
     src_crs, src_gt,
     dst_crs, dst_gt,
     dst_size    = attr(plan, "dst_size"),
-    nbands      = 1L,
+    nbands      = attr(plan, "nbands"),
     resample    = attr(plan, "resample"),
     src_nodata  = NA,
     dst_nodata  = NA,
@@ -292,6 +361,7 @@ warp_exec <- function(
   mode_ties   <- match.arg(mode_ties)
   output      <- match.arg(output)
   if (is.null(resample)) resample <- "near"
+  if (is.null(nbands)) nbands <- 1L
   resample <- match.arg(resample, c("near", "bilinear", "cubic", "cubicspline",
                                     "lanczos", "average", "mode", "min", "max",
                                     "med", "rms"))

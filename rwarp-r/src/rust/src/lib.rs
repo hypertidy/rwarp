@@ -2,11 +2,11 @@ use extendr_api::prelude::*;
 use std::ffi::{CStr, CString, c_char};
 use proj_sys as ffi;
 use rwarp::approx::ApproxTransformer;
-use rwarp::plan::{ChunkOptions, ChunkPlanner};
+use rwarp::plan::{ChunkOptions, ChunkPlanner, ScaleOrigin};
 use rwarp::transform::GenImgProjTransformer;
 use rwarp::warp::{
-    BandNodata, DstNodata, KernelScaling, ModeTies, Nodata, ResampleAlg, Sample, SourceBuffer,
-    WarpOptions,
+    BandNodata, DataType, DstNodata, KernelScaling, ModeTies, Nodata, ResampleAlg, Sample,
+    SourceBuffer, WarpOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +145,31 @@ fn kernel_scaling(scaling: &str, scale: &[f64]) -> KernelScaling {
             KernelScaling::Fixed { x: scale[0], y: scale[1] }
         }
         _ => throw_r_error(&format!("unsupported scaling: {}", scaling)),
+    }
+}
+
+fn data_type(name: &str) -> DataType {
+    match name {
+        "Byte" | "UInt8" => DataType::UInt8,
+        "Int8" => DataType::Int8,
+        "UInt16" => DataType::UInt16,
+        "Int16" => DataType::Int16,
+        "UInt32" => DataType::UInt32,
+        "Int32" => DataType::Int32,
+        "UInt64" => DataType::UInt64,
+        "Int64" => DataType::Int64,
+        "Float16" => DataType::Float16,
+        "Float32" => DataType::Float32,
+        "Float64" => DataType::Float64,
+        _ => throw_r_error(&format!("unsupported working_type: {}", name)),
+    }
+}
+
+fn scale_origin(origin: &str) -> ScaleOrigin {
+    match origin {
+        "chunk" => ScaleOrigin::Chunk,
+        "output" => ScaleOrigin::Output,
+        _ => throw_r_error(&format!("unsupported scale_origin: {}", origin)),
     }
 }
 
@@ -373,6 +398,12 @@ fn warp_plan(
     scaling: &str,
     scale: &[f64],
     split_antimeridian: bool,
+    nbands: i32,
+    working_type: &str,
+    src_nodata: bool,
+    dst_nodata: bool,
+    memory_limit: f64,
+    scale_origin_: &str,
 ) -> Robj {
     let src_size = [src_dim[0] as usize, src_dim[1] as usize];
     let off = [dst_off[0] as usize, dst_off[1] as usize];
@@ -384,7 +415,10 @@ fn warp_plan(
         .with_special_points(special_points(src_crs, dst_crs, dst_gt))
         .with_source_extra(if resample_padding < 0 { None } else { Some(resample_padding as usize) })
         .with_fill_ratio_split(min_fill_ratio, min_dst_size as usize)
-        .with_split_antimeridian(split_antimeridian);
+        .with_split_antimeridian(split_antimeridian)
+        .with_pixel_cost(data_type(working_type), nbands.max(1) as usize, src_nodata, dst_nodata)
+        .with_memory_limit(memory_limit)
+        .with_scale_origin(scale_origin(scale_origin_));
     let planner = ChunkPlanner::new(&t, src_size, [off[0] + size[0], off[1] + size[1]], opts);
     let plan = planner.plan_window(off, size);
     let chunks: Vec<Robj> = plan.live().map(|c| {

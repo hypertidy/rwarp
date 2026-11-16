@@ -92,3 +92,59 @@ test_that("split_antimeridian reads two edge windows and gives the same values",
     expect_identical(ex(TRUE), ex(FALSE), info = rs)
   }
 })
+
+test_that("sizes and offsets can be whole-number doubles, as GDAL bindings give them", {
+  p_int <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt, dst_size = dst_dim)
+  p_dbl <- warp_plan(src_crs, src_gt, as.double(src_dim), dst_crs, dst_gt,
+                     dst_off = c(0, 0), dst_size = as.double(dst_dim))
+  expect_identical(p_dbl, p_int)
+  expect_error(warp_plan(src_crs, src_gt, c(360.5, 180), dst_crs, dst_gt, dst_size = dst_dim),
+               "`src_dim` must be two whole numbers")
+  expect_error(warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt, dst_off = c(-1, 0),
+                         dst_size = dst_dim), "`dst_off`")
+  expect_identical(pixel_transform(src_crs, src_gt, dst_crs, dst_gt, c(10, 10)),
+                   pixel_transform(src_crs, src_gt, dst_crs, dst_gt, dst_dim))
+})
+
+test_that("the working memory a chunk takes sets where the destination splits", {
+  ## global 0.1 degree source to a 2000 x 2000 polar grid
+  sgt <- c(-180, 0.1, 0, 90, 0, -0.1); sdim <- c(3600L, 1800L)
+  dgt <- c(-4e6, 4000, 0, 4e6, 0, -4000); ddim <- c(2000L, 2000L)
+  plan <- function(...) warp_plan("EPSG:4326", sgt, sdim, "EPSG:3031", dgt,
+                                  dst_size = ddim, resample = "cubic", ...)
+  one <- plan()
+  ## the defaults: one byte per pixel, which fits in 64 MB
+  expect_identical(one, plan(nbands = 1L, working_type = "Byte", src_nodata = FALSE,
+                             memory_limit = 64, scale_origin = "chunk"))
+  expect_identical(attr(one, "nbands"), 1L)
+  ## three Float64 bands with nodata masks: 195 bits a pixel, 97 MB for the
+  ## destination alone
+  three <- plan(nbands = 3, working_type = "Float64", src_nodata = -9999)
+  expect_gt(length(three[[1]]), length(one[[1]]))
+  expect_identical(attr(three, "nbands"), 3L)
+  ## dst_nodata follows src_nodata unless given
+  expect_identical(three, plan(nbands = 3, working_type = "Float64", src_nodata = TRUE,
+                               dst_nodata = TRUE))
+  ## a larger limit, fewer chunks
+  expect_lt(length(plan(nbands = 3, working_type = "Float64", src_nodata = TRUE,
+                        memory_limit = 512)[[1]]), length(three[[1]]))
+  ## chunk-sized windows at the top-left give equal-sized chunks one scale
+  out <- plan(nbands = 3, working_type = "Float64", src_nodata = TRUE, scale_origin = "output")
+  sc <- vapply(out[[1]], function(ch) ch$scale_x, 0)
+  sz <- vapply(out[[1]], function(ch) paste(ch$dst_xsize, ch$dst_ysize), "")
+  expect_true(all(tapply(sc, sz, function(s) diff(range(s))) == 0))
+
+  expect_error(plan(nbands = 0), "`nbands`")
+  expect_error(plan(memory_limit = -1), "`memory_limit`")
+  expect_error(plan(working_type = "CFloat64"), "should be one of")
+})
+
+test_that("warp_exec() takes nbands from the plan", {
+  gt <- c(0, 1, 0, 4, 0, -1)
+  plan <- warp_plan("EPSG:4326", gt, c(4L, 4L), "EPSG:4326", gt, dst_size = c(4L, 4L),
+                    nbands = 2L)
+  r <- warp_exec(plan, function(...) as.double(c(1:16, 101:116)), "EPSG:4326", gt,
+                 "EPSG:4326", gt)
+  expect_equal(dim(r), c(4L, 4L, 2L))
+  expect_equal(r[, , 2], matrix(as.double(101:116), 4, 4, byrow = TRUE))
+})
