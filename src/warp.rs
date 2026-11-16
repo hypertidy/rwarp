@@ -69,7 +69,9 @@
 //!   antimeridian wraps past the right edge.
 //! - [`Footprint::Exact`] intersects the transformed outline exactly with
 //!   the source pixels, which with renormalisation is first-order
-//!   conservative remapping with areas in source pixel space.
+//!   conservative remapping with areas in source pixel space, or, for a
+//!   geolocation source, in the source's world coordinates
+//!   ([`Transformer::source_cells`]).
 //!
 //! For a destination pixel that maps to an axis-aligned rectangle the two
 //! agree. The exact footprint transforms the destination pixel lattice
@@ -77,7 +79,9 @@
 //! each densify level a scanline, so an approximate transformer applies),
 //! and takes coverage from a reused [`controlledburn::CoverageWindow`]. It
 //! costs about 3x the box at 3.5:1 in the timing test (0.8 microseconds a
-//! pixel), less at higher ratios.
+//! pixel), less at higher ratios. Over a geolocation source each outline
+//! is also walked onto the source cells: 4 to 6 microseconds a pixel at
+//! densify 2 in the timings for #36, 3 to 9 times the source-pixel measure.
 //!
 //! ## Mode
 //!
@@ -210,6 +214,7 @@
 //! covered (nearest likewise). There is no blending with the destination.
 
 use crate::cutline::{Cutline, CutlineRule, BAND_DENSITY_THRESHOLD, SRC_DENSITY_THRESHOLD};
+use crate::mesh::QuadMesh;
 use crate::transform::{transform_scanline, SourceWrap, Transformer};
 
 /// Resampling algorithm.
@@ -305,9 +310,11 @@ pub enum KernelScaling {
 }
 
 /// How [`ResampleAlg::Average`] and [`ResampleAlg::Mode`] measure the
-/// overlap of a destination pixel with source pixels. Both measure area in source pixel space, which
-/// is planar area in the source CRS for an affine source; neither is area
-/// in the target CRS or on the ellipsoid.
+/// overlap of a destination pixel with source pixels. Both measure area in
+/// source pixel space, which is planar area in the source CRS for an
+/// affine source; the exact footprint measures a geolocation source in its
+/// world coordinates. Neither is area in the target CRS or on the
+/// ellipsoid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Footprint {
@@ -329,6 +336,18 @@ pub enum Footprint {
     /// longitude period ([`Transformer::source_wrap`]). The same overlaps,
     /// unrounded, are available as a table from
     /// [`crate::weights::exact_weights`].
+    ///
+    /// For a source whose transformer reports its cells
+    /// ([`Transformer::source_cells`]: a geolocation source, see
+    /// [`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)),
+    /// the outline's points go to source world coordinates instead, its
+    /// edges are straight there, and it is walked onto the source window's
+    /// cells under the equal-area map: each fraction is of the cell's world
+    /// area, and each source pixel is weighted by its fraction times its
+    /// world area. That is first-order conservative remapping in the
+    /// source's own coordinates. Without it a geolocation source is
+    /// measured in source pixel space, off by about 1% of a cell along the
+    /// outline on a curved grid.
     Exact { densify: usize },
 }
 
@@ -2768,7 +2787,8 @@ fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
     let mut row_res: Vec<Res<T>> = vec![Res::None; dst_ncol * nb];
     let mut exact = match opts.footprint {
         Footprint::Exact { densify } => {
-            Some(Lattice::new(transformer, dst_ncol, densify.max(1), (opts.dst_col_off, opts.dst_row_off)))
+            let src = (src_off.0 as usize, src_off.1 as usize, img.ncol, img.nrow);
+            Some(Lattice::new(transformer, dst_ncol, densify.max(1), (opts.dst_col_off, opts.dst_row_off), src))
         }
         Footprint::GdalBox => None,
     };
@@ -2886,8 +2906,13 @@ struct LatticeLine {
 }
 
 impl LatticeLine {
-    fn transform(&mut self, transformer: &impl Transformer) {
-        self.ok = transformer.transform(true, &mut self.x, &mut self.y);
+    /// To source pixels, or with `world` to source world coordinates
+    /// ([`SourceCells::dst_to_world`](crate::transform::SourceCells::dst_to_world)).
+    fn transform(&mut self, transformer: &impl Transformer, world: bool) {
+        self.ok = match transformer.source_cells() {
+            Some(cells) if world => cells.dst_to_world(&mut self.x, &mut self.y),
+            _ => transformer.transform(true, &mut self.x, &mut self.y),
+        };
     }
 }
 
@@ -2929,6 +2954,17 @@ pub(crate) struct Lattice {
     /// ([`Cover::Pieces`]): `(col, row, fraction)` in buffer pixels, by
     /// row then column, each cell once.
     pub(crate) pieces: Vec<(i64, i64, f64)>,
+    /// The source window's cells in world coordinates, when the
+    /// transformer has them ([`Transformer::source_cells`]): the lattice
+    /// is then in source world coordinates and each outline is walked onto
+    /// this mesh, whose cell `(row, col)` is buffer pixel `(row, col)`.
+    /// `Err` when the window's mesh could not be built: every outline
+    /// fails.
+    mesh: Option<Result<QuadMesh, String>>,
+    /// Scratch: the outline as world points, and its index-space ring.
+    world: Vec<[f64; 2]>,
+    ix: Vec<f64>,
+    iy: Vec<f64>,
 }
 
 /// What one destination pixel's exact footprint touches; see
@@ -2948,8 +2984,14 @@ pub(crate) enum Cover {
 
 impl Lattice {
     /// The lattice of a destination window `ncol` pixels wide at offset
-    /// `(dst_col_off, dst_row_off)`, ready for [`Lattice::row`]`(0)`.
-    pub(crate) fn new(transformer: &impl Transformer, ncol: usize, densify: usize, (dst_col_off, dst_row_off): (usize, usize)) -> Self {
+    /// `(dst_col_off, dst_row_off)`, against the source window `src`
+    /// (`col_off, row_off, ncol, nrow` in the full source), ready for
+    /// [`Lattice::row`]`(0)`.
+    pub(crate) fn new(
+        transformer: &impl Transformer, ncol: usize, densify: usize,
+        (dst_col_off, dst_row_off): (usize, usize), src: (usize, usize, usize, usize),
+    ) -> Self {
+        let mesh = transformer.source_cells().map(|cells| cells.mesh(src.0, src.1, src.2, src.3));
         let mut lat = Lattice {
             densify, ncol,
             xoff: dst_col_off as f64, yoff: dst_row_off as f64,
@@ -2957,10 +2999,37 @@ impl Lattice {
             level: LatticeLine::default(),
             rx: Vec::new(), ry: Vec::new(), win: controlledburn::CoverageWindow::default(),
             wrap: transformer.source_wrap(), sx: Vec::new(), pieces: Vec::new(),
+            mesh, world: Vec::new(), ix: Vec::new(), iy: Vec::new(),
         };
         lat.fill_row_line(0);
-        lat.bot.transform(transformer);
+        lat.bot.transform(transformer, lat.mesh.is_some());
         lat
+    }
+
+    /// Whether outlines are measured in source world coordinates, against
+    /// the source window's cells.
+    pub(crate) fn in_world(&self) -> bool {
+        self.mesh.is_some()
+    }
+
+    /// The area of buffer pixel `(col, row)`: its world area in world
+    /// coordinates, 1 in source pixel space.
+    #[inline]
+    pub(crate) fn cell_area(&self, col: i64, row: i64) -> f64 {
+        match &self.mesh {
+            Some(Ok(m)) => m.cell_area(row as usize, col as usize),
+            _ => 1.0,
+        }
+    }
+
+    /// The measure of the outline left by [`Lattice::cover`]: its planar
+    /// area in world coordinates, or `measure`'s in source pixel space.
+    pub(crate) fn outline_area(&self, measure: controlledburn::Measure) -> f64 {
+        if self.in_world() {
+            controlledburn::Measure::Planar.ring_area(&self.rx, &self.ry).abs()
+        } else {
+            measure.ring_area(&self.rx, &self.ry).abs()
+        }
     }
 
     /// Fill `bot` with the untransformed row line `row` of the destination.
@@ -2978,7 +3047,8 @@ impl Lattice {
     pub(crate) fn row(&mut self, transformer: &impl Transformer, row: usize) {
         std::mem::swap(&mut self.top, &mut self.bot);
         self.fill_row_line(row + 1);
-        self.bot.transform(transformer);
+        let world = self.in_world();
+        self.bot.transform(transformer, world);
         let d = self.densify;
         if d > 1 {
             // Each interior level is a scanline too (constant y), so it goes
@@ -2992,7 +3062,7 @@ impl Lattice {
                 self.level.y.clear();
                 self.level.x.extend((0..=self.ncol).map(|c| self.xoff + c as f64));
                 self.level.y.resize(self.ncol + 1, y);
-                self.level.transform(transformer);
+                self.level.transform(transformer, world);
                 self.vert.x.extend_from_slice(&self.level.x);
                 self.vert.y.extend_from_slice(&self.level.y);
                 self.vert.ok.extend_from_slice(&self.level.ok);
@@ -3037,6 +3107,7 @@ impl Lattice {
     /// it reaches the buffer: once, as [`Cover::Window`], or more than once,
     /// merged into [`Cover::Pieces`].
     pub(crate) fn cover(&mut self, c: usize, src_off: (f64, f64), (ncol, nrow): (i64, i64)) -> Cover {
+        if self.in_world() { return self.cover_world(c, (ncol, nrow)); }
         if !self.ring(c, src_off) { return Cover::Failed; }
         if let Some(wrap) = self.wrap {
             if !self.unwrap(wrap, src_off.1) { return Cover::Failed; }
@@ -3115,6 +3186,43 @@ impl Lattice {
         }
     }
 
+    /// [`Lattice::cover`] against the source window's cells: the outline
+    /// in world coordinates (left in `rx`, `ry`), walked onto the mesh
+    /// under the equal-area map ([`QuadMesh::ring_to_index`], which
+    /// replaces any part outside the window by an arc of its boundary),
+    /// then covered in the mesh's index space, which is buffer pixels.
+    fn cover_world(&mut self, c: usize, (ncol, nrow): (i64, i64)) -> Cover {
+        if !matches!(self.mesh, Some(Ok(_))) { return Cover::Failed; }
+        if !self.ring(c, (0.0, 0.0)) { return Cover::Failed; }
+        if self.rx.iter().chain(&self.ry).any(|v| !v.is_finite()) { return Cover::Failed; }
+        self.world.clear();
+        self.world.extend(self.rx.iter().zip(&self.ry).map(|(&x, &y)| [x, y]));
+        let Some(Ok(mesh)) = &self.mesh else { return Cover::Failed };
+        debug_assert_eq!((mesh.ncol() as i64, mesh.nrow() as i64), (ncol, nrow));
+        let ring = match mesh.ring_to_index(&self.world) {
+            Ok(r) => r,
+            Err(_) => return Cover::Failed,
+        };
+        if ring.len() < 3 { return Cover::Outside; }
+        self.ix.clear();
+        self.iy.clear();
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for p in &ring {
+            self.ix.push(p[0]);
+            self.iy.push(p[1]);
+            minx = minx.min(p[0]); maxx = maxx.max(p[0]);
+            miny = miny.min(p[1]); maxy = maxy.max(p[1]);
+        }
+        let (c0, c1) = ((minx.floor() as i64).max(0), (maxx.ceil() as i64).min(ncol));
+        let (r0, r1) = ((miny.floor() as i64).max(0), (maxy.ceil() as i64).min(nrow));
+        if c0 >= c1 || r0 >= r1 { return Cover::Outside; }
+        let w = (c1 - c0) as usize;
+        self.win.reset(c0, r0, w, (r1 - r0) as usize);
+        self.win.add_ring(&self.ix, &self.iy, 1.0);
+        self.win.resolve();
+        Cover::Window { c0, r0, w }
+    }
+
     /// Unwrap the outline in `rx` across the source's seam, so that no
     /// step moves by more than half a period. An outline around a pole
     /// then comes back one period from where it started: close it along
@@ -3173,11 +3281,12 @@ fn area_row_exact<T: Sample, R: AreaReducer<T>>(
             Cover::Window { c0, r0, w } => {
                 let cov = lat.win.coverage();
                 let at = |k: usize| ((r0 + (k / w) as i64) * ncol + c0 + (k % w) as i64) as usize;
+                let area = |k: usize| lat.cell_area(c0 + (k % w) as i64, r0 + (k / w) as i64);
                 for (k, &f) in cov.iter().enumerate() {
-                    if f >= 1.0 - TOL { img.reduce(red, at(k), 1.0, band_ok); }
+                    if f >= 1.0 - TOL { img.reduce(red, at(k), area(k), band_ok); }
                 }
                 for (k, &f) in cov.iter().enumerate() {
-                    if f > TOL && f < 1.0 - TOL { img.reduce(red, at(k), f as f32 as f64, band_ok); }
+                    if f > TOL && f < 1.0 - TOL { img.reduce(red, at(k), f as f32 as f64 * area(k), band_ok); }
                 }
             }
             Cover::Pieces => {

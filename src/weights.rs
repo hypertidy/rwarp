@@ -14,14 +14,21 @@
 //! - **Cells.** Destination cells have edges straight in destination pixel
 //!   space, each split into `densify` segments whose end points go through
 //!   the transformer exactly. Source cells are unit squares in source pixel
-//!   space.
+//!   space, joined to the end points by straight lines there. For a source
+//!   whose transformer reports its cells ([`Transformer::source_cells`]: a
+//!   geolocation source) the end points go to source world coordinates
+//!   instead, are joined by straight lines there, and source cells are the
+//!   quadrilaterals through their corners' world positions.
 //! - **Measure.** By default areas are planar in source pixel space: for a
 //!   source whose pixel-to-world map is affine (any regular grid in its own
 //!   CRS) that is world area in the source CRS, up to one constant. With
 //!   [`WeightOptions::with_measure`] and [`lonlat_measure`], a regular
 //!   longitude/latitude source measures area on the sphere instead
 //!   (controlledburn's [`Measure::CosLatitude`]): exact for the cells as
-//!   defined here, whose edges are straight in source pixel space.
+//!   defined here, whose edges are straight in source pixel space. Over
+//!   source world cells the measure is planar area in the source's world
+//!   coordinates (square degrees for longitude and latitude arrays), and
+//!   [`WeightOptions::measure`] must be [`Measure::Planar`].
 //! - **`frac`** is the overlap's measure over the source cell's (1 for the
 //!   planar measure), unrounded `f64`. Because neighbouring destination outlines are built
 //!   from the same transformed points, the destination cells tile source
@@ -30,11 +37,14 @@
 //!   covered fraction where its edge cuts it, up to `f64` rounding (about
 //!   1e-15; see `tests/weights.rs`).
 //! - **`dst_area`** is the measure of each destination cell's outline
-//!   (controlledburn's [`Measure::ring_area`]), whether or not
+//!   (controlledburn's [`Measure::ring_area`], or its world area over
+//!   source world cells), whether or not
 //!   the outline lies inside the source window. `NaN` where a point of
 //!   the outline failed to transform. A destination cell wholly inside the
 //!   source has `dst_area` equal to the sum of its `frac` times the source
-//!   cell's measure ([`Weights::src_area`], 1 for the planar measure).
+//!   cell's measure ([`Weights::src_area`]: 1 for the planar measure, the
+//!   cell's world area over source world cells, in
+//!   [`Weights::src_cell_area`]).
 //!
 //! # Normalisation
 //!
@@ -61,8 +71,8 @@
 //! src_ncol_full + src_col + 1` ([`Weights::esmf_row_col`]), and `S` is
 //! [`Weights::normalised`]. ESMF's `area_b` corresponds to `dst_area`
 //! (in source pixels, or under the spherical measure source pixels at the
-//! equator, not steradians) and `frac_b` to [`Weights::dst_covered`] over
-//! `dst_area`.
+//! equator, not steradians; in world units over source world cells) and
+//! `frac_b` to [`Weights::dst_covered`] over `dst_area`.
 //!
 //! # Relation to `warp()`
 //!
@@ -95,7 +105,10 @@
 //! [`GenImgProjTransformer`](crate::transform::GenImgProjTransformer)
 //! does once it has the source size). Without it, a destination cell whose
 //! outline crosses the source's wrap column folds across the whole source
-//! width, and its weights are wrong. The spherical measure takes cell edges straight in
+//! width, and its weights are wrong. Over source world cells this is not
+//! yet done: geolocation arrays that cross the antimeridian fall back to
+//! source pixel space ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)).
+//! The spherical measure takes cell edges straight in
 //! source pixel space (rhumb lines on a longitude/latitude source), not
 //! great circles as ESMF does; see `design/conservative.md` and
 //! `tests/esmf.rs` for the size of the difference.
@@ -284,6 +297,8 @@ pub struct CellWeights<'a> {
     pub src_row: &'a [u32],
     pub src_col: &'a [u32],
     pub frac: &'a [f64],
+    /// The measure of each entry's source cell (as [`Weights::src_area`]).
+    pub src_area: &'a [f64],
 }
 
 /// Overlap of each destination cell with each source cell, from the exact
@@ -311,6 +326,11 @@ pub struct Weights {
     pub dst_size: [usize; 2],
     /// The measure over the full source grid ([`WeightOptions::measure`]).
     pub measure: Measure,
+    /// For a source with world cells ([`Transformer::source_cells`]):
+    /// each entry's source cell area in world coordinates. Empty
+    /// otherwise, when cell measures follow from `measure`.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub src_cell_area: Vec<f64>,
 }
 
 /// Options for [`Weights::apply`]: nodata and validity, as in
@@ -389,9 +409,17 @@ pub fn exact_weights_with(
     to_u32(opts.dst_col_off + dst_ncol, "destination column");
     to_u32(opts.dst_row_off + dst_nrow, "destination row");
     let src_off = (src.col_off as f64, src.row_off as f64);
-    let (mut sr, mut sc, mut fr) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sr, mut sc, mut fr, mut sa) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     if dst_ncol == 0 || dst_nrow == 0 { return; }
-    let mut lat = Lattice::new(transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off));
+    let mut lat = Lattice::new(
+        transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off),
+        (src.col_off, src.row_off, src.ncol, src.nrow),
+    );
+    assert!(
+        !lat.in_world() || opts.measure == Measure::Planar,
+        "a source with world cells (Transformer::source_cells) is measured in its world coordinates: \
+         WeightOptions::measure must be Measure::Planar"
+    );
     // The window works in source window pixels.
     let measure = shift_rows(opts.measure, src.row_off as f64);
     lat.win.set_measure(measure);
@@ -402,27 +430,31 @@ pub fn exact_weights_with(
             sr.clear();
             sc.clear();
             fr.clear();
+            sa.clear();
             let cover = lat.cover(c, src_off, (ncol, nrow));
             let dst_area = match cover {
                 Cover::Failed => f64::NAN,
-                _ => measure.ring_area(&lat.rx, &lat.ry).abs(),
+                _ => lat.outline_area(measure),
+            };
+            // buffer pixel (pc, pr): its full-grid indices and measure
+            let mut push = |pc: i64, pr: i64, v: f64| {
+                sr.push((src.row_off as i64 + pr) as u32);
+                sc.push((src.col_off as i64 + pc) as u32);
+                fr.push(v);
+                sa.push(if lat.in_world() { lat.cell_area(pc, pr) } else { opts.measure.cell_area(src.row_off as i64 + pr) });
             };
             match cover {
                 Cover::Window { c0, r0, w } => {
                     for (k, &v) in lat.win.coverage().iter().enumerate() {
                         if let Some(v) = opts.weight(v) {
-                            sr.push((src.row_off as i64 + r0 + (k / w) as i64) as u32);
-                            sc.push((src.col_off as i64 + c0 + (k % w) as i64) as u32);
-                            fr.push(v);
+                            push(c0 + (k % w) as i64, r0 + (k / w) as i64, v);
                         }
                     }
                 }
                 Cover::Pieces => {
                     for &(pc, pr, v) in &lat.pieces {
                         if let Some(v) = opts.weight(v) {
-                            sr.push((src.row_off as i64 + pr) as u32);
-                            sc.push((src.col_off as i64 + pc) as u32);
-                            fr.push(v);
+                            push(pc, pr, v);
                         }
                     }
                 }
@@ -430,7 +462,7 @@ pub fn exact_weights_with(
             }
             f(CellWeights {
                 dst_row, dst_col: (opts.dst_col_off + c) as u32, dst_area,
-                src_row: &sr, src_col: &sc, frac: &fr,
+                src_row: &sr, src_col: &sc, frac: &fr, src_area: &sa,
             });
         }
     }
@@ -457,8 +489,10 @@ pub fn exact_weights(
         measure: opts.measure,
         ..Weights::default()
     };
+    let world = transformer.source_cells().is_some();
     exact_weights_with(transformer, src, dst_ncol, dst_nrow, opts, |cell| {
         let n = cell.frac.len();
+        if world { w.src_cell_area.extend_from_slice(cell.src_area); }
         w.dst_row.extend(std::iter::repeat_n(cell.dst_row, n));
         w.dst_col.extend(std::iter::repeat_n(cell.dst_col, n));
         w.src_row.extend_from_slice(cell.src_row);
@@ -543,10 +577,15 @@ impl Weights {
         order
     }
 
-    /// The measure of entry `k`'s source cell: 1 for the planar measure.
+    /// The measure of entry `k`'s source cell: 1 for the planar measure,
+    /// its world area for a source with world cells
+    /// ([`Weights::src_cell_area`]).
     #[inline]
     pub fn src_area(&self, k: usize) -> f64 {
-        self.measure.cell_area(self.src_row[k] as i64)
+        match self.src_cell_area.get(k) {
+            Some(&a) => a,
+            None => self.measure.cell_area(self.src_row[k] as i64),
+        }
     }
 
     /// The measure of entry `k`'s overlap, `frac * src_area`.

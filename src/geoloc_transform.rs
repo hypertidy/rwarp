@@ -93,7 +93,11 @@
 
 mod backmap;
 
+use std::sync::OnceLock;
+
 use crate::crs::{crs_pair, CrsTransform};
+use crate::mesh::{validate_corners, CellMap, QuadMesh};
+use crate::transform::SourceCells;
 use crate::Transformer;
 use vaster::inv_geotransform;
 
@@ -394,6 +398,8 @@ pub struct GeolocArrays {
     nrow: usize,
     opts: GeolocOptions,
     index: InverseIndex,
+    /// [`GeolocArrays::world_cells`], computed on first use.
+    cells: OnceLock<Result<(), String>>,
 }
 
 impl GeolocArrays {
@@ -428,6 +434,7 @@ impl GeolocArrays {
             nrow,
             opts,
             index: InverseIndex::Quads(QuadIndex::new(Vec::new())),
+            cells: OnceLock::new(),
         };
         g.index = g.build_index()?;
         Ok(g)
@@ -508,6 +515,13 @@ impl GeolocArrays {
     /// Follows `GDALGeoLoc::PixelLineToXY` (double overload). `None` where a
     /// needed sample is missing.
     pub fn pixel_line_to_xy(&self, gpix: f64, gline: f64) -> Option<(f64, f64)> {
+        self.pixel_line_to_xy_raw(gpix, gline).map(|(gx, gy)| (self.unshift_geo_x(gx), gy))
+    }
+
+    /// [`GeolocArrays::pixel_line_to_xy`] before longitudes are moved back
+    /// into -180..180: continuous across a square that crosses the
+    /// antimeridian, and beyond the arrays' edge.
+    fn pixel_line_to_xy_raw(&self, gpix: f64, gline: f64) -> Option<(f64, f64)> {
         let nx = self.ncol as i64;
         let ny = self.nrow as i64;
         // C's static_cast<int> of a clamped non-negative double truncates.
@@ -533,7 +547,7 @@ impl GeolocArrays {
                         + fy * (x01a + fx * (x11a - x01a));
                     let gy = (1.0 - fy) * (y00 + fx * (y10 - y00))
                         + fy * (y01 + fx * (y11 - y01));
-                    return Some((self.unshift_geo_x(gx), gy));
+                    return Some((gx, gy));
                 }
             }
 
@@ -555,15 +569,15 @@ impl GeolocArrays {
                 let fx = gpix - ix as f64;
                 let gx = x00 + fx * (self.shift_geo_x(x00, x10) - x00);
                 let gy = y00 + fx * (y10 - y00);
-                return Some((self.unshift_geo_x(gx), gy));
+                return Some((gx, gy));
             } else if iy + 1 < ny && !self.is_missing(self.get(ix as usize, iy as usize + 1).0) {
                 let (x01, y01) = self.get(ix as usize, iy as usize + 1);
                 let fy = gline - iy as f64;
                 let gx = x00 + fy * (self.shift_geo_x(x00, x01) - x00);
                 let gy = y00 + fy * (y01 - y00);
-                return Some((self.unshift_geo_x(gx), gy));
+                return Some((gx, gy));
             } else {
-                return Some((self.unshift_geo_x(x00), y00));
+                return Some((x00, y00));
             }
         }
         // Both attempts used: GDAL leaves the output untouched and still
@@ -681,10 +695,113 @@ impl GeolocArrays {
     }
 }
 
+impl GeolocArrays {
+    /// Whether the exact footprint
+    /// ([`Footprint::Exact`](crate::warp::Footprint::Exact),
+    /// [`exact_weights`](crate::weights::exact_weights)) measures a source
+    /// with these arrays in world coordinates (`Ok`), or falls back to
+    /// source pixel space (`Err`, with the reason). Decided once, from the
+    /// whole arrays, so every chunk of a warp uses the same measure.
+    ///
+    /// In world coordinates each raster pixel is the straight-edged
+    /// quadrilateral through the positions of its four corners
+    /// ([`GeolocArrays::pixel_to_geo`] at whole pixel/line), and weights
+    /// are fractions of its area there: planar area in the arrays'
+    /// coordinates (in square degrees for longitude and latitude). For
+    /// [`GeolocConvention::TopLeftCorner`] with whole-number steps and
+    /// offsets this is exactly GDAL's bilinear model, whose lines of
+    /// constant pixel or line are straight within a square of samples.
+    /// For [`GeolocConvention::PixelCenter`] the corners are the means of
+    /// four centres (as [`QuadMesh::from_centres`]); GDAL's model bends
+    /// each pixel side where it crosses a line of samples.
+    ///
+    /// The fallback measures what the exact footprint measured before:
+    /// the outline taken through [`GeolocArrays::geo_to_pixel`] and
+    /// joined straight in source pixel space, off by about 1% of a cell
+    /// along the outline on a curved grid. It is used when the arrays
+    ///
+    /// - have a missing sample (the mesh would have a hole),
+    /// - cross the antimeridian with [`GeolocOptions::lon_wrap`], or
+    /// - have a square of samples that is a bow-tie, or squares of both
+    ///   orientations (a fold, as where a scanning swath's scans overlap).
+    pub fn world_cells(&self) -> Result<(), &str> {
+        self.cells.get_or_init(|| self.check_cells()).as_ref().map(|_| ()).map_err(|e| e.as_str())
+    }
+
+    fn check_cells(&self) -> Result<(), String> {
+        let (nx, ny) = (self.ncol, self.nrow);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let (x, y) = self.get(ix, iy);
+                if self.is_missing(x) || !x.is_finite() || !y.is_finite() {
+                    return Err(format!("sample (row {iy}, col {ix}) is missing: the cells would have a hole"));
+                }
+            }
+        }
+        if self.opts.lon_wrap {
+            let jump = |a: (usize, usize), b: (usize, usize)| (self.get(a.0, a.1).0 - self.get(b.0, b.1).0).abs() > 180.0;
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    if (ix + 1 < nx && jump((ix, iy), (ix + 1, iy))) || (iy + 1 < ny && jump((ix, iy), (ix, iy + 1))) {
+                        return Err(format!("the arrays cross the antimeridian at sample (row {iy}, col {ix})"));
+                    }
+                }
+            }
+        }
+        validate_corners(nx - 1, ny - 1, &self.x, &self.y).map(|_| ())
+    }
+
+    /// Raster pixel/line to fractional position in the arrays.
+    fn raster_to_array(&self, pixel: f64, line: f64) -> (f64, f64) {
+        let off = self.convention_offset();
+        (
+            (pixel - self.opts.pixel_offset) / self.opts.pixel_step - off,
+            (line - self.opts.line_offset) / self.opts.line_step - off,
+        )
+    }
+
+    /// The cells of a raster window in world coordinates, as
+    /// [`SourceCells::mesh`]: corner `(j, i)` at the position of raster
+    /// pixel corner `(col_off + i, row_off + j)`. Fails where
+    /// [`GeolocArrays::world_cells`] does, or when a cell of the window
+    /// (one beyond the arrays, extrapolated) is a bow-tie or folds.
+    pub fn window_mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String> {
+        self.world_cells().map_err(str::to_string)?;
+        let n = (ncol + 1) * (nrow + 1);
+        let (mut x, mut y) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for j in 0..=nrow {
+            for i in 0..=ncol {
+                let (gp, gl) = self.raster_to_array((col_off + i) as f64, (row_off + j) as f64);
+                let (gx, gy) = self
+                    .pixel_line_to_xy_raw(gp, gl)
+                    .ok_or_else(|| format!("raster corner ({}, {}) has no position", col_off + i, row_off + j))?;
+                x.push(gx);
+                y.push(gy);
+            }
+        }
+        QuadMesh::from_corners(ncol, nrow, x, y, CellMap::EqualArea)
+    }
+}
+
+/// Destination coordinates are already world coordinates.
+impl SourceCells for GeolocArrays {
+    fn dst_to_world(&self, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+        x.iter().zip(y.iter()).map(|(a, b)| a.is_finite() && b.is_finite()).collect()
+    }
+
+    fn mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String> {
+        self.window_mesh(col_off, row_off, ncol, nrow)
+    }
+}
+
 /// On its own, a [`GeolocArrays`] is a transformer between raster
 /// pixel/line ("source") and the geolocation arrays' coordinates
 /// ("destination"), as GDAL's geolocation transformer is.
 impl Transformer for GeolocArrays {
+    fn source_cells(&self) -> Option<&dyn SourceCells> {
+        self.world_cells().is_ok().then_some(self as &dyn SourceCells)
+    }
+
     fn transform(&self, dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
         let mut ok = vec![false; x.len()];
         for k in 0..x.len() {
@@ -838,7 +955,46 @@ impl GenImgGeolocTransformer {
     }
 }
 
+/// For a geolocation source: the destination side and the CRS step, without
+/// the source's inverse.
+impl SourceCells for GenImgGeolocTransformer {
+    fn dst_to_world(&self, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+        let mut ok = vec![false; x.len()];
+        for k in 0..x.len() {
+            match self.dst.to_geo(x[k], y[k]).and_then(|(gx, gy)| self.crs_dst_to_src.convert(gx, gy)) {
+                Some((a, b)) if a.is_finite() && b.is_finite() => {
+                    x[k] = a;
+                    y[k] = b;
+                    ok[k] = true;
+                }
+                _ => {
+                    x[k] = f64::INFINITY;
+                    y[k] = f64::INFINITY;
+                }
+            }
+        }
+        ok
+    }
+
+    fn mesh(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<QuadMesh, String> {
+        match &self.src {
+            PixelGeo::Geoloc(g) => g.window_mesh(col_off, row_off, ncol, nrow),
+            PixelGeo::Affine { .. } => Err("the source is affine: its pixels are unit squares".to_string()),
+        }
+    }
+}
+
+/// With a geolocation source whose
+/// [`GeolocArrays::world_cells`] is `Ok`, the exact footprint measures
+/// source cells in world coordinates ([`Transformer::source_cells`]).
 impl Transformer for GenImgGeolocTransformer {
+    fn source_cells(&self) -> Option<&dyn SourceCells> {
+        match &self.src {
+            PixelGeo::Geoloc(g) if g.world_cells().is_ok() => Some(self),
+            _ => None,
+        }
+    }
+
     fn transform(&self, dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
         let (from, to, crs) = if dst_to_src {
             (&self.dst, &self.src, &self.crs_dst_to_src)

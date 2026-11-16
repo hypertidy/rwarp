@@ -274,7 +274,9 @@ for coverage, none affecting GDAL parity:
 - **Ownership.** A point on a shared side belongs to one cell, by side
   identity, not by tolerance.
 - **Boundary index.** The mesh's outer sides, for "where does this
-  segment first enter".
+  segment first enter". Built with #36: a bucket grid over the outer
+  sides' boxes, queried in the sides' scan order, so the walk's output is
+  unchanged.
 - **Compact and lazy.** CSR buckets (offsets plus one `u32` array), built
   on first use.
 - **Triangles.** For `EqualArea`, the containing triangle and its
@@ -302,8 +304,10 @@ impl QuadMesh {
 }
 ```
 
-`GeolocArrays` would hold a `QuadMesh` in place of `QuadIndex`, with
-`GeolocOptions` gaining `cell_map` (default `Bilinear`).
+`GeolocArrays` keeps its `QuadIndex` for the point inverse. Area methods
+build a `QuadMesh` of the source window when they need one
+(`GeolocArrays::window_mesh`, section 6); under N1 coverage always uses
+the equal-area map, so `GeolocOptions` needs no `cell_map`.
 
 ## 5. Where bigcurve plugs in
 
@@ -349,16 +353,57 @@ transformed lattice and measures its overlap with source pixels with
 |---|---|---|
 | affine source | small rings onto a regular lattice | yes, to densify |
 | geoloc destination | straight quads onto a regular lattice | yes, to densify |
-| geoloc source | small rings onto a curvilinear grid | no: rings reach source index space by inverse bilinear, the index measure |
-| both geoloc | quads onto a curvilinear grid | no, as above |
+| geoloc source | small rings onto a curvilinear grid | yes, to densify (#36), when the arrays' cells are whole |
+| both geoloc | quads onto a curvilinear grid | yes, as above |
 
-The fix is the same front end: with `cell_map: EqualArea` on the source
-`GeolocArrays`, the inverse used for area methods becomes the
-equal-area map, outline vertices are inserted at source cell sides and
-spokes, and `CoverageWindow` then returns world-area fractions in the
-source CRS. That makes the exact footprint first-order conservative
-remapping on curvilinear sources, as its docs already claim for affine
-ones. Point kernels keep `Bilinear` for GDAL parity.
+The fix is the same front end. Built (stage 3, #36, decided 2026-11-16:
+on by default, fall back where the cells are not whole):
+
+- **How the warp gets the cells.** `Transformer::source_cells()` returns
+  a `&dyn SourceCells`, as `source_wrap` reports a wrap: `dst_to_world`
+  (the pipeline without the source's world-to-pixel step) and `mesh` (a
+  `QuadMesh` of a source window, mesh cell = window pixel).
+  `GenImgGeolocTransformer` with a geolocation source and `GeolocArrays`
+  on its own report it; `ApproxTransformer` passes it through and runs
+  `dst_to_world` exactly (it has no inverse lookup, so it costs about
+  the same; approximating it is a possible follow-up).
+- **The cells.** Corners are `pixel_to_geo` at whole raster pixel/line,
+  computed point by point (so neighbouring windows share their edges
+  exactly), before longitudes are moved back into -180..180. This takes
+  both conventions and any `PIXEL_STEP`/`LINE_STEP` the same way. For
+  `TopLeftCorner` at whole-number steps and offsets it is GDAL's bilinear
+  model exactly, since lines of constant pixel or line are straight
+  within a square of samples. For `PixelCenter` the corners are the means
+  of four centres (`from_centres`' rule), and GDAL's model bends each
+  pixel side where it crosses a line of samples (a second-order
+  difference; following it would take a mesh at twice the resolution).
+- **The lattice.** `Lattice::new` takes the source window and builds its
+  mesh once per warp call or chunk (about 70 bytes a source pixel). Rows
+  go through `dst_to_world`, each outline is walked with
+  `ring_to_index` (whose boundary arcs do the clamping `CoverageWindow`
+  does in source pixel space) and covered in index space.
+- **Weights.** Source cells differ in area, so `warp()`'s area methods
+  weight by fraction times cell area; `exact_weights` gives `dst_area`
+  as the outline's world area and per-entry `Weights::src_cell_area`. A
+  non-planar `WeightOptions::measure` is refused.
+- **Fallback.** `GeolocArrays::world_cells()` decides once, from the
+  whole arrays: no missing sample, no fold (both orientations), no
+  bow-tie, no antimeridian crossing with `lon_wrap`. Otherwise the exact
+  footprint measures in source pixel space as before, so chunks never mix
+  measures.
+
+The measure is planar in the arrays' coordinates: square degrees for
+longitude and latitude, true area for arrays in an equal-area CRS.
+Tested in `tests/geoloc_exact.rs`: each weight against an independent
+clip, generator 8 (to 2e-13; the source-pixel measure fails it at 3e-3
+to 6e-3), tiling, affine as geoloc, steps, conventions, windows,
+fallbacks, `warp()` against `Weights::apply` bit for bit, and a curved
+longitude/latitude grid to polar stereographic.
+
+Next (stage 3b, its own issue): longitude/latitude arrays across the
+antimeridian, with corners unwrapped by continuity and the outline walked
+at offsets -360, 0 and +360, merged as in `Cover::Pieces`. Swaths over a
+pole stay on the fallback.
 
 What is shared between the two uses is all in rwarp: `QuadMesh`, the
 walk, the equal-area map, the periodic and fold handling. What each
@@ -424,7 +469,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 |---|---|---|
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
-| 3 | exact footprint: `cell_map: EqualArea` for geoloc sources; antimeridian unwrap and copies, ring-fold closure | generator 8; the antimeridian cases from #11's comparison |
+| 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b) | generator 8; the antimeridian cases from #11's comparison |
 | 4 | `PeriodicCols`, `Tripolar` for the polygon front end | generators 5 and 6 |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping folds, swath gaps (mesh holes), approx (cell-centre) mode | |

@@ -309,6 +309,13 @@ impl<T: Transformer> Transformer for ApproxTransformer<T> {
         self.inner.source_wrap()
     }
 
+    /// The inner transformer's, unapproximated: the exact footprint maps
+    /// its outlines to source world coordinates with the inner
+    /// transformer's [`SourceCells::dst_to_world`](crate::transform::SourceCells::dst_to_world).
+    fn source_cells(&self) -> Option<&dyn crate::transform::SourceCells> {
+        self.inner.source_cells()
+    }
+
     fn transform(
         &self,
         dst_to_src: bool,
