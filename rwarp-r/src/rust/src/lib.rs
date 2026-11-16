@@ -731,13 +731,7 @@ fn warp_exec_rs(
     }
     if nbands < 1 { throw_r_error("nbands must be at least 1"); }
     let nb = nbands as usize;
-    let t = if src_dim.len() == 2 {
-        let full = [(dst_off[0] + dst_size[0]) as usize, (dst_off[1] + dst_size[1]) as usize];
-        ApproxTransformer::new(transformer_gdal(
-            src_crs, src_gt, [src_dim[0] as usize, src_dim[1] as usize], dst_crs, dst_gt, full), max_error)
-    } else {
-        ApproxTransformer::new(transformer(src_crs, src_gt, dst_crs, dst_gt), max_error)
-    };
+    let t = window_transformer(src_crs, src_gt, src_dim, dst_crs, dst_gt, dst_off, dst_size, max_error);
     let a = ExecArgs {
         chunks, scales, read_fn: &read_fn, t: &t,
         dst_off: [dst_off[0] as usize, dst_off[1] as usize],
@@ -812,6 +806,112 @@ fn warp_exec_rs(
 }
 
 // ---------------------------------------------------------------------------
+// One pre-fetched buffer: warp_buffer()
+// ---------------------------------------------------------------------------
+
+/// The transformer for a destination window `dst_off`, `dst_size` of the
+/// grid `dst_gt`: gdalwarp's (source longitudes wrapped at CENTER_LONG)
+/// when the full source size is known, plain otherwise.
+fn window_transformer(
+    src_crs: &str, src_gt: &[f64], src_dim: &[i32],
+    dst_crs: &str, dst_gt: &[f64], dst_off: &[i32], dst_size: &[i32],
+    max_error: f64,
+) -> ApproxTransformer<GenImgProjTransformer> {
+    if src_dim.len() == 2 {
+        let full = [(dst_off[0] + dst_size[0]) as usize, (dst_off[1] + dst_size[1]) as usize];
+        ApproxTransformer::new(transformer_gdal(
+            src_crs, src_gt, [src_dim[0] as usize, src_dim[1] as usize], dst_crs, dst_gt, full), max_error)
+    } else {
+        ApproxTransformer::new(transformer(src_crs, src_gt, dst_crs, dst_gt), max_error)
+    }
+}
+
+/// Warp one buffer, band-sequential as `read_fn` returns it, with `rwarp::warp::warp`.
+fn buffer_typed<T: RSample>(
+    src: &Robj, size: [usize; 2], off: [usize; 2], nb: usize,
+    t: &ApproxTransformer<GenImgProjTransformer>, dst_size: [usize; 2], o: &WarpOptions,
+) -> Vec<T> {
+    let v = T::from_robj(src).unwrap();
+    let npix = size[0] * size[1];
+    if v.len() != npix * nb {
+        throw_r_error(&format!(
+            "src has {} values for a {}x{} window of {} band(s); expected {}",
+            v.len(), size[0], size[1], nb, npix * nb));
+    }
+    let data = interleave(&v, npix, nb);
+    let buf = SourceBuffer { data: &data, ncol: size[0], nrow: size[1], nbands: nb, col_off: off[0], row_off: off[1] };
+    rwarp::warp::warp(t, &buf, dst_size[0], dst_size[1], o)
+}
+
+/// Internal: the warp behind the R function warp_buffer().
+/// @noRd
+#[extendr]
+fn warp_buffer_rs(
+    src: Robj, src_size: &[i32], src_off: &[i32], nbands: i32,
+    src_crs: &str, src_gt: &[f64], src_dim: &[i32],
+    dst_crs: &str, dst_gt: &[f64],
+    dst_off: &[i32], dst_size: &[i32],
+    max_error: f64,
+    resample: &str, scaling: &str, scale: &[f64],
+    mode_ties_: &str,
+    src_nodata: &[f64], dst_nodata: &[f64],
+    band_nodata_: &str,
+    mask_band: i32,
+    nara: bool,
+) -> Robj {
+    let two = |v: &[i32], what: &str| -> [usize; 2] {
+        if v.len() != 2 || v.iter().any(|&x| x < 0) {
+            throw_r_error(&format!("{} must be two non-negative integers", what));
+        }
+        [v[0] as usize, v[1] as usize]
+    };
+    let size = two(src_size, "src_size");
+    let off = two(src_off, "src_off");
+    let dsize = two(dst_size, "dst_size");
+    let doff = two(dst_off, "dst_off");
+    if nbands < 1 { throw_r_error("nbands must be at least 1"); }
+    let nb = nbands as usize;
+    let t = window_transformer(src_crs, src_gt, src_dim, dst_crs, dst_gt, dst_off, dst_size, max_error);
+
+    let mut o = WarpOptions::default();
+    o.alg = resample_alg(resample);
+    o.scaling = kernel_scaling(scaling, scale);
+    o.mode_ties = mode_ties(mode_ties_);
+    o.band_nodata = band_nodata(band_nodata_);
+    o.dst_col_off = doff[0];
+    o.dst_row_off = doff[1];
+    if mask_band > 0 {
+        if mask_band as usize > nb { throw_r_error("mask_band is past the last band"); }
+        o.mask_band = Some(mask_band as usize - 1);
+    }
+    let [w, h] = dsize;
+    macro_rules! run {
+        ($t:ty) => {{
+            o.src_nodata = src_nodata_opt::<$t>(src_nodata);
+            o.dst_nodata = dst_nodata_opt::<$t>(dst_nodata);
+            buffer_typed::<$t>(&src, size, off, nb, &t, dsize, &o)
+        }};
+    }
+    match src.rtype() {
+        Rtype::Integers => {
+            if nara { throw_r_error("output = \"nara\" needs raw (byte) data in src"); }
+            let v = run!(i32);
+            to_r_array(v, w, h, nb)
+        }
+        Rtype::Doubles => {
+            if nara { throw_r_error("output = \"nara\" needs raw (byte) data in src"); }
+            let v = run!(f64);
+            to_r_array(v, w, h, nb)
+        }
+        Rtype::Raw => {
+            let v = run!(u8);
+            if nara { to_nara(&v, w, h, nb, &nodata_of::<u8>(dst_nodata, true)) } else { to_r_array(v, w, h, nb) }
+        }
+        _ => throw_r_error("src must be an integer, double or raw vector, matrix or array"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // extendr boilerplate
 // ---------------------------------------------------------------------------
 
@@ -822,4 +922,5 @@ extendr_module! {
     fn warp_plan;
     fn warp_resample;
     fn warp_exec_rs;
+    fn warp_buffer_rs;
 }

@@ -20,7 +20,8 @@ remotes::install_github("hypertidy/rwarp", subdir = "rwarp-r")
 |---|---|
 | `warp_plan()` | Compute source windows for a destination grid (pure geometry, no I/O) |
 | `warp_exec()` | Execute a plan with a user-supplied read function |
-| `warp_resample()` | Warp a pre-fetched pixel buffer directly |
+| `warp_buffer()` | Warp one source window you already have, as `warp_exec()` does each chunk |
+| `warp_resample()` | Deprecated: use `warp_buffer()` |
 | `pixel_transform()` | Map destination pixels to fractional source pixel coordinates |
 | `crs_describe()` | Describe a CRS string in all PROJ output formats |
 
@@ -76,7 +77,7 @@ result <- warp_exec(
 ds$close()
 
 ## result is an integer matrix, dst_dim[2] rows by dst_dim[1] columns
-## (warp_resample() instead returns a row-major vector)
+## (warp_buffer() returns the same shape)
 ximage::ximage(result, dst_ext)
 ```
 

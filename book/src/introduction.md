@@ -117,7 +117,7 @@ where rwarp deliberately differs. Feedback and testing are very welcome at
 An R package lives in the [`rwarp-r/`](https://github.com/hypertidy/rwarp/tree/main/rwarp-r)
 subdirectory of this repository. It wraps the same planning and resampling
 pipeline via [extendr](https://extendr.github.io/), exposing `warp_plan()`,
-`warp_exec()`, `warp_resample()`, `pixel_transform()` and `crs_describe()`.
+`warp_exec()`, `warp_buffer()`, `pixel_transform()` and `crs_describe()`.
 See the [R package chapter](r-package.md) or install directly:
 
 ```r

@@ -100,6 +100,15 @@ pixel_transform <- function(src_crs, src_gt, dst_crs, dst_gt, dst_dim) {
 #'   `fill_ratio`, `scale_x`, `scale_y` (the kernel scale for the chunk).
 #'   Attributes `src_dim`, `dst_off`, `dst_size`, `resample` and `scaling` record what
 #'   it was planned for.
+#'
+#'   `fill_ratio` is GDAL's: the area of the source window (whole pixels,
+#'   clamped to the source) over the area of the unrounded extent the
+#'   destination needs, both padded for the kernel. A low value means much of
+#'   that extent lies outside the source. It can be a little above 1, because
+#'   the window is rounded out to whole pixels, and further above 1 when GDAL's
+#'   rule takes the whole source width or height for a window that needs more
+#'   than 90% of it (1.06 for a whole-world Mercator destination from a global
+#'   longitude/latitude source, which needs 170 of 180 degrees of latitude).
 #'   Returns `NULL` when no valid chunks are found (source does not overlap
 #'   the destination window).
 #'
@@ -318,11 +327,152 @@ warp_exec <- function(
   )
 }
 
-#' Warp and resample a source pixel buffer into a destination grid
+#' Warp a source buffer you already have
 #'
-#' Low-level kernel.  Reprojects a pre-fetched source window into the
-#' destination grid.  In most workflows you will call [warp_exec()] instead,
-#' which handles the planning loop and compositing automatically.
+#' Warps one pre-fetched source window into a destination window with rwarp's
+#' kernels: the step [warp_exec()] runs for each chunk of a plan, for a buffer
+#' read some other way (a byte-reference fetch, a cache, an array in memory).
+#' Read the window [warp_plan()] gives for the destination, with the plan's
+#' `resample`, so the kernels have the pixels they need at its edges.
+#'
+#' `src` is laid out as `read_fn` returns it to [warp_exec()]: one vector,
+#' each band row-major (as `GDALRaster$read()` gives it), bands one after
+#' another, with `src_size` giving the window's `c(ncol, nrow)`.  A matrix
+#' `c(nrow, ncol)` or array `c(nrow, ncol, nbands)` in R orientation, as
+#' [warp_exec()] and `warp_buffer()` return, also works; its `dim` gives the
+#' size.  The data type follows `src`: integer warps as 32-bit integers,
+#' double as 64-bit floats, raw as bytes, and the output is the same type.
+#'
+#' @param src The source window: integer, double or raw; a vector (with
+#'   `src_size`), a matrix or an array.  See Details.
+#' @param src_crs,src_gt CRS and geotransform of the full source raster.
+#' @param dst_crs,dst_gt CRS and geotransform of the full destination grid.
+#' @param dst_size Integer `c(ncol, nrow)` of the destination window.
+#' @param src_off Integer `c(col_off, row_off)` of the window in the full
+#'   source raster (0-based), as `src_xoff`, `src_yoff` in a plan's chunk.
+#'   Default `c(0L, 0L)`.
+#' @param src_size Integer `c(ncol, nrow)` of the window, for a vector `src`.
+#'   Taken from `dim(src)` for a matrix or array.
+#' @param src_dim Integer `c(ncol, nrow)` of the full source raster.  With it,
+#'   source longitudes wrap as gdalwarp wraps them (`CENTER_LONG`), which a
+#'   source across 180 degrees needs.  `NULL` (the default) skips that.
+#' @param dst_off Integer `c(col_off, row_off)` of the destination window in
+#'   the full destination grid (0-based).  Default `c(0L, 0L)`.
+#' @param resample Resampling method, gdalwarp's `-r` names (see
+#'   [warp_plan()]).  Default `"near"`.
+#' @param scaling,scale How the kernel widens when downsampling (see
+#'   [warp_plan()]).  `"widen"` (the default) estimates the scale over the
+#'   destination window, as gdalwarp does per chunk, so two windows of one
+#'   grid can widen differently.  For a chunk of a plan that is its
+#'   `scale_x`, `scale_y`; `scaling = "fixed", scale = c(ch$scale_x,
+#'   ch$scale_y)` uses them as given.
+#' @inheritParams warp_exec
+#'
+#' @return As [warp_exec()]: a matrix `c(nrow, ncol)` for one band, an array
+#'   `c(nrow, ncol, nbands)` for more (row 1 at the top), or a `nativeRaster`
+#'   with `output = "nara"`.
+#'
+#' @seealso [warp_plan()] for the window to read, [warp_exec()] to run a whole
+#'   plan with a read function.
+#' @export
+#' @examples
+#' ## a 4 x 4 longitude/latitude source warped onto a 2 x 2 grid
+#' gt  <- c(0, 1, 0, 4, 0, -1)
+#' src <- as.double(1:16)              # row-major, as GDAL reads it
+#' warp_buffer(src, "EPSG:4326", gt, "EPSG:4326", c(0, 2, 0, 4, 0, -2),
+#'             dst_size = c(2L, 2L), src_size = c(4L, 4L), resample = "average")
+#'
+#' \dontrun{
+#' ## the window a plan asks for, read with gdalraster
+#' library(gdalraster)
+#' ds   <- new(GDALRaster, "/vsicurl/https://example.com/my.tif")
+#' plan <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+#'                   dst_size = dst_dim, resample = "cubic")
+#' ch   <- plan[[1]][[1]]
+#' v    <- ds$read(1L, ch$src_xoff, ch$src_yoff, ch$src_xsize, ch$src_ysize,
+#'                 ch$src_xsize, ch$src_ysize)
+#' warp_buffer(v, src_crs, src_gt, dst_crs, dst_gt, dst_size = dst_dim,
+#'             src_off = c(ch$src_xoff, ch$src_yoff),
+#'             src_size = c(ch$src_xsize, ch$src_ysize),
+#'             src_dim = src_dim, resample = "cubic")
+#' }
+warp_buffer <- function(
+    src,
+    src_crs, src_gt,
+    dst_crs, dst_gt, dst_size,
+    src_off     = c(0L, 0L),
+    src_size    = NULL,
+    src_dim     = NULL,
+    dst_off     = c(0L, 0L),
+    resample    = "near",
+    scaling     = c("widen", "point", "fixed"),
+    scale       = NULL,
+    src_nodata  = NA,
+    dst_nodata  = NA,
+    band_nodata = c("partial", "unified", "per_band"),
+    mask_band   = NULL,
+    mode_ties   = c("first", "min", "max"),
+    max_error   = 0.125,
+    output      = c("array", "nara")) {
+  resample <- match.arg(resample, c("near", "bilinear", "cubic", "cubicspline",
+                                    "lanczos", "average", "mode", "min", "max",
+                                    "med", "rms"))
+  scaling     <- match.arg(scaling)
+  band_nodata <- match.arg(band_nodata)
+  mode_ties   <- match.arg(mode_ties)
+  output      <- match.arg(output)
+  if (!(is.integer(src) || is.double(src) || is.raw(src))) {
+    stop("src must be an integer, double or raw vector, matrix or array")
+  }
+  d <- dim(src)
+  if (!is.null(d)) {
+    if (!length(d) %in% 2:3) stop("src must be a vector, a matrix or a 3-dimensional array")
+    size <- c(d[2L], d[1L])
+    if (!is.null(src_size) && !all(as.integer(src_size) == size)) {
+      stop("src_size is c(", paste(src_size, collapse = ", "), ") but dim(src) gives c(",
+           paste(size, collapse = ", "), ")")
+    }
+    src_size <- size
+    nbands   <- if (length(d) == 3L) d[3L] else 1L
+    ## R orientation (column-major, row 1 at the top) to band-sequential row-major
+    src <- if (length(d) == 3L) as.vector(aperm(src, c(2L, 1L, 3L))) else as.vector(t(src))
+  } else {
+    if (is.null(src_size)) stop("src_size = c(ncol, nrow) is needed for a vector src")
+    npix   <- prod(src_size)
+    nbands <- if (npix > 0) length(src) / npix else 1L
+    if (npix > 0 && (nbands < 1 || nbands != round(nbands))) {
+      stop("src has ", length(src), " values, which is not a whole number of ",
+           src_size[1L], "x", src_size[2L], " bands")
+    }
+  }
+  if (scaling == "fixed" && (is.null(scale) || length(scale) != 2L)) {
+    stop("scaling = \"fixed\" needs scale = c(x, y)")
+  }
+  stopifnot(length(dst_size) == 2L, length(src_off) == 2L, length(dst_off) == 2L)
+
+  nd <- function(x) if (is.null(x)) numeric(0) else as.double(x)
+  .Call(wrap__warp_buffer_rs,
+    src, as.integer(src_size), as.integer(src_off), as.integer(nbands),
+    src_crs, as.double(src_gt),
+    if (is.null(src_dim)) integer(0) else as.integer(src_dim),
+    dst_crs, as.double(dst_gt),
+    as.integer(dst_off), as.integer(dst_size),
+    as.double(max_error),
+    resample, scaling, if (is.null(scale)) numeric(0) else as.double(scale),
+    mode_ties,
+    nd(src_nodata), nd(dst_nodata),
+    band_nodata,
+    if (is.null(mask_band)) 0L else as.integer(mask_band),
+    output == "nara"
+  )
+}
+
+#' Warp and resample a source pixel buffer into a destination grid (deprecated)
+#'
+#' Deprecated: use [warp_buffer()], which takes every kernel, integer, double
+#' and raw data, several bands and nodata, and returns a matrix as
+#' [warp_exec()] does.  `warp_resample()` calls the rwarp crate's deprecated
+#' `warp_resample` shim: integer data, one band, `"near"` or `"bilinear"`.
 #'
 #' The source buffer must be a **row-major integer vector**.
 #' Use `as.integer(as.vector(t(m)))` to convert from an R matrix `m`.
@@ -342,7 +492,8 @@ warp_exec <- function(
 #'   Convert to a matrix with
 #'   `matrix(result, nrow = dst_dim[2], ncol = dst_dim[1], byrow = TRUE)`.
 #'
-#' @seealso [warp_plan()], [warp_exec()]
+#' @seealso [warp_buffer()], which replaces it.
+#' @keywords internal
 #' @export
 warp_resample <- function(
     src_crs, src_gt,
@@ -354,6 +505,8 @@ warp_resample <- function(
     max_error = 0.125,
     resample  = "near") {
 
+  .Deprecated("warp_buffer", package = "rwarp",
+              msg = "warp_resample() is deprecated; use warp_buffer(), which returns a matrix as warp_exec() does")
   stopifnot(
     is.integer(src_pixels),
     is.integer(dst_dim), length(dst_dim) == 2L
