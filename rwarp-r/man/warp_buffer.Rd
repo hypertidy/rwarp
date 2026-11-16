@@ -65,8 +65,9 @@ default) means R's \code{NA} for integer data; NaN is always nodata in double
 data; raw has none.  \code{NULL} for none.}
 
 \item{dst_nodata}{Value written where no source contributes, one value or
-one per band.  \code{NA} (the default) writes \code{NA} (integer and double) or 0
-(raw).  \code{NULL} writes 0.}
+one per band.  \code{NA} (the default) writes \code{NA} for integer data, \code{NaN}
+for double (\code{is.na()} is \code{TRUE} for both) and 0 for raw.  \code{NULL} writes
+0.}
 
 \item{band_nodata}{How nodata works across bands (gdalwarp
 \code{UNIFIED_SRC_NODATA}): \code{"partial"} (gdalwarp's default), \code{"unified"}, or

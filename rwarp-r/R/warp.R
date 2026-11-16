@@ -210,8 +210,9 @@ warp_plan <- function(
 #'   default) means R's `NA` for integer data; NaN is always nodata in double
 #'   data; raw has none.  `NULL` for none.
 #' @param dst_nodata Value written where no source contributes, one value or
-#'   one per band.  `NA` (the default) writes `NA` (integer and double) or 0
-#'   (raw).  `NULL` writes 0.
+#'   one per band.  `NA` (the default) writes `NA` for integer data, `NaN`
+#'   for double (`is.na()` is `TRUE` for both) and 0 for raw.  `NULL` writes
+#'   0.
 #' @param band_nodata How nodata works across bands (gdalwarp
 #'   `UNIFIED_SRC_NODATA`): `"partial"` (gdalwarp's default), `"unified"`, or
 #'   `"per_band"`.
