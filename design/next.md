@@ -44,8 +44,8 @@ This file is a snapshot, so replace it rather than append to it.
 
 ## Next, in order
 
-1. **rwarp-r is on rwarp 0.4.1** (with controlledburn 0.3.2) once its
-   PR merges. For later bumps: change `rwarp-r/src/rust/Cargo.toml`, run
+1. **rwarp-r is on rwarp 0.4.1** (with controlledburn 0.3.2, #64). For
+   later bumps: change `rwarp-r/src/rust/Cargo.toml`, run
    `cargo update -p rwarp`, and commit the lock with it. The lock and the
    manifest must move together, or `vendor.sh` fails as above.
 2. **The rest of controlledburn 0.3:**
@@ -66,9 +66,18 @@ This file is a snapshot, so replace it rather than append to it.
 4. **Decisions waiting on the maintainer**: N1 to N5 (#43 to #47) and C1
    to C4 (#48 to #51). N6 is decided (`f32` edges, controlledburn 0.3.0).
 5. **rwarp-r**: `warp_buffer()` binds `warp()` for one pre-fetched
-   window (#54), and `warp_resample()`, which still calls the deprecated
-   `warp::warp_resample` shim, is deprecated. Next, the Sentinel-2/HLS
-   showcase (#55).
+   window (#54, #65), and `warp_resample()`, which still calls the
+   deprecated `warp::warp_resample` shim, is deprecated. The Sentinel-2
+   showcase (#55) is the `sentinel2-warp` vignette: two UTM zones, three
+   float bands, onto EPSG:3577, equal to gdalwarp's mosaic to 1e-11.
+   What it found: R's `warp_plan()` plans with the crate's default
+   working memory (one byte per pixel) and `min_fill_ratio = 0`, so for
+   several Float64 bands with nodata gdalwarp splits a destination that
+   the plan keeps whole, and its per-chunk kernel scale then differs (93
+   DN at 50 m). The vignette gives gdalwarp `-wm 512`. Exposing the
+   crate's `ChunkOptions::with_pixel_cost`, `memory_limit` and
+   `ScaleOrigin::Output` in `warp_plan()` would let the plan match
+   gdalwarp's chunks without that.
 
 ## Parked
 

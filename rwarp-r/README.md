@@ -122,8 +122,9 @@ ds$close()
 
 ## Vignettes
 
-- **Sentinel-2: Reproject from UTM to Albers Equal Area** —
-  single-tile, 10 m, GDAL read path.
+- **Sentinel-2: two UTM zones onto one grid** —
+  two tiles in zones 54 and 55, three bands as float reflectance, warped
+  to Australian Albers, combined, and checked against gdalwarp.
 - **GHRSST SST: Reproject to Antarctic Polar Stereographic** —
   global geographic source, polar target, byte-ref read path concept.
 - **CRS Strings: What PROJ Actually Sees** —

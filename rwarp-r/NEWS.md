@@ -1,5 +1,15 @@
 # rwarp (development version)
 
+* The `sentinel2-warp` vignette is rewritten (#55): two Sentinel-2 tiles from
+  one overpass, in UTM zones 54 and 55, warped as three bands of float
+  reflectance onto Australian Albers (EPSG:3577), combined in order as
+  gdalwarp combines its inputs, and compared with gdalwarp's mosaic of the
+  same sources (the same nodata, values to 1e-11). It also reads one window
+  once and warps it again with `warp_buffer()`.
+
+* `warp_exec()` and `warp_buffer()` document that `dst_nodata = NA` writes
+  `NaN` for double data, not `NA`; `is.na()` is `TRUE` for both.
+
 * New `warp_buffer()` warps one pre-fetched source window with the crate's
   `warp()` (#54). It has what `warp_exec()` has: every kernel, integer, double
   and raw data, several bands, source and destination nodata, `band_nodata`,

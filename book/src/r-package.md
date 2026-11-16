@@ -168,7 +168,7 @@ vignette (`vignette("crs-strings", package = "rwarp")`).
 
 | Vignette | What it shows |
 |---|---|
-| `sentinel2-warp` | Reproject a Sentinel-2 tile from UTM to Albers Equal Area |
+| `sentinel2-warp` | Two Sentinel-2 tiles in different UTM zones, three bands as float reflectance, onto one Albers grid; checked against gdalwarp |
 | `ghrsst-polar` | Reproject global SST to Antarctic Polar Stereographic via byte-range concept |
 | `crs-strings` | Diagnosing `+proj=` string pitfalls with `crs_describe()` |
 | `plan-inspect` | Fill ratios, antimeridian splits, tiled execution loops |
