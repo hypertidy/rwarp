@@ -12,11 +12,13 @@ This file is a snapshot, so replace it rather than append to it.
 |---|---|---|---|
 | rwarp | 0.3.3 | 2026-11-12 | antimeridian split reads two edge windows, not the whole width; `merge_tile` |
 | rwarp | 0.4.0 | 2026-11-12 | controlledburn 0.3.1 (breaking for rwarp: its types are in rwarp's API); N6 recorded |
+| rwarp | 0.4.1 | 2026-11-16 | `QuadMesh::burn_par`, `Rectilinear::burn_par` (#59, #63) |
+| controlledburn | 0.3.2 | 2026-11-12 | `burn_wkb_par`; burns the same as 0.3.1 |
 | controlledburn | 0.3.1 | 2026-11-12 | `relate_cells` (0.3.0: `burn_par`, `burn_window`, `merge_parts`, `f32` edges kept) |
 | bigcurve (crate) | 0.3.0 | 2026-11-04 | |
 
-`v0.4.0` was tagged on 2026-11-16 (annotated, on `6a4c337`, the commit
-the crate was published from).
+`v0.4.0` (on `6a4c337`) and `v0.4.1` (on `e4c3e49`) were tagged on
+2026-11-16, each on the commit its crate was published from.
 
 ## Open
 
@@ -42,12 +44,11 @@ the crate was published from).
 
 ## Next, in order
 
-1. Publish 0.4.1 (#59's `burn_par`) when ready.
-2. **rwarp-r on rwarp 0.4.x**, when R should get controlledburn 0.3 or
-   `burn_par`: bump `rwarp-r/src/rust/Cargo.toml`, run
-   `cargo update -p rwarp`, and commit the lock. The lock and the
+1. **rwarp-r is on rwarp 0.4.1** (with controlledburn 0.3.2) once its
+   PR merges. For later bumps: change `rwarp-r/src/rust/Cargo.toml`, run
+   `cargo update -p rwarp`, and commit the lock with it. The lock and the
    manifest must move together, or `vendor.sh` fails as above.
-3. **The rest of controlledburn 0.3:**
+2. **The rest of controlledburn 0.3:**
    - `burn_window` could replace rwarp's own windowed burn in
      `src/cutline.rs` (`Cutline::burn_window`, which builds a grid for
      the window). Check that the records are identical first.
@@ -57,14 +58,14 @@ the crate was published from).
      at a corner, which `burn` gives no record for. GDAL parity doesn't
      need it; it would help explain cutline edge differences, if any
      turn up.
-4. **The stages on the board**: curvilinear stage 3 (#36: exact
+3. **The stages on the board**: curvilinear stage 3 (#36: exact
    footprint for geolocation sources, antimeridian), then stage 4 (#37:
    periodic and tripolar grids and CF bounds, which takes the ESMF
    comparison onto ocean grids). Both depend on decision N1 (#43); #37
    also on N3 and N4.
-5. **Decisions waiting on the maintainer**: N1 to N5 (#43 to #47) and C1
+4. **Decisions waiting on the maintainer**: N1 to N5 (#43 to #47) and C1
    to C4 (#48 to #51). N6 is decided (`f32` edges, controlledburn 0.3.0).
-6. **rwarp-r**: bind `warp()` (#54) and the Sentinel-2/HLS showcase
+5. **rwarp-r**: bind `warp()` (#54) and the Sentinel-2/HLS showcase
    (#55). The R binding still calls the deprecated
    `warp::warp_resample` shim (integer data, near and bilinear only).
 

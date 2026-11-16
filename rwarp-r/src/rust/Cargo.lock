@@ -56,9 +56,9 @@ dependencies = [
 
 [[package]]
 name = "controlledburn"
-version = "0.2.4"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "811c442fce690d0e5cdc7de91e3bd8f3cc89266a63316c103723a20f910afe64"
+checksum = "50ecc9a9733d3c0acca87d302cf74e6bba48d5839c82a37942bb1262b5af6530"
 
 [[package]]
 name = "crc32fast"
@@ -282,9 +282,9 @@ dependencies = [
 
 [[package]]
 name = "rwarp"
-version = "0.3.3"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c172fd7c61de395bdbeb668be71cc0de2c64c1fd7cdc8f6d8011421edb8cec14"
+checksum = "ea9cd163a34f818886a42a20f66d4a5633b06f2163159a771247d520e51fb71f"
 dependencies = [
  "controlledburn",
  "proj",

@@ -1,5 +1,9 @@
 # rwarp (development version)
 
+* Built on rwarp (the crate) 0.4.1, with controlledburn 0.3. The R functions
+  are unchanged: the crate's 0.4 changes are in its mesh and weights API,
+  which the package doesn't bind yet.
+
 * `warp_plan()` gains `split_antimeridian` (default `TRUE`): a destination
   crossing the antimeridian of a global longitude/latitude source reads the
   two edges of the source instead of a full-width strip (about 11x fewer
