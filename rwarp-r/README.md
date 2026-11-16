@@ -115,7 +115,8 @@ ds$close()
 |----------|---------|
 | `warp_plan()` | Compute source windows for a destination grid (no I/O) |
 | `warp_exec()` | Execute a plan with a user-supplied read function |
-| `warp_resample()` | Low-level: warp a pre-fetched pixel buffer |
+| `warp_buffer()` | Warp one source window you already have, as `warp_exec()` does each chunk |
+| `warp_resample()` | Deprecated: use `warp_buffer()` |
 | `pixel_transform()` | Map destination pixels to fractional source pixel coords |
 | `crs_describe()` | Describe a CRS string in all PROJ output formats |
 
@@ -138,8 +139,10 @@ ds$close()
 to find the source window(s) that overlap the destination, accounting for
 antimeridian wrapping and minimum fill ratios.  No pixels are read.
 
-`warp_exec()` iterates the plan, calls `read_fn` per chunk, and composites
-with a "first valid wins" rule.  Swap `read_fn` for any source.
+`warp_exec()` iterates the plan, calls `read_fn` per chunk, and places each
+chunk's warped pixels in the output.  Swap `read_fn` for any source.
+`warp_buffer()` is the same warp for one window you have already read, from a
+byte-reference fetch, a cache or memory.
 
 ### CRS strings
 
@@ -151,8 +154,9 @@ Use `crs_describe()` to diagnose any string.
 
 ### Known issues
 
-- `warp_resample()` may write `i32::MIN`, which is `NA` in R, for out-of-bounds
-  pixels instead of the supplied `nodata` value.
+- `warp_resample()` (deprecated) may write `i32::MIN`, which is `NA` in R, for
+  out-of-bounds pixels instead of the supplied `nodata` value. `warp_buffer()`
+  writes `dst_nodata`.
 - Bilinear resampling has stripe artifacts at tile boundaries in some
   configurations (rwarp upstream issue).
 

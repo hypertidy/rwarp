@@ -6,7 +6,7 @@
 \alias{rwarp-package}
 \title{rwarp: Plannable Raster Warp via Rust (rwarp)}
 \description{
-Provides R bindings to the rwarp Rust crate: a GDAL-style raster warp pipeline implemented in pure Rust using the proj crate for coordinate transforms. The package exposes a plannable, inspectable warp workflow where the chunk plan (source windows, fill ratios) can be examined before execution, and the read function is user-swappable (GDAL, byte-ref COG, Zarr). Core functions replace vapour::gdal_raster_data() and related gdal_raster_* utilities for common reprojection tasks.
+Provides R bindings to the rwarp Rust crate: a GDAL-style raster warp pipeline implemented in pure Rust using the proj crate for coordinate transforms. The package exposes a plannable, inspectable warp workflow where the chunk plan (source windows, fill ratios) can be examined before execution, and the read function is user-swappable (GDAL, byte-ref COG, Zarr). The core functions cover the same reprojection tasks as vapour::gdal_raster_data() and the related gdal_raster_* utilities.
 }
 \seealso{
 Useful links:

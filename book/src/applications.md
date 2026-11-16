@@ -48,7 +48,7 @@ Install from the `rwarp-r/` subdirectory of this repository:
 remotes::install_github("hypertidy/rwarp", subdir = "rwarp-r")
 ```
 
-It exposes `warp_plan()`, `warp_exec()`, `warp_resample()`,
+It exposes `warp_plan()`, `warp_exec()`, `warp_buffer()`,
 `pixel_transform()` and `crs_describe()`. The plan/execute split and
 the user-supplied read function work the same way as in the Rust API.
 

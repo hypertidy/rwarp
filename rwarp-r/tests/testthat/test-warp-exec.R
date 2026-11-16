@@ -76,6 +76,34 @@ test_that("Int16: every kernel matches gdalwarp exactly", {
   }
 })
 
+test_that("warp_buffer() on the plan's window matches gdalwarp, every kernel (Int16, Float64)", {
+  skip_if_not_installed("gdalraster")
+  for (dt in c("Int16", "Float64")) {
+    f <- make_src(list(if (dt == "Int16") round(field()) else field()), dt)
+    ds <- methods::new(gdalraster::GDALRaster, f)
+    for (alg in kernels) {
+      plan <- warp_plan(src_crs, src_gt, c(nc, nr), dst_crs, dst_gt,
+                        dst_size = dst_dim, resample = alg)
+      ch <- plan[[1]][[1]]
+      v <- ds$read(1, ch$src_xoff, ch$src_yoff, ch$src_xsize, ch$src_ysize,
+                   ch$src_xsize, ch$src_ysize)
+      if (dt == "Int16") v <- as.integer(v)
+      r <- warp_buffer(v, src_crs, src_gt, dst_crs, dst_gt, dst_size = dst_dim,
+                       src_off = c(ch$src_xoff, ch$src_yoff),
+                       src_size = c(ch$src_xsize, ch$src_ysize), src_dim = c(nc, nr),
+                       resample = alg, src_nodata = NULL, dst_nodata = NULL)
+      g <- gdal_ref(f, alg)
+      if (dt == "Int16") {
+        expect_identical(r, matrix(as.integer(g), nrow = dst_dim[2]), label = paste(dt, alg))
+      } else if (alg != "mode") {
+        ## mode on float data: see the Float64 test below
+        expect_lt(max(abs(r - g)), 1e-9, label = paste(dt, alg))
+      }
+    }
+    ds$close()
+  }
+})
+
 test_that("Byte (raw): every kernel matches gdalwarp exactly", {
   skip_if_not_installed("gdalraster")
   f <- make_src(list(pmin(255, pmax(0, round(field() + 128)))), "Byte")

@@ -73,7 +73,7 @@ grid = result.reshape(dst_dim[1], dst_dim[0])
 |---|---|
 | `warp_plan()` | Compute source windows for a destination grid (pure geometry, no I/O) |
 | `warp_exec()` | Execute a plan with a user-supplied read function |
-| `warp_resample()` | Warp a pre-fetched pixel buffer directly |
+| `warp_buffer()` | Warp one source window you already have |
 | `pixel_transform()` | Map destination pixels to fractional source pixel coordinates |
 | `crs_describe()` | Describe a CRS string in all PROJ output formats |
 

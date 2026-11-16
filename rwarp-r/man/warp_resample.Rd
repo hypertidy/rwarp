@@ -2,7 +2,7 @@
 % Please edit documentation in R/warp.R
 \name{warp_resample}
 \alias{warp_resample}
-\title{Warp and resample a source pixel buffer into a destination grid}
+\title{Warp and resample a source pixel buffer into a destination grid (deprecated)}
 \usage{
 warp_resample(
   src_crs,
@@ -46,14 +46,16 @@ Convert to a matrix with
 \code{matrix(result, nrow = dst_dim[2], ncol = dst_dim[1], byrow = TRUE)}.
 }
 \description{
-Low-level kernel.  Reprojects a pre-fetched source window into the
-destination grid.  In most workflows you will call \code{\link[=warp_exec]{warp_exec()}} instead,
-which handles the planning loop and compositing automatically.
+Deprecated: use \code{\link[=warp_buffer]{warp_buffer()}}, which takes every kernel, integer, double
+and raw data, several bands and nodata, and returns a matrix as
+\code{\link[=warp_exec]{warp_exec()}} does.  \code{warp_resample()} calls the rwarp crate's deprecated
+\code{warp_resample} shim: integer data, one band, \code{"near"} or \code{"bilinear"}.
 }
 \details{
 The source buffer must be a \strong{row-major integer vector}.
 Use \code{as.integer(as.vector(t(m)))} to convert from an R matrix \code{m}.
 }
 \seealso{
-\code{\link[=warp_plan]{warp_plan()}}, \code{\link[=warp_exec]{warp_exec()}}
+\code{\link[=warp_buffer]{warp_buffer()}}, which replaces it.
 }
+\keyword{internal}

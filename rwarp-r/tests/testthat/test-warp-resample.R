@@ -1,4 +1,8 @@
-## Minimal round-trip test for warp_resample (no network).
+## Minimal round-trip test for warp_resample (no network). It is deprecated
+## in favour of warp_buffer(); the tests call it quietly, and one checks the
+## warning.
+
+resample_quiet <- function(...) suppressWarnings(warp_resample(...))
 
 src_gt  <- c(-180, 1, 0, 90, 0, -1)
 src_dim <- c(360L, 180L)
@@ -11,7 +15,7 @@ dst_dim <- c(5L, 5L)
 src_pixels <- as.integer(seq_len(prod(src_dim)))
 
 test_that("warp_resample returns integer vector of correct length", {
-  result <- warp_resample(
+  result <- resample_quiet(
     src_crs = src_crs, src_gt = src_gt,
     dst_crs = dst_crs, dst_gt = dst_gt,
     dst_dim = dst_dim,
@@ -25,7 +29,7 @@ test_that("warp_resample returns integer vector of correct length", {
 })
 
 test_that("identity warp produces non-nodata values", {
-  result <- warp_resample(
+  result <- resample_quiet(
     src_crs = src_crs, src_gt = src_gt,
     dst_crs = dst_crs, dst_gt = dst_gt,
     dst_dim = dst_dim,
@@ -56,7 +60,7 @@ test_that("warp_exec places every chunk of a split plan", {
     dst_crs = dst_crs, dst_gt = dst_gt,
     dst_size = dst_dim
   )
-  whole <- warp_resample(
+  whole <- resample_quiet(
     src_crs = src_crs, src_gt = src_gt,
     dst_crs = dst_crs, dst_gt = dst_gt,
     dst_dim = dst_dim,
@@ -66,4 +70,15 @@ test_that("warp_exec places every chunk of a split plan", {
     nodata = -32768L
   )
   expect_equal(out, matrix(whole, nrow = 5L, ncol = 5L, byrow = TRUE))
+})
+
+test_that("warp_resample() is deprecated, and warp_buffer() gives its result as a matrix", {
+  args <- list(src_crs = src_crs, src_gt = src_gt, dst_crs = dst_crs, dst_gt = dst_gt,
+               dst_dim = dst_dim, src_pixels = src_pixels,
+               src_ncol = src_dim[1], src_nrow = src_dim[2],
+               src_col_off = 0L, src_row_off = 0L, nodata = -32768L)
+  expect_warning(old <- do.call(warp_resample, args), "deprecated")
+  new <- warp_buffer(src_pixels, src_crs, src_gt, dst_crs, dst_gt, dst_size = dst_dim,
+                     src_size = src_dim)
+  expect_identical(new, matrix(old, nrow = dst_dim[2], ncol = dst_dim[1], byrow = TRUE))
 })

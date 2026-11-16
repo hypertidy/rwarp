@@ -1,5 +1,19 @@
 # rwarp (development version)
 
+* New `warp_buffer()` warps one pre-fetched source window with the crate's
+  `warp()` (#54). It has what `warp_exec()` has: every kernel, integer, double
+  and raw data, several bands, source and destination nodata, `band_nodata`,
+  `mask_band`, `mode_ties`, kernel scaling and `output = "nara"`. The buffer is
+  laid out as `read_fn` returns it, or is a matrix or array in R orientation,
+  and the result is a matrix or array, as from `warp_exec()`. On the window
+  `warp_plan()` gives, it warps to the same pixels as `warp_exec()`.
+
+* `warp_resample()` is deprecated in favour of `warp_buffer()`. It is
+  integer-only, `"near"` or `"bilinear"`, one band, and returns a row-major
+  vector.
+
+* `warp_plan()` documents `fill_ratio`: GDAL's, which can be above 1.
+
 * Built on rwarp (the crate) 0.4.1, with controlledburn 0.3. The R functions
   are unchanged: the crate's 0.4 changes are in its mesh and weights API,
   which the package doesn't bind yet.

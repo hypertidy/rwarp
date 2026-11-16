@@ -65,9 +65,10 @@ This file is a snapshot, so replace it rather than append to it.
    also on N3 and N4.
 4. **Decisions waiting on the maintainer**: N1 to N5 (#43 to #47) and C1
    to C4 (#48 to #51). N6 is decided (`f32` edges, controlledburn 0.3.0).
-5. **rwarp-r**: bind `warp()` (#54) and the Sentinel-2/HLS showcase
-   (#55). The R binding still calls the deprecated
-   `warp::warp_resample` shim (integer data, near and bilinear only).
+5. **rwarp-r**: `warp_buffer()` binds `warp()` for one pre-fetched
+   window (#54), and `warp_resample()`, which still calls the deprecated
+   `warp::warp_resample` shim, is deprecated. Next, the Sentinel-2/HLS
+   showcase (#55).
 
 ## Parked
 

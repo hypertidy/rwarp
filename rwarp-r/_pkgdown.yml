@@ -25,12 +25,15 @@ reference:
     contents:
       - warp_plan
       - warp_exec
-      - warp_resample
+      - warp_buffer
   - title: "Utilities"
     desc: "Pixel coordinate transforms and CRS diagnostics."
     contents:
       - pixel_transform
       - crs_describe
+  - title: "Deprecated"
+    contents:
+      - warp_resample
 
 articles:
   - title: "Worked examples"

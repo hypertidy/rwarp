@@ -74,6 +74,15 @@ fields:
 \code{fill_ratio}, \code{scale_x}, \code{scale_y} (the kernel scale for the chunk).
 Attributes \code{src_dim}, \code{dst_off}, \code{dst_size}, \code{resample} and \code{scaling} record what
 it was planned for.
+
+\code{fill_ratio} is GDAL's: the area of the source window (whole pixels,
+clamped to the source) over the area of the unrounded extent the
+destination needs, both padded for the kernel. A low value means much of
+that extent lies outside the source. It can be a little above 1, because
+the window is rounded out to whole pixels, and further above 1 when GDAL's
+rule takes the whole source width or height for a window that needs more
+than 90\% of it (1.06 for a whole-world Mercator destination from a global
+longitude/latitude source, which needs 170 of 180 degrees of latitude).
 Returns \code{NULL} when no valid chunks are found (source does not overlap
 the destination window).
 }

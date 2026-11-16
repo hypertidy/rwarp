@@ -18,8 +18,8 @@ A conventional warp pipeline reads source data and reprojects it in one step.
 
 1. `warp_plan()` — pure geometry; no I/O. Returns the source windows and
    destination sub-windows needed. Inspect, cache, or parallelise this.
-2. `warp_exec()` (or `warp_resample()`) — the actual pixel work, driven by
-   a user-supplied `read_fn`.
+2. `warp_exec()` — the actual pixel work, driven by a user-supplied
+   `read_fn` (or `warp_buffer()`, for a window you have already read).
 
 This means you can:
 
