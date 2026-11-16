@@ -2,6 +2,17 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## Unreleased
+
+### Changed
+
+- Decision N1 (#43): coverage uses the equal-area map on every mesh.
+  `QuadMesh::ring_to_index`, `burn`, `burn_par` and `cover_ring` no longer
+  refuse a mesh built with `CellMap::Bilinear`; they give the same records
+  as on a `CellMap::EqualArea` mesh. A mesh's `CellMap` is now the map of
+  its point methods only (`to_index`, `to_world`, `local`, `world`),
+  `Bilinear` by default for GDAL parity.
+
 ## 0.4.1 (2026-11-16)
 
 ### Added

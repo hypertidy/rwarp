@@ -108,7 +108,9 @@ walking from a hint.
 splits each cell into four triangles so that areas in index space are
 the same fractions of the cell as in the world. That is what makes a
 burn in index space give world-area coverage on a curvilinear grid
-(`design/curvilinear-frontend.md`). The module needs no CRS backend.
+(`design/curvilinear-frontend.md`), so coverage always uses it: the
+`CellMap` a mesh is built with, `Bilinear` by default, is the map of its
+point methods (`to_index`, `to_world`). The module needs no CRS backend.
 
 `QuadMesh::burn` takes polygons and points in the grid's coordinates
 and returns controlledburn's tables with the grid's own `(row, col)`:

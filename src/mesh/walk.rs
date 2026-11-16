@@ -18,9 +18,11 @@
 //!    the arc together do not wind around the mesh. The arc lies on the
 //!    outer walls, so it changes no cell.
 //!
-//! The walk needs [`CellMap::EqualArea`]: under `Bilinear` the preimage of
-//! a straight edge is curved, and mapping cut points alone would not be
-//! exact for either model.
+//! The walk uses the equal-area map whatever the mesh's [`CellMap`] (which
+//! is for its point methods): under `Bilinear` the preimage of a straight
+//! edge is curved, and mapping cut points alone would not be exact for
+//! either model. A bilinear measure would need the ring densified
+//! (bigcurve; `design/curvilinear-frontend.md`, section 5).
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -453,11 +455,10 @@ impl QuadMesh {
     /// coverage of each cell is the world ring's coverage of that cell as
     /// a fraction of the cell's area.
     ///
-    /// Errors unless the mesh uses [`CellMap::EqualArea`].
+    /// Index positions are under the equal-area map, whatever the mesh's
+    /// [`CellMap`]: inside a cell they can differ from
+    /// [`QuadMesh::to_index`] on a `Bilinear` mesh (never on a cell side).
     pub fn ring_to_index(&self, ring: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> {
-        if self.map != CellMap::EqualArea {
-            return Err("the ring walk needs CellMap::EqualArea".into());
-        }
         let mut pts: Vec<[f64; 2]> = ring.to_vec();
         while pts.len() > 1 && pts.first() == pts.last() {
             pts.pop();
@@ -477,7 +478,7 @@ impl QuadMesh {
             }
             vcell.push(cell);
             vidx.push(cell.and_then(|(r, c)| {
-                self.local(r, c, p)
+                self.local_in(CellMap::EqualArea, r, c, p)
                     .map(|[u, v]| [c as f64 + u, r as f64 + v])
             }));
         }
@@ -627,9 +628,6 @@ impl QuadMesh {
         opts: impl Into<BurnOptions>,
         threads: usize,
     ) -> Result<BurnResult, String> {
-        if self.map != CellMap::EqualArea {
-            return Err("the ring walk needs CellMap::EqualArea".into());
-        }
         burn_with(
             self.ncol,
             self.nrow,

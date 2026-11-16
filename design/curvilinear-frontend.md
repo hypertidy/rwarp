@@ -89,6 +89,9 @@ pub enum CellMap {
 }
 ```
 
+Decision N1 (`decisions.md`, 2026-11-16): coverage uses `EqualArea` on
+every mesh; a mesh's `CellMap` is the map of its point methods.
+
 | cell map | index-space fractions are | use |
 |---|---|---|
 | `Bilinear` | fractions of the bilinear preimage: not world areas; needs densifying even for straight polygon edges | GDAL parity (point kernels, `geo_to_pixel`) |
