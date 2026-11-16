@@ -61,10 +61,12 @@ This file is a snapshot, so replace it rather than append to it.
 3. **The stages on the board**: curvilinear stage 3 (#36: exact
    footprint for geolocation sources, antimeridian), then stage 4 (#37:
    periodic and tripolar grids and CF bounds, which takes the ESMF
-   comparison onto ocean grids). Both depend on decision N1 (#43); #37
-   also on N3 and N4.
-4. **Decisions waiting on the maintainer**: N1 to N5 (#43 to #47) and C1
-   to C4 (#48 to #51). N6 is decided (`f32` edges, controlledburn 0.3.0).
+   comparison onto ocean grids). N1 (#43) is decided (coverage uses
+   `EqualArea` on every mesh), so #36 is unblocked; #37 also waits on N3
+   and N4.
+4. **Decisions waiting on the maintainer**: N2 to N5 (#44 to #47) and C1
+   to C4 (#48 to #51). N1 (2026-11-16) and N6 (`f32` edges,
+   controlledburn 0.3.0) are decided.
 5. **rwarp-r**: `warp_buffer()` binds `warp()` for one pre-fetched
    window (#54, #65), and `warp_resample()`, which still calls the
    deprecated `warp::warp_resample` shim, is deprecated. The Sentinel-2

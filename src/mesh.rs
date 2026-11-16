@@ -9,7 +9,7 @@
 //! row + 1)` and row 0 the first row of the arrays as stored. That is the
 //! space controlledburn burns in (its `design/grid-frontends.md`).
 //!
-//! Cells are the straight-edged quadrilaterals through their corners. The
+//! Cells are the straight-edged quadrilaterals through their corners. A
 //! [`CellMap`] says how a cell's inside maps to the unit square:
 //!
 //! - [`CellMap::Bilinear`] is GDAL's geolocation model (the inverse is
@@ -24,14 +24,19 @@
 //!   the world, exactly. This is the map for coverage and area methods.
 //!
 //! The cells of the two maps are the same quadrilaterals; only the
-//! interior map differs.
+//! interior map differs. Coverage always uses the equal-area map (decision
+//! N1, `design/decisions.md`): the ring walk, [`QuadMesh::burn`] and
+//! [`QuadMesh::cover_ring`] give world-area fractions whatever map the mesh
+//! was built with. The mesh's own map, `Bilinear` by default for GDAL
+//! parity, is the one its point methods use: [`QuadMesh::to_index`],
+//! [`QuadMesh::to_world`], [`QuadMesh::local`] and [`QuadMesh::world`].
 //!
 //! No CRS is involved: the module builds with `--no-default-features`.
 //!
 //! # Rings and burns
 //!
 //! [`QuadMesh::ring_to_index`] moves a whole world ring into index space
-//! (under [`CellMap::EqualArea`]): every segment is cut where it crosses a
+//! (under the equal-area map): every segment is cut where it crosses a
 //! cell side or a spoke of the four-triangle split, each cut point placed
 //! by its parameter along that edge (so neighbouring rings get bitwise the
 //! same point), and any stretch outside the mesh is replaced by an arc of
@@ -84,7 +89,8 @@ pub use rect::Rectilinear;
 
 use crate::geoloc_transform::inverse_bilinear;
 
-/// How a cell's inside maps to the unit square.
+/// How a cell's inside maps to the unit square, for a mesh's point methods.
+/// Coverage always uses [`CellMap::EqualArea`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CellMap {
@@ -93,7 +99,7 @@ pub enum CellMap {
     #[default]
     Bilinear,
     /// Four triangles per cell with matching area shares: index-space
-    /// area fractions are world-area fractions.
+    /// area fractions are world-area fractions. The map coverage uses.
     EqualArea,
 }
 
@@ -282,7 +288,8 @@ impl QuadMesh {
         self.nrow
     }
 
-    /// The cell map in use.
+    /// The cell map of the point methods (coverage always uses
+    /// [`CellMap::EqualArea`]).
     pub fn cell_map(&self) -> CellMap {
         self.map
     }
@@ -403,10 +410,15 @@ impl QuadMesh {
     /// cell `(row, col)`, through the cell map. `None` if the cell has no
     /// area or does not own `p`.
     pub fn local(&self, row: usize, col: usize, p: [f64; 2]) -> Option<[f64; 2]> {
+        self.local_in(self.map, row, col, p)
+    }
+
+    /// [`QuadMesh::local`] through `map`, whatever the mesh's own.
+    fn local_in(&self, map: CellMap, row: usize, col: usize, p: [f64; 2]) -> Option<[f64; 2]> {
         let k = self.triangle(row, col, p)?;
         let q = self.corners(row, col);
         let cell = &self.cells[row * self.ncol + col];
-        match self.map {
+        match map {
             CellMap::EqualArea => {
                 let (a, b, x) = (q[k], q[(k + 1) % 4], cell.centre);
                 let (ua, ub, ux) = (UNIT[k], UNIT[(k + 1) % 4], cell.unit);

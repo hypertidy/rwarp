@@ -632,12 +632,58 @@ fn points_and_refusals() {
     let line = Geometry::LineString(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 }]);
     assert!(m.burn(&[line], BurnOptions::coverage()).is_err());
     assert!(m.burn(&[], BurnOptions::approx()).is_err());
-    let (nc, nr, x, y) = jittered(7, 0.2);
-    let bil = QuadMesh::from_corners(nc, nr, x, y, CellMap::Bilinear).unwrap();
-    assert!(bil
-        .ring_to_index(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
-        .is_err());
     assert!(Rectilinear::new(vec![0.0, 1.0, 1.0], vec![0.0, 1.0]).is_err());
+}
+
+#[test]
+fn coverage_uses_the_equal_area_map_whatever_the_mesh_map() {
+    // decision N1: a Bilinear mesh (GDAL's point model) walks and burns as
+    // an EqualArea one, record for record; only its point methods differ
+    for (name, c) in [
+        ("jitter", jittered(7, 0.2)),
+        ("jitter_strong", jittered(11, 0.45)),
+        ("polar", polar()),
+        ("sinusoid", sinusoid()),
+        ("dented", dented()),
+        ("polar_flipped", flipped(polar())),
+    ] {
+        let (nc, nr, x, y) = c;
+        let ea = QuadMesh::from_corners(nc, nr, x.clone(), y.clone(), CellMap::EqualArea).unwrap();
+        let bil = QuadMesh::from_corners(nc, nr, x, y, CellMap::Bilinear).unwrap();
+        assert_eq!(bil.cell_map(), CellMap::Bilinear);
+        let cs = cases(&ea, 20261116, 30);
+        for rings in &cs {
+            for r in rings {
+                assert_eq!(bil.ring_to_index(r).unwrap(), ea.ring_to_index(r).unwrap(), "{name}");
+            }
+        }
+        let g: Vec<Geometry> = cs.iter().map(|r| polygon(r)).collect();
+        let want = ea.burn(&g, BurnOptions::coverage()).unwrap();
+        assert!(!want.edges.is_empty(), "{name}");
+        assert_eq!(bil.burn(&g, BurnOptions::coverage()).unwrap(), want, "{name}");
+        assert_eq!(bil.burn_par(&g, BurnOptions::coverage(), 3).unwrap(), want, "{name}");
+        let (mut a, mut b) = (CoverageWindow::default(), CoverageWindow::default());
+        let mut hits = 0;
+        for rings in &cs {
+            let hit = ea.cover_ring(&rings[0], &mut b).unwrap();
+            assert_eq!(bil.cover_ring(&rings[0], &mut a).unwrap(), hit, "{name}");
+            if hit {
+                hits += 1;
+                assert_eq!((a.row0(), a.col0(), a.nrow(), a.ncol()), (b.row0(), b.col0(), b.nrow(), b.ncol()));
+                assert_eq!(a.coverage(), b.coverage(), "{name}");
+            }
+        }
+        assert!(hits > 0, "{name}");
+    }
+    // the point maps still differ inside a cell: a polar cell's corner mean
+    // is (0.5, 0.5) under Bilinear, its equal-area unit centre otherwise
+    let (nc, nr, x, y) = polar();
+    let ea = QuadMesh::from_corners(nc, nr, x.clone(), y.clone(), CellMap::EqualArea).unwrap();
+    let bil = QuadMesh::from_corners(nc, nr, x, y, CellMap::Bilinear).unwrap();
+    let p = ea.split_centre(2, 3).0;
+    let (ib, ie) = (bil.to_index(p, None).unwrap(), ea.to_index(p, None).unwrap());
+    assert!((ib[0] - 3.5).abs() < 1e-9 && (ib[1] - 2.5).abs() < 1e-9, "{ib:?}");
+    assert!((ib[1] - ie[1]).abs() > 1e-3, "{ib:?} {ie:?}");
 }
 
 #[test]

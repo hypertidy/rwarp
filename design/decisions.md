@@ -18,7 +18,7 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 
 | | decision | today | recommendation |
 |---|---|---|---|
-| N1 | cell map default for coverage | `Bilinear` default; `burn` requires `EqualArea` | `EqualArea` for coverage |
+| N1 | cell map default for coverage | coverage uses `EqualArea` on every mesh; `Bilinear` default for point methods | decided: A, `EqualArea` for coverage (2026-11-16) |
 | N2 | non-convex cells | equal-area split; fallback note never seen | keep, and test that it never fires |
 | N3 | folds other than tripolar | refused at construction | refuse for coverage |
 | N4 | `mesh` public or crate-private | public, documented unstable | public, unstable |
@@ -32,7 +32,16 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 
 ---
 
-## N1. The cell map for coverage
+## N1. The cell map for coverage (decided)
+
+**Decided (2026-11-16): option A.** Coverage uses the equal-area map on
+every mesh: `ring_to_index`, `burn`, `burn_par` and `cover_ring` no
+longer refuse a `Bilinear` mesh, and give the same records as on an
+`EqualArea` mesh. A mesh's `CellMap` is now only the map of its point
+methods (`to_index`, `to_world`, `local`, `world`), `Bilinear` by
+default for parity with GDAL's point kernels and `geo_to_pixel`. A
+bilinear coverage measure, if anyone wants one, would need densified
+rings (bigcurve) and an option of its own.
 
 ![Bilinear vs EqualArea on one distorted cell](figures/cellmap.svg)
 
@@ -46,9 +55,9 @@ cell (controlledburn-rs `examples/grid_frontends.rs`). The equal-area map
 splits the cell into four triangles at the corner mean, and every index
 area maps to an equal share (1.000 to 1.000).
 
-**Today:** `CellMap::Bilinear` is the default at construction, and
-`QuadMesh::burn` / `ring_to_index` require `EqualArea` (they refuse a
-bilinear mesh), so coverage users must ask for it.
+**Before the decision:** `CellMap::Bilinear` was the default at
+construction, and `QuadMesh::burn` / `ring_to_index` required `EqualArea`
+(they refused a bilinear mesh), so coverage users had to ask for it.
 
 | option | for | against |
 |---|---|---|
