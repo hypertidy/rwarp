@@ -90,23 +90,53 @@ if (!is.null(plan2)) {
 
 ## Antimeridian splitting
 
-For source rasters that cross the antimeridian (e.g. a Pacific-centred
-projection), `warp_plan()` may return two chunk-lists: one for each side.
+A destination across the antimeridian of a global longitude/latitude
+source needs source pixels at both of its edges, 180 W and 180 E. One
+window holding both is a strip the whole width of the source, which is what
+gdalwarp reads. `warp_plan()` instead splits the chunk where source x
+jumps, so each side reads a compact window at its own edge
+(`split_antimeridian = TRUE`, the default; `FALSE` is gdalwarp's plan).
 
 ```{r antimeridian}
-## Pacific-centred destination (centred on 180 E)
-dst_gt3  <- c(160 - 180, 1, 0, 10, 0, -1)   # simple illustration
-dst_dim3 <- c(40L, 20L)
+## Lambert azimuthal equal-area centred on 30 S, 180 E, 4000 km across
+pac_crs <- "+proj=laea +lat_0=-30 +lon_0=180 +datum=WGS84 +type=crs"
+pac_gt  <- c(-2e6, 20000, 0, 2e6, 0, -20000)
+glob_gt <- c(-180, 1, 0, 90, 0, -1)
 
-plan3 <- warp_plan(
-  src_crs  = "EPSG:4326",
-  src_gt   = c(-180, 1, 0, 90, 0, -1),
-  src_dim  = c(360L, 180L),
-  dst_crs  = "EPSG:4326",
-  dst_gt   = dst_gt3,
-  dst_off  = c(0L, 0L), dst_size = dst_dim3
-)
-cat("Chunk groups (expect 1 or 2 at antimeridian):", length(plan3), "\n")
+plan3 <- warp_plan("EPSG:4326", glob_gt, c(360L, 180L), pac_crs, pac_gt,
+                   dst_size = c(200L, 200L))
+plan3_g <- warp_plan("EPSG:4326", glob_gt, c(360L, 180L), pac_crs, pac_gt,
+                     dst_size = c(200L, 200L), split_antimeridian = FALSE)
+
+windows <- function(p) do.call(rbind, lapply(p[[1]], as.data.frame))
+w  <- windows(plan3)
+wg <- windows(plan3_g)
+w[c("dst_xoff", "dst_xsize", "src_xoff", "src_yoff", "src_xsize", "src_ysize")]
+c(split = sum(w$src_xsize * w$src_ysize), one_window = sum(wg$src_xsize * wg$src_ysize))
+```
+
+The two halves of the destination each read 26 columns at one edge. The two
+destination columns that straddle the jump are chunks of their own, reading
+two columns at each edge. Together that's about a sixth of the pixels in the
+full-width strip:
+
+```{r antimeridian-plot, fig.width = 7, fig.height = 3.9}
+lon <- function(x) glob_gt[1] + x * glob_gt[2]
+lat <- function(y) glob_gt[4] + y * glob_gt[6]
+box <- function(d, ...) {
+  rect(lon(d$src_xoff), lat(d$src_yoff + d$src_ysize),
+       lon(d$src_xoff + d$src_xsize), lat(d$src_yoff), ...)
+}
+op <- par(mar = c(2.5, 2.5, 2, 0.5))
+plot(NA, xlim = c(-180, 180), ylim = c(-90, 90), asp = 1, xlab = "", ylab = "",
+     main = "What each plan reads from the global source")
+rect(-180, -90, 180, 90, border = "grey60")
+abline(v = c(-180, 180), col = "grey60")
+box(wg, border = "grey30", lty = 2, lwd = 1.5)
+box(w, col = adjustcolor("firebrick", 0.45), border = "firebrick")
+legend("top", c("split (default)", "one window (gdalwarp)"), horiz = TRUE,
+       col = c("firebrick", "grey30"), lty = c(1, 2), lwd = c(8, 1.5), bty = "n")
+par(op)
 ```
 
 ## Tiled execution loop

@@ -39,11 +39,10 @@ mapping directly — useful for debugging CRS strings, checking extent
 coverage, and understanding fill ratios.
 }
 \examples{
-\dontrun{
-library(vaster)
-src_gt  <- extent_dim_to_gt(c(-180, 180, -90, 90), c(3600L, 1800L))
-dst_ext <- c(-20037508, 20037508, -20037508, 20037508)
-dst_gt  <- extent_dim_to_gt(dst_ext, c(256L, 256L))
+## a global 0.1 degree source and a 256 x 256 Web Mercator grid
+src_gt <- c(-180, 0.1, 0, 90, 0, -0.1)
+w      <- 20037508.34
+dst_gt <- c(-w, 2 * w / 256, 0, w, 0, -2 * w / 256)
 
 coords <- pixel_transform(
   src_crs = "EPSG:4326", src_gt = src_gt,
@@ -52,7 +51,10 @@ coords <- pixel_transform(
 )
 # Proportion of destination pixels with valid source coordinates
 mean(!is.na(coords$src_x))
-}
+# the source row each destination row samples: Mercator stretches the
+# poles, so rows near the top and bottom sample far apart in latitude
+plot(coords$src_y[seq(1, by = 256, length.out = 256)], type = "l",
+     xlab = "destination row", ylab = "source row")
 }
 \seealso{
 \code{\link[=warp_plan]{warp_plan()}}, \code{\link[=warp_resample]{warp_resample()}}

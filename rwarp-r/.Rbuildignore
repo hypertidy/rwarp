@@ -2,3 +2,6 @@
 ^_pkgdown\.yml$
 ^tools/vendor\.sh$
 ^src/rust/target$
+^vignettes/articles$
+^docs$
+^pkgdown$

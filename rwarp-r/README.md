@@ -1,8 +1,10 @@
 # rwarp (R package)
 
+<!-- badges: start -->
 [![R-CMD-check](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml)
 [![Crate](https://img.shields.io/crates/v/rwarp.svg)](https://crates.io/crates/rwarp)
 [![pkgdown site](https://img.shields.io/badge/docs-pkgdown-blue)](https://hypertidy.github.io/rwarp/r/)
+<!-- badges: end -->
 
 **Plannable raster warp via Rust ([rwarp](https://crates.io/crates/rwarp))**
 
@@ -72,6 +74,10 @@ remotes::install_github("hypertidy/rwarp", subdir = "rwarp-r")
 
 ## Quick start
 
+The shape of a warp with a remote source. [Get started](https://hypertidy.github.io/rwarp/r/articles/rwarp.html)
+runs the same steps on a file shipped with vapour, with plots and a check
+against gdalwarp.
+
 ```r
 library(rwarp)
 library(gdalraster)
@@ -120,17 +126,22 @@ ds$close()
 | `pixel_transform()` | Map destination pixels to fractional source pixel coords |
 | `crs_describe()` | Describe a CRS string in all PROJ output formats |
 
-## Vignettes
+## Articles
 
-- **Sentinel-2: two UTM zones onto one grid** —
+- [**Get started**](https://hypertidy.github.io/rwarp/r/articles/rwarp.html) —
+  plan, warp and check against gdalwarp, on a file shipped with vapour.
+- [**Sentinel-2: two UTM zones onto one grid**](https://hypertidy.github.io/rwarp/r/articles/sentinel2-warp.html) —
   two tiles in zones 54 and 55, three bands as float reflectance, warped
   to Australian Albers, combined, and checked against gdalwarp.
-- **GHRSST SST: Reproject to Antarctic Polar Stereographic** —
+- [**GHRSST SST: Reproject to Antarctic Polar Stereographic**](https://hypertidy.github.io/rwarp/r/articles/ghrsst-polar.html) —
   global geographic source, polar target, byte-ref read path concept.
-- **CRS Strings: What PROJ Actually Sees** —
-  diagnosing `+proj=` string pitfalls with `crs_describe()`.
-- **Warp Planning: Inspect Before You Read** —
+- [**Warp Planning: Inspect Before You Read**](https://hypertidy.github.io/rwarp/r/articles/plan-inspect.html) —
   fill ratios, antimeridian splits, tiled execution loops.
+- [**CRS Strings: What PROJ Actually Sees**](https://hypertidy.github.io/rwarp/r/articles/crs-strings.html) —
+  diagnosing `+proj=` string pitfalls with `crs_describe()`.
+
+The Sentinel-2 and GHRSST articles read from the network, so they are on
+the website only (precomputed), not installed with the package.
 
 ## Design notes
 

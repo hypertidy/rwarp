@@ -1,0 +1,201 @@
+---
+title: "Get started with rwarp"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Get started with rwarp}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+needs <- c("gdalraster", "vapour", "ximage")
+knitr::opts_chunk$set(
+  collapse = TRUE, comment = "#>", fig.width = 7.5, fig.height = 4.2,
+  eval = all(vapply(needs, requireNamespace, logical(1), quietly = TRUE))
+)
+```
+
+rwarp warps rasters as gdalwarp does, in two steps you can look at. A
+**plan** says which source pixels each part of the destination needs, and
+reads nothing. The **warp** then runs on pixels you read however you like.
+
+This page warps a small sea surface temperature raster onto Antarctic polar
+stereographic, looks at the plan, and checks the result against gdalwarp.
+It uses gdalraster to read, a file shipped with vapour, and ximage to plot.
+
+```{r libraries, message = FALSE}
+library(rwarp)
+library(gdalraster)
+```
+
+## The source
+
+`sst.tif` in vapour is sea surface temperature in kelvin south of Tasmania:
+longitude 140 to 150 east, latitude 40 to 60 south, in pixels of 0.07
+degrees.
+
+```{r source}
+f  <- system.file("extdata", "sst.tif", package = "vapour")
+ds <- new(GDALRaster, f)
+src_crs <- ds$getProjectionRef()
+src_gt  <- ds$getGeoTransform()
+src_dim <- c(ds$getRasterXSize(), ds$getRasterYSize())
+src_dim
+```
+
+## The destination
+
+A destination is a CRS, a geotransform and a size. Here it's polar
+stereographic (EPSG:3031) at 10 km, over the source's bounding box, snapped
+to whole kilometres:
+
+```{r destination}
+dst_crs <- "EPSG:3031"
+res <- 10000
+bb  <- transform_bounds(c(140, -60, 150, -40), "EPSG:4326", dst_crs)
+ext <- c(floor(bb[1] / res), ceiling(bb[3] / res),
+         floor(bb[2] / res), ceiling(bb[4] / res)) * res   # xmin, xmax, ymin, ymax
+dst_dim <- as.integer(c(ext[2] - ext[1], ext[4] - ext[3]) / res)
+dst_gt  <- c(ext[1], res, 0, ext[4], 0, -res)
+dst_dim
+```
+
+## Plan
+
+`warp_plan()` works out, from geometry alone, the window of the source each
+chunk of the destination needs:
+
+```{r plan}
+plan <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+                  dst_size = dst_dim, resample = "bilinear")
+str(plan[[1]][[1]])
+```
+
+One chunk, reading the whole source. `fill_ratio` is low because the
+destination is a rectangle in polar stereographic and the source a wedge in
+it, so most of the area the destination maps onto in the source lies
+outside the source. `scale_x` and `scale_y` are how far the bilinear kernel
+widens: destination pixels are larger than source pixels here, and gdalwarp
+widens its kernels when it downsamples.
+
+## Warp
+
+`warp_exec()` runs a plan, calling `read_fn` for each chunk's window.
+gdalraster reads nodata as `NA`, and in double data rwarp treats `NaN` and
+`NA` as nodata.
+
+```{r warp}
+read_fn <- function(xoff, yoff, xsize, ysize) {
+  ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize)
+}
+sst <- warp_exec(plan, read_fn, src_crs, src_gt, dst_crs, dst_gt)
+dim(sst)
+```
+
+The result is a matrix in R's orientation, row 1 at the top. The source, in
+longitude and latitude, and the warp:
+
+```{r plot-warp}
+src <- matrix(read_fn(0, 0, src_dim[1], src_dim[2]), src_dim[2], byrow = TRUE)
+pal <- hcl.colors(96, "RdYlBu", rev = TRUE)
+zl  <- range(src, na.rm = TRUE) - 273.15
+op  <- par(mfrow = c(1, 2), mar = c(2.5, 2.5, 2, 0.5))
+ximage::ximage(src - 273.15, c(140, 150.01, -60.02, -40), zlim = zl, col = pal,
+               asp = 1 / cos(50 * pi / 180), main = "sst.tif, longitude and latitude")
+ximage::ximage(sst - 273.15, ext, zlim = zl, col = pal, asp = 1,
+               main = "warped to EPSG:3031, 10 km")
+par(op)
+```
+
+## Planning as gdalwarp does
+
+gdalwarp would not warp this destination in one piece. Its rule splits a
+chunk in two while the fill ratio is below 0.5 and the chunk is larger than
+100 pixels. `warp_plan()` follows gdalwarp's rules when told how gdalwarp
+sees the warp (see "Planning as gdalwarp does" in `?warp_plan`):
+
+```{r plan-gdalwarp}
+plan_g <- warp_plan(src_crs, src_gt, src_dim, dst_crs, dst_gt,
+                    dst_size = dst_dim, resample = "bilinear",
+                    nbands = 1L, working_type = "Float64", src_nodata = TRUE,
+                    min_fill_ratio = 0.5, min_dst_size = 100L,
+                    scale_origin = "output", split_antimeridian = FALSE)
+chunks <- do.call(rbind, lapply(plan_g[[1]], as.data.frame))
+chunks[c("dst_xoff", "dst_yoff", "dst_xsize", "dst_ysize", "src_xsize", "src_ysize", "fill_ratio")]
+```
+
+Each chunk reads only the source it needs:
+
+```{r plot-chunks, fig.height = 5}
+op <- par(mar = c(2.5, 2.5, 2, 0.5))
+ximage::ximage(sst - 273.15, ext, zlim = zl, col = pal, asp = 1,
+               main = "gdalwarp's chunks for this destination")
+x0 <- dst_gt[1] + chunks$dst_xoff * res
+y0 <- dst_gt[4] - chunks$dst_yoff * res
+rect(x0, y0 - chunks$dst_ysize * res, x0 + chunks$dst_xsize * res, y0, border = "grey20")
+text(x0 + chunks$dst_xsize * res / 2, y0 - chunks$dst_ysize * res / 2,
+     sprintf("%.2f", chunks$fill_ratio), cex = 0.8)
+par(op)
+```
+
+The numbers are each chunk's fill ratio. Chunks with no source at all are
+left out of the plan, as gdalwarp skips them.
+
+## The same as gdalwarp
+
+gdalwarp, through `gdalraster::warp()`, onto the same grid. `-ot Float64`
+and `-wt Float64` make it work and write in doubles, as rwarp does:
+
+```{r gdalwarp}
+sst_g <- warp_exec(plan_g, read_fn, src_crs, src_gt, dst_crs, dst_gt)
+
+out <- tempfile(fileext = ".tif")
+warp(f, out, t_srs = dst_crs, quiet = TRUE,
+     cl_arg = c("-te", ext[c(1, 3, 2, 4)], "-ts", dst_dim, "-r", "bilinear",
+                "-ot", "Float64", "-wt", "Float64"))
+g  <- new(GDALRaster, out)
+gd <- matrix(g$read(1L, 0, 0, dst_dim[1], dst_dim[2], dst_dim[1], dst_dim[2]),
+             dst_dim[2], byrow = TRUE)
+g$close()
+
+identical(is.na(sst_g), is.na(gd))     # the same pixels have data
+max(abs(sst_g - gd), na.rm = TRUE)     # and the same values, to rounding
+```
+
+The single-chunk plan reads the same pixels but differs a little, by up to
+`r signif(max(abs(sst - gd), na.rm = TRUE), 2)` K here: each chunk
+estimates its own kernel scale and approximates the transform along its own
+rows, so how the destination is chunked shows in the values.
+
+## Already have the pixels?
+
+`warp_exec()` is a loop over the plan's chunks. When you already hold the
+source pixels, `warp_buffer()` warps one window into one destination window,
+the step `warp_exec()` runs for each chunk. Here the whole source, which is
+what the one-chunk plan read:
+
+```{r buffer}
+v <- read_fn(0, 0, src_dim[1], src_dim[2])
+sst_b <- warp_buffer(v, src_crs, src_gt, dst_crs, dst_gt, dst_size = dst_dim,
+                     src_size = src_dim, resample = "bilinear")
+identical(sst_b, sst)
+```
+
+```{r close, include = FALSE}
+ds$close()
+```
+
+## Where next
+
+- [Sentinel-2: two UTM zones onto one grid](https://hypertidy.github.io/rwarp/r/articles/sentinel2-warp.html):
+  three bands from two tiles in different zones, mosaicked as gdalwarp
+  mosaics them, the same as gdalwarp's to 1e-11.
+- [GHRSST SST onto Antarctic polar stereographic](https://hypertidy.github.io/rwarp/r/articles/ghrsst-polar.html):
+  a window of a global 0.01 degree COG, and the read function as the place
+  to swap readers.
+- `vignette("plan-inspect", package = "rwarp")`: what a plan holds, fill
+  ratios, and tiling a large destination.
+- `vignette("crs-strings", package = "rwarp")`: what PROJ makes of the
+  strings you give it.
+- [The rwarp book](https://hypertidy.github.io/rwarp/): the Rust crate
+  underneath, and how its results compare with GDAL's.

@@ -3,7 +3,9 @@
 The [`rwarp-r/`](https://github.com/hypertidy/rwarp/tree/main/rwarp-r)
 subdirectory of this repository is an R package, also named **rwarp**, that
 exposes the same planning and resampling pipeline via
-[extendr](https://extendr.github.io/).
+[extendr](https://extendr.github.io/). Its website, with the function
+reference and articles, is
+**<https://hypertidy.github.io/rwarp/r/>**.
 
 ## Installation
 
@@ -180,19 +182,19 @@ crs_describe("+proj=merc +datum=WGS84 +type=crs") # works
 The CRS string pitfalls are covered in depth in the **CRS Strings**
 vignette (`vignette("crs-strings", package = "rwarp")`).
 
-## Vignettes
+## Articles
 
-| Vignette | What it shows |
+| Article | What it shows |
 |---|---|
-| `sentinel2-warp` | Two Sentinel-2 tiles in different UTM zones, three bands as float reflectance, onto one Albers grid; checked against gdalwarp |
-| `ghrsst-polar` | Reproject global SST to Antarctic Polar Stereographic via byte-range concept |
-| `crs-strings` | Diagnosing `+proj=` string pitfalls with `crs_describe()` |
-| `plan-inspect` | Fill ratios, antimeridian splits, tiled execution loops |
+| [Get started](https://hypertidy.github.io/rwarp/r/articles/rwarp.html) | Plan, warp and check against gdalwarp, on a file shipped with vapour |
+| [Sentinel-2: two UTM zones onto one grid](https://hypertidy.github.io/rwarp/r/articles/sentinel2-warp.html) | Two Sentinel-2 tiles in different UTM zones, three bands as float reflectance, onto one Albers grid; checked against gdalwarp |
+| [GHRSST SST onto Antarctic polar stereographic](https://hypertidy.github.io/rwarp/r/articles/ghrsst-polar.html) | A window of a global COG to a polar grid, and the byte-range read path as a concept |
+| [Warp planning](https://hypertidy.github.io/rwarp/r/articles/plan-inspect.html) | Fill ratios, antimeridian splits, tiled execution loops |
+| [CRS strings](https://hypertidy.github.io/rwarp/r/articles/crs-strings.html) | Diagnosing `+proj=` string pitfalls with `crs_describe()` |
 
-```r
-vignette("sentinel2-warp",  package = "rwarp")
-vignette("plan-inspect",    package = "rwarp")
-```
+Get started, warp planning and CRS strings are installed with the package
+(`vignette("rwarp", package = "rwarp")`). The Sentinel-2 and GHRSST
+articles read from the network, so they are on the website only.
 
 ## Alongside vapour, gdalraster and terra
 
