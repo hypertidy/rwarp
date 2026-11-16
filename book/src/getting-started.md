@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-rwarp = "0.3"
+rwarp = "0.4"
 ```
 
 For unreleased changes on `main`, depend on the repository:

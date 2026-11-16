@@ -7,7 +7,7 @@ exposes the same planning and resampling pipeline via
 
 ## Installation
 
-Requires a Rust toolchain (>= 1.75) and PROJ (>= 9.0):
+Requires a Rust toolchain (>= 1.86), pkg-config, and PROJ (>= 9.6.2):
 
 ```r
 # install.packages("remotes")
@@ -70,7 +70,8 @@ result <- warp_exec(
     as.integer(ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize)),
   src_crs  = src_crs,  src_gt  = src_gt,
   dst_crs  = dst_crs,  dst_gt  = dst_gt,
-  dst_size = dst_dim,  nodata  = -32768L
+  dst_size = dst_dim,
+  src_nodata = -32768L, dst_nodata = -32768L
 )
 ds$close()
 
@@ -96,8 +97,9 @@ result <- warp_exec(plan, read_fn = read_fn, ...)
 
 ## Inspecting the plan
 
-The list returned by `warp_plan()` has one entry per destination chunk,
-each containing source offset, source size, and fill ratio:
+`warp_plan()` returns a list holding one chunk list. Each chunk has its
+destination window, its source window, its fill ratio and the kernel
+scale it was planned for:
 
 ```r
 plan <- warp_plan(
@@ -108,31 +110,32 @@ plan <- warp_plan(
   dst_size = c(512L, 512L)
 )
 
-## how many source chunks?
-length(plan)
+## how many chunks?
+length(plan[[1]])
 
-## first chunk
-str(plan[[1]])
-# List of 4
-#  $ xoff      : int ...
-#  $ yoff      : int ...
-#  $ fill_ratio: num ...   # 0-1; < 0.05 often not worth fetching
-#  $ ...
+## the first chunk
+str(plan[[1]][[1]])
+# List of 11
+#  $ dst_xoff  : int 0
+#  $ dst_yoff  : int 0
+#  $ dst_xsize : int 512
+#  $ dst_ysize : int 512
+#  $ src_xoff  : int 0
+#  $ src_yoff  : int 0
+#  $ src_xsize : int 3600
+#  $ src_ysize : int 1800
+#  $ fill_ratio: num 1.06
+#  $ scale_x   : num 0.143
+#  $ scale_y   : num 0.778
 ```
 
-Skip chunks with a very low fill ratio to avoid fetching data that
-contributes almost nothing to the output:
+`warp_plan(min_fill_ratio = )` splits chunks with a low fill ratio into
+smaller ones, so less is read. To skip chunks that contribute almost
+nothing, drop them from the plan before executing it:
 
 ```r
-result <- warp_exec(
-  plan,
-  read_fn = function(xoff, yoff, xsize, ysize) {
-    ## caller decides whether to actually read
-    as.integer(ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize))
-  },
-  min_fill = 0.05,   ## skip chunks below 5 % coverage
-  ...
-)
+plan[[1]] <- Filter(function(ch) ch$fill_ratio >= 0.05, plan[[1]])
+result <- warp_exec(plan, read_fn = read_fn, ...)
 ```
 
 ## CRS diagnostics
@@ -174,19 +177,22 @@ vignette("sentinel2-warp",  package = "rwarp")
 vignette("plan-inspect",    package = "rwarp")
 ```
 
-## Relationship to vapour
+## Alongside vapour, gdalraster and terra
 
-rwarp has the same feature set in mind as `vapour::gdal_raster_data()` and
-the `gdal_raster_*` family. A few things the pipeline adds:
+The usual way to reproject in R is through GDAL's warper:
+`vapour::gdal_raster_data()` and the `gdal_raster_*` family,
+`gdalraster::warp()` and `terra::project()`. For reading and writing
+ordinary raster files they remain the natural choices. rwarp covers the
+same reprojection, with the steps apart, which helps when:
 
-- The read step is **user-supplied**: any source, not just GDAL files.
-- The plan is **inspectable**: fill ratios and source windows are
+- The read step should be **user-supplied**: any source, not just GDAL files.
+- The plan should be **inspectable**: fill ratios and source windows are
   available before any I/O.
-- The warp kernel is **pure Rust**: no GDAL warp dependency, so it
+- The warp kernel should be **pure Rust**: no GDAL warp dependency, so it
   can compile to WebAssembly and run in the browser.
 
-For reading and writing ordinary raster files, vapour and gdalraster
-remain the natural choices.
+The two work together: the example above reads with gdalraster and warps
+with rwarp.
 
 ## Source and issues
 

@@ -103,7 +103,7 @@ result <- warp_exec(
     as.integer(ds$read(1L, xoff, yoff, xsize, ysize, xsize, ysize)),
   src_crs = src_crs, src_gt = src_gt,
   dst_crs = dst_crs, dst_gt = dst_gt,
-  dst_size = dst_dim, nodata = -32768L
+  dst_size = dst_dim, src_nodata = -32768L, dst_nodata = -32768L
 )
 ximage::ximage(result, dst_ext)
 ds$close()
