@@ -282,9 +282,9 @@ dependencies = [
 
 [[package]]
 name = "rwarp"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8a597dd05caa25142adafa9760b8fde9b8ca97fbc5d04e847175734783a9bcd"
+checksum = "c172fd7c61de395bdbeb668be71cc0de2c64c1fd7cdc8f6d8011421edb8cec14"
 dependencies = [
  "controlledburn",
  "proj",
