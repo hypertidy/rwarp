@@ -4,6 +4,28 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ## Unreleased
 
+### Fixed
+
+- The exact footprint (`Footprint::Exact`, `exact_weights`) across a
+  geographic source's antimeridian and around a pole (#36, the cases #11's
+  comparison found). A destination pixel whose outline crosses the
+  source's seam is unwrapped and measured at each whole-period offset that
+  reaches the source; one that goes around a pole is closed along the
+  pole's row. On a global 1 degree grid to 41 x 41 polar stereographic
+  pixels, the weights no longer depend on where the source's seam is (to
+  5e-14), every pixel's weights sum to its outline's area, and the pole
+  pixel's converge to the polar cap at second order in densify; before,
+  weights across the seam were off by up to 0.92.
+
+### Added
+
+- `Transformer::source_wrap` and `transform::SourceWrap`: a transformer
+  reports a source that wraps in longitude (its period in source pixels
+  and the rows of the poles), for the exact footprint. Default `None`;
+  `GenImgProjTransformer` reports it for a north-up geographic source of
+  at most 360 degrees wrapped around a centre longitude (after
+  `with_source_size`), and `ApproxTransformer` passes it through.
+
 ### Changed
 
 - Decision N1 (#43): coverage uses the equal-area map on every mesh.

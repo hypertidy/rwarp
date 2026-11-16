@@ -305,6 +305,10 @@ impl<T: Transformer> ApproxTransformer<T> {
 }
 
 impl<T: Transformer> Transformer for ApproxTransformer<T> {
+    fn source_wrap(&self) -> Option<crate::transform::SourceWrap> {
+        self.inner.source_wrap()
+    }
+
     fn transform(
         &self,
         dst_to_src: bool,
