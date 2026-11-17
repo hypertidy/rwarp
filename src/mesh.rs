@@ -116,10 +116,11 @@
 //! world point, and each cell gets its coverage as anywhere else. The two
 //! walls need to agree only to rounding.
 //!
-//! Not covered: coordinates that jump at the seam, such as longitudes
-//! 360 degrees apart, where the seam's two walls are different places in
-//! the plane. A tripolar grid can't be given in longitude and latitude
-//! anyway, since the geographic pole is inside one of its cells.
+//! Coordinates that jump at the seam, such as longitudes 360 degrees
+//! apart, put the seam's two walls in different places in the plane:
+//! declare the period, below. A tripolar grid can't be given in longitude
+//! and latitude anyway, since the geographic pole is inside one of its
+//! cells.
 //!
 //! ```
 //! use controlledburn::{BurnOptions, Coord, Geometry, Polygon};
@@ -156,6 +157,56 @@
 //! assert!((area - 400.0).abs() < 1e-3, "{area}");
 //! // cells either side of the seam share it
 //! assert!(res.edges.iter().any(|e| e.col == 0) && res.edges.iter().any(|e| e.col == 23));
+//! ```
+//!
+//! # Longitude: a declared period
+//!
+//! [`QuadMesh::with_period`] (and [`Rectilinear::with_period`]) declares
+//! world x periodic, 360 for longitude in degrees. Polygons are then
+//! burned at each whole period at which they overlap the mesh, points are
+//! found at any whole period, and a mesh source
+//! ([`MeshTransformer`]) takes destination outlines across its seam and
+//! round a pole. Where the seam is, and which longitudes the polygons are
+//! given in, make no difference beyond rounding. Corners must be
+//! continuous: [`unwrap_grid`] and [`unwrap_bounds`] unwrap longitudes
+//! stored with a jump, as from `[-180, 180)` or `[0, 360)`.
+//!
+//! ```
+//! use controlledburn::{BurnOptions, Coord, Geometry, Polygon};
+//! use rwarp::mesh::{CellMap, QuadMesh};
+//!
+//! // a global grid of 10 degree cells from 0 to 360, row 0 at the north
+//! let (ncol, nrow) = (36, 18);
+//! let (mut x, mut y) = (Vec::new(), Vec::new());
+//! for j in 0..=nrow {
+//!     for i in 0..=ncol {
+//!         x.push(10.0 * i as f64);
+//!         y.push(90.0 - 10.0 * j as f64);
+//!     }
+//! }
+//! let mesh = QuadMesh::from_corners(ncol, nrow, x, y, CellMap::EqualArea)
+//!     .unwrap()
+//!     .with_period(360.0)
+//!     .unwrap();
+//!
+//! // a square of 400 square degrees across the seam, from 10 W to 10 E
+//! let sq = [[-10.0, 0.0], [10.0, 0.0], [10.0, 20.0], [-10.0, 20.0], [-10.0, 0.0]];
+//! let ring = sq.iter().map(|p| Coord { x: p[0], y: p[1] }).collect();
+//! let res = mesh
+//!     .burn(&[Geometry::Polygon(Polygon { rings: vec![ring] })], BurnOptions::coverage())
+//!     .unwrap();
+//! let mut area = 0.0;
+//! for run in &res.runs {
+//!     for c in run.col_start..run.col_end {
+//!         area += mesh.cell_area(run.row as usize, c as usize);
+//!     }
+//! }
+//! assert_eq!(area, 400.0);
+//! // the first and last columns
+//! let mut cols: Vec<i32> = res.runs.iter().flat_map(|r| r.col_start..r.col_end).collect();
+//! cols.sort();
+//! cols.dedup();
+//! assert_eq!(cols, vec![0, 35]);
 //! ```
 //!
 //! # CF bounds, SCRIP corners and halos
@@ -261,11 +312,14 @@
 use std::sync::OnceLock;
 
 mod cf;
+mod period;
 mod rect;
 mod source;
 mod walk;
 
 pub use cf::Halo;
+pub use period::{unwrap_bounds, unwrap_grid};
+pub(crate) use period::Period;
 pub use rect::Rectilinear;
 pub use source::MeshTransformer;
 
@@ -323,6 +377,8 @@ pub struct QuadMesh {
     buckets: OnceLock<Buckets>,
     /// The outer sides in a bucket grid, for where a segment enters.
     sides: OnceLock<Buckets>,
+    /// A declared period of world x ([`QuadMesh::with_period`]).
+    period: Option<Period>,
 }
 
 impl QuadMesh {
@@ -335,7 +391,9 @@ impl QuadMesh {
     /// with area do not all have the same orientation (a fold: cells
     /// overlap, as on an overlapping swath scan, and location would be
     /// ambiguous; build one mesh per scan instead, see the
-    /// [module docs](crate::mesh#overlapping-swaths-one-mesh-per-scan)). Zero-area
+    /// [module docs](crate::mesh#overlapping-swaths-one-mesh-per-scan);
+    /// or longitudes that jump at a seam, which [`unwrap_grid`] makes
+    /// continuous). Zero-area
     /// cells (collapsed corners, or an area zero to rounding) are allowed;
     /// they contain no point, and a ring may cross them (their coverage
     /// fraction then weighs nothing).
@@ -353,7 +411,25 @@ impl QuadMesh {
         y: Vec<f64>,
         map: CellMap,
     ) -> Result<Self, String> {
-        let sign = validate_corners(ncol, nrow, &x, &y)?;
+        Self::from_corners_with_hint(ncol, nrow, x, y, map, "unwrap_grid")
+    }
+
+    /// [`QuadMesh::from_corners`], naming `helper` in the hint for
+    /// longitudes that jump at a seam.
+    pub(crate) fn from_corners_with_hint(
+        ncol: usize,
+        nrow: usize,
+        x: Vec<f64>,
+        y: Vec<f64>,
+        map: CellMap,
+        helper: &str,
+    ) -> Result<Self, String> {
+        let sign = validate_corners(ncol, nrow, &x, &y).map_err(|e| {
+            let hint = (x.len() == (ncol + 1) * (nrow + 1))
+                .then(|| period::seam_hint(ncol + 1, &x, helper))
+                .flatten();
+            e + hint.as_deref().unwrap_or("")
+        })?;
         let mut mesh = QuadMesh {
             ncol,
             nrow,
@@ -364,6 +440,7 @@ impl QuadMesh {
             cells: Vec::with_capacity(ncol * nrow),
             buckets: OnceLock::new(),
             sides: OnceLock::new(),
+            period: None,
         };
 
         for r in 0..nrow {
@@ -487,12 +564,15 @@ impl QuadMesh {
     }
 
     /// Whether cell `(row, col)` owns the world point `p` (see the module
-    /// docs for the rule on shared sides).
+    /// docs for the rule on shared sides), in the plane: a declared period
+    /// doesn't apply.
     pub fn contains(&self, row: usize, col: usize, p: [f64; 2]) -> bool {
         self.triangle(row, col, p).is_some()
     }
 
-    /// The cell that owns `p`, starting the search at `hint` when given.
+    /// The cell that owns `p`, starting the search at `hint` when given;
+    /// with a declared period ([`QuadMesh::with_period`]), at any whole
+    /// period.
     ///
     /// With a hint, the search walks cell to cell towards `p` (O(1) when
     /// `p` is near the hint, as consecutive points of a ring or a
@@ -500,6 +580,34 @@ impl QuadMesh {
     /// bucket index over the cells' bounding boxes (built on first use)
     /// finds it.
     pub fn locate(&self, p: [f64; 2], hint: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        match self.period {
+            None => self.locate_planar(p, hint),
+            Some(_) => self.locate_shifted(p, hint).map(|(cell, _)| cell),
+        }
+    }
+
+    /// [`QuadMesh::locate`] with a period: the cell, and `p` moved by the
+    /// whole periods that put it there.
+    fn locate_shifted(
+        &self,
+        p: [f64; 2],
+        hint: Option<(usize, usize)>,
+    ) -> Option<((usize, usize), [f64; 2])> {
+        let Some(per) = self.period else {
+            return self.locate_planar(p, hint).map(|c| (c, p));
+        };
+        per.point_shifts(p[0]).find_map(|s| {
+            let q = if s == 0.0 { p } else { [p[0] + s, p[1]] };
+            self.locate_planar(q, hint).map(|c| (c, q))
+        })
+    }
+
+    /// [`QuadMesh::locate`] in the plane, whatever the period.
+    pub(crate) fn locate_planar(
+        &self,
+        p: [f64; 2],
+        hint: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
         if !(p[0].is_finite() && p[1].is_finite()) {
             return None;
         }
@@ -529,29 +637,40 @@ impl QuadMesh {
             .map(|k| (k / self.ncol, k % self.ncol))
     }
 
-    /// Every cell that owns `p`. For a valid mesh this is at most one;
-    /// the method exists to check that.
+    /// Every cell that owns `p` (at any whole period, with a declared
+    /// period). For a valid mesh this is at most one; the method exists to
+    /// check that.
     pub fn locate_all(&self, p: [f64; 2]) -> Vec<(usize, usize)> {
         if !(p[0].is_finite() && p[1].is_finite()) {
             return Vec::new();
         }
-        self.buckets()
-            .candidates(p)
-            .filter(|&k| self.contains(k / self.ncol, k % self.ncol, p))
-            .map(|k| (k / self.ncol, k % self.ncol))
-            .collect()
+        let mut out = Vec::new();
+        let mut at = |q: [f64; 2]| {
+            out.extend(
+                self.buckets()
+                    .candidates(q)
+                    .filter(|&k| self.contains(k / self.ncol, k % self.ncol, q))
+                    .map(|k| (k / self.ncol, k % self.ncol)),
+            )
+        };
+        match self.period {
+            None => at(p),
+            Some(per) => per.point_shifts(p[0]).for_each(|s| at([p[0] + s, p[1]])),
+        }
+        out
     }
 
     /// World point to index space `[col, row]` (fractional), or `None`
-    /// outside the mesh.
+    /// outside the mesh; with a declared period, at any whole period.
     pub fn to_index(&self, p: [f64; 2], hint: Option<(usize, usize)>) -> Option<[f64; 2]> {
-        let (r, c) = self.locate(p, hint)?;
-        let [u, v] = self.local(r, c, p)?;
+        let ((r, c), q) = self.locate_shifted(p, hint)?;
+        let [u, v] = self.local(r, c, q)?;
         Some([c as f64 + u, r as f64 + v])
     }
 
     /// Index space `[col, row]` to world, for `0 <= col <= ncol` and
-    /// `0 <= row <= nrow`; `None` outside.
+    /// `0 <= row <= nrow`; `None` outside. World x is in the corners' own
+    /// range, with a declared period too.
     pub fn to_world(&self, idx: [f64; 2]) -> Option<[f64; 2]> {
         let [ci, ri] = idx;
         if !(ci >= 0.0 && ri >= 0.0 && ci <= self.ncol as f64 && ri <= self.nrow as f64) {

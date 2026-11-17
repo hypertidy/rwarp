@@ -314,7 +314,9 @@ particular:
   world-area fractions for quadrilateral cells (convex, and the non-convex
   cases the note accepts);
 - `Topology::{PeriodicCols, Tripolar}`, the antimeridian (unwrap and add the
-  ring at offsets −P, 0, +P) and poles.
+  ring at offsets −P, 0, +P) and poles. Built without a topology: walls
+  that meet in the world are crossed with nothing declared (4a), and a
+  period declared on the mesh does the rest (4e).
 
 For conservative regridding, the curvilinear destination's cells come from
 corner bounds (CF `bounds`, SCRIP corners), as ESMF defines them, not from
@@ -325,7 +327,11 @@ built. `QuadMesh::from_cf_bounds` reads CF bounds and SCRIP corners
 (4b), and `mesh::MeshTransformer` makes the mesh a source for
 `exact_weights` and `warp()` (4d). Against ESMF the weights agree to
 rounding in the mesh's plane, with the spherical differences recorded
-(`tests/esmf_tripolar.rs`, 4c). A mesh as the destination isn't built.
+(`tests/esmf_tripolar.rs`, 4c). A mesh in longitude declares its period
+(`QuadMesh::with_period`, 4e): outlines across its seam and round a pole
+are measured as for geolocation arrays, and the southern rows of an ORCA
+grid are a mesh in longitude and latitude. A mesh as the destination
+isn't built.
 
 ## 7. Stage 5: meshes
 

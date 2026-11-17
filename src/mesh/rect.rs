@@ -11,7 +11,8 @@
 
 use controlledburn::{BurnOptions, BurnResult, CoverageWindow, Geometry};
 
-use super::walk::burn_with;
+use super::walk::{burn_with, cover_rings, turn_shifts};
+use super::Period;
 
 /// A rectilinear grid by its edges: `x` has `ncol + 1` values, `y` has
 /// `nrow + 1`, row 0 between `y[0]` and `y[1]`.
@@ -19,6 +20,8 @@ use super::walk::burn_with;
 pub struct Rectilinear {
     x: Vec<f64>,
     y: Vec<f64>,
+    /// A declared period of x ([`Rectilinear::with_period`]).
+    period: Option<Period>,
 }
 
 fn monotone(v: &[f64]) -> bool {
@@ -61,7 +64,42 @@ impl Rectilinear {
                     .into(),
             );
         }
-        Ok(Rectilinear { x, y })
+        Ok(Rectilinear { x, y, period: None })
+    }
+
+    /// The grid with x periodic with `period` (360 for longitude in
+    /// degrees), as [`QuadMesh::with_period`](super::QuadMesh::with_period)
+    /// says: polygons are burned at each whole period at which they
+    /// overlap the grid, and [`Rectilinear::cell`] finds a point at any
+    /// whole period. [`Rectilinear::to_index`] and
+    /// [`Rectilinear::ring_to_index`] take points where they are.
+    ///
+    /// For a global grid whose column edges run once round, such as a
+    /// Gaussian grid's from 0 to 360, with polygons from -180 to 180.
+    ///
+    /// Errors when `period` isn't finite and positive, when a column is
+    /// half a period wide or more, or when the grid is wider than the
+    /// period by half a column or more: it would go round more than once.
+    pub fn with_period(mut self, period: f64) -> Result<Self, String> {
+        let [lo, hi] = super::period::range_of(&self.x);
+        let p = Period::new(period, [lo, hi])?;
+        if let Some(c) = self.x.windows(2).position(|w| (w[1] - w[0]).abs() >= period / 2.0) {
+            return Err(format!("column {c} is half the period ({period}) wide or more"));
+        }
+        let centres = self.x.windows(2).map(|w| 0.5 * (w[0] + w[1]));
+        let [c0, c1] = super::period::range_of(&centres.collect::<Vec<_>>());
+        if c0 + period < hi || c1 - period > lo {
+            return Err(format!(
+                "the columns span {lo} to {hi}, more than a period ({period}): the grid would go round more than once"
+            ));
+        }
+        self.period = Some(p);
+        Ok(self)
+    }
+
+    /// The declared period of x ([`Rectilinear::with_period`]).
+    pub fn period(&self) -> Option<f64> {
+        self.period.map(|p| p.period)
     }
 
     pub fn ncol(&self) -> usize {
@@ -77,11 +115,18 @@ impl Rectilinear {
         [axis(&self.x, p[0]), axis(&self.y, p[1])]
     }
 
-    /// The cell holding `p`, if inside the grid (low walls inclusive).
+    /// The cell holding `p`, if inside the grid (low walls inclusive);
+    /// with a declared period, at any whole period.
     pub fn cell(&self, p: [f64; 2]) -> Option<(usize, usize)> {
-        let [c, r] = self.to_index(p);
-        (c >= 0.0 && r >= 0.0 && c < self.ncol() as f64 && r < self.nrow() as f64)
-            .then_some((r as usize, c as usize))
+        let at = |p: [f64; 2]| {
+            let [c, r] = self.to_index(p);
+            (c >= 0.0 && r >= 0.0 && c < self.ncol() as f64 && r < self.nrow() as f64)
+                .then_some((r as usize, c as usize))
+        };
+        match self.period {
+            None => at(p),
+            Some(per) => per.point_shifts(p[0]).find_map(|s| at([p[0] + s, p[1]])),
+        }
     }
 
     /// A world ring (closed implicitly) in index space, with a vertex at
@@ -156,6 +201,7 @@ impl Rectilinear {
             geoms,
             opts.into(),
             threads,
+            self.period,
             &|r| Ok(self.ring_to_index(r)),
             &|p, _| self.cell(p),
         )
@@ -164,20 +210,31 @@ impl Rectilinear {
     /// Exact coverage of one small world ring through a reused
     /// [`CoverageWindow`], as [`QuadMesh::cover_ring`](super::QuadMesh::cover_ring).
     /// The window may extend beyond the grid; cells outside it are the
-    /// caller's to ignore.
+    /// caller's to ignore. With a declared period the ring is taken at
+    /// each whole period at which it overlaps the grid, and the window
+    /// spans all of them: across the seam, the grid's full width and a
+    /// column or so beyond each end.
+    ///
+    /// False, with an empty window, when the ring has a coordinate that
+    /// isn't finite or, with a period, is at no whole period over the
+    /// grid or would be taken at more than 16.
     pub fn cover_ring(&self, ring: &[[f64; 2]], win: &mut CoverageWindow) -> bool {
-        let ir = self.ring_to_index(ring);
-        if ir.len() < 3 {
+        let Ok(shifts) = turn_shifts(self.period, ring.iter().map(|p| p[0])) else {
             win.reset(0, 0, 0, 0);
             return false;
+        };
+        let mut rings = Vec::with_capacity(shifts.len());
+        for s in shifts {
+            let ir = if s == 0.0 {
+                self.ring_to_index(ring)
+            } else {
+                let moved: Vec<[f64; 2]> = ring.iter().map(|p| [p[0] + s, p[1]]).collect();
+                self.ring_to_index(&moved)
+            };
+            if ir.len() >= 3 {
+                rings.push(ir);
+            }
         }
-        let xs: Vec<f64> = ir.iter().map(|p| p[0]).collect();
-        let ys: Vec<f64> = ir.iter().map(|p| p[1]).collect();
-        if !win.reset_to_ring(&xs, &ys) {
-            return false;
-        }
-        win.add_ring(&xs, &ys, 1.0);
-        win.resolve();
-        true
+        cover_rings(&rings, win)
     }
 }

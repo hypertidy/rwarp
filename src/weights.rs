@@ -110,7 +110,9 @@
 //! width, and its weights are wrong. Over source world cells the same is
 //! done in world coordinates, a turn being 360 degrees, when the cells'
 //! longitudes wrap
-//! ([`SourceCells::lon_wrap`](crate::transform::SourceCells::lon_wrap));
+//! ([`SourceCells::lon_wrap`](crate::transform::SourceCells::lon_wrap)),
+//! or the period declared on a mesh source
+//! ([`QuadMesh::with_period`](crate::mesh::QuadMesh::with_period));
 //! geolocation arrays over a pole fall back to source pixel space
 //! ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)).
 //! The spherical measure takes cell edges straight in
