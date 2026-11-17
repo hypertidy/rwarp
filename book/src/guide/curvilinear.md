@@ -427,6 +427,7 @@ On the same files (scratch), at a tolerance of 1 m:
 | A whole-world box | every cell kept covered in full | the same |
 | Five boxes on 1° lines (Arctic, Antarctic, across 180°, across 20 S), against `weights_onto` from a 1° indicator at densify 64 | 8e-6 | 6e-6 |
 | Natural Earth 10 m countries (258, 548k vertices) | 0.74 s | 1.1 s |
+| The same with `burn_par` on 8 threads | 0.40 s | 0.44 s |
 
 The comparison is two separate walks: a polygon into the mesh's index
 space, and each cell's outline into the source's pixels. On a 30° wide
@@ -441,6 +442,13 @@ runs of edges away from it are cut short. That doesn't change the
 result: the walk sees the same crossings and the same winding round its
 interior point. What's left of the time is projecting the polygons and
 walking the edges that are near.
+
+`MeshSet::burn_par(geoms, bands, tolerance, opts, threads)` gives the
+same records on several threads. The pieces filter, walk and burn their
+polygons in parallel. Projecting into each band stays on the calling
+thread, since a libproj transform can't be shared between threads. That
+is the floor: about 0.3 s for the countries at 1 m, and 1.6 s at
+0.01 m, where 8 threads take ORCA2 from 5.6 s to 2.2 s.
 
 ### Overlapping swaths
 
