@@ -116,7 +116,8 @@ pub trait Transformer {
     /// Geolocation sources report it
     /// ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)),
     /// and so does a mesh source
-    /// ([`MeshTransformer`](crate::mesh::MeshTransformer)).
+    /// ([`MeshTransformer`](crate::mesh::MeshTransformer)); a mesh target
+    /// ([`MeshTarget`](crate::mesh::MeshTarget)) passes its source's on.
     fn source_cells(&self) -> Option<&dyn SourceCells> {
         None
     }

@@ -67,6 +67,19 @@
 //! Destination outlines are walked onto the mesh, across a seam or fold,
 //! as for any ring. [`QuadMesh::window`] gives a source window's cells.
 //!
+//! # A mesh as a warp target
+//!
+//! [`MeshTarget`] makes a mesh the target, for data on a grid (or on
+//! geolocation arrays, or on another mesh) regridded onto a curvilinear
+//! grid such as an ocean model's. Its target pixels are the mesh's cells,
+//! and each goes to the mesh's world coordinates and then through an inner
+//! transformer to the source ([`MeshTarget::from_grid`] for a grid with a
+//! CRS, or any transformer whose destination geotransform is
+//! [`WORLD_GT`]). [`exact_weights`](crate::weights::exact_weights) then
+//! gives conservative weights onto the mesh, each cell measured as a
+//! target pixel in the source's space, and [`warp`](crate::warp::warp)
+//! regrids onto it, with point kernels sampling each cell's centre.
+//!
 //! # Ownership
 //!
 //! Every point of the mesh belongs to exactly one cell. Orientation tests
@@ -315,6 +328,7 @@ mod cf;
 mod period;
 mod rect;
 mod source;
+mod target;
 mod walk;
 
 pub use cf::Halo;
@@ -322,6 +336,7 @@ pub use period::{unwrap_bounds, unwrap_grid};
 pub(crate) use period::Period;
 pub use rect::Rectilinear;
 pub use source::MeshTransformer;
+pub use target::{MeshTarget, WORLD_GT};
 
 use crate::geoloc_transform::inverse_bilinear;
 

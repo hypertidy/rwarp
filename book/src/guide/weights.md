@@ -58,6 +58,13 @@ It is measured the same way, in the mesh's world coordinates, and the
 outlines are walked across the mesh's seam and fold. See
 [Curvilinear grids](curvilinear.md#warping-from-a-mesh).
 
+A mesh is a target through `MeshTarget`: each of its cells is a target
+pixel, its outline the cell itself (sides straight in the mesh's
+coordinates, densified), measured in the source's space. So `frac` is a
+cell's share of each source pixel, under any measure the source takes
+(`lonlat_measure` for areas on the sphere), and `dst_area` is the cell's
+measure there. See [Curvilinear grids](curvilinear.md#warping-onto-a-mesh).
+
 `frac` is relative to the source cell, not the target, so it doesn't depend
 on how the target is normalised. `dst_area` gives either normalisation:
 
@@ -185,6 +192,7 @@ columns.
   set of arrays, so every chunk of a warp uses the same measure.
 - **Destination cells are what a transformer describes.** A curvilinear
   target works through `GenImgGeolocTransformer` with its bilinear cell
-  definition. A mesh is a source only (`MeshTransformer`). The reverse
-  map, onto a mesh, uses the same overlaps normalised by the mesh cell's
-  area, and isn't built.
+  definition, or as a mesh through `MeshTarget`, whose cells are the
+  mesh's. Onto a mesh, the overlaps are measured in the source's space,
+  so a cell's sides are only as straight there as `densify` makes them:
+  near a pole, in longitude and latitude, use more.

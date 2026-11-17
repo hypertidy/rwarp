@@ -293,6 +293,51 @@ Against ESMF, on an analytic tripolar cap with a seam and a fold
   weights differ by up to 2.6e-3 and cell areas by up to 9e-4. The area
   difference falls with the square of cell size.
 
+### Warping onto a mesh
+
+`MeshTarget` makes a mesh the target: its pixels are the mesh's cells,
+`ncol` by `nrow` (`target_size`), one value each. Each target pixel goes to
+the mesh's coordinates and then to the source. `from_grid` does that for a
+grid with a CRS, wrapping a longitude/latitude source's longitudes as
+gdalwarp does, so cells across its seam or over a pole are measured
+whole. `MeshTarget::new(mesh, inner)` takes any transformer whose
+destination geotransform is `WORLD_GT`: geolocation arrays, or another
+mesh through `MeshTransformer`.
+
+```rust,ignore
+use rwarp::mesh::MeshTarget;
+use rwarp::weights::{exact_weights, lonlat_measure, GridWindow, WeightOptions};
+
+// a global 0.25 degree grid onto the eORCA1 mesh above, in LAEA on the
+// north pole; areas on the sphere
+let laea = "+proj=laea +lat_0=90 +lon_0=0 +R=6371229 +units=m";
+let src_gt = [-180.0, 0.25, 0.0, 90.0, 0.0, -0.25];
+let t = MeshTarget::from_grid("+proj=longlat +R=6371229", src_gt, [1440, 720], mesh, laea)?;
+let [w, h] = t.target_size();
+let opts = WeightOptions::new(8).with_measure(lonlat_measure(src_gt).unwrap());
+let wts = exact_weights(&t, &GridWindow::new(1440, 720), w, h, &opts);
+```
+
+Each cell is measured on its own, so the mesh's seam and fold don't
+matter on this side. Its outline is the cell, sides straight in the
+mesh's coordinates, taken to the source at `densify` points per side and
+joined straight there. Near the pole, in longitude and latitude, that
+needs a higher `densify`: the cell over the pole has its corners 90
+degrees of longitude apart. `warp` onto the mesh works the same way, with
+point kernels such as `Bilinear` sampling each cell's centre.
+
+Against ESMF, on the same tripolar cap as the target:
+
+- **ESMF in the same plane** (Cartesian) has the same cells, and the
+  weights agree to rounding. That holds from a grid in the plane, and
+  mesh to mesh from a lon/lat grid's corners in the plane.
+- **ESMF on the sphere.** The weights differ more this way round, by up
+  to 3e-2 on the cap's smallest cells, 13 to 55 km across near its grid
+  poles. There, a long source edge drawn as a great circle rather than a
+  straight line moves a large share of a small cell. From a grid in the
+  plane, over cells more than 100 km across, the difference is 3e-3, as
+  in the other direction.
+
 ### Overlapping swaths
 
 A mesh is one sheet: `from_corners` refuses cells of both orientations,
