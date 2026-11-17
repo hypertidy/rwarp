@@ -232,7 +232,9 @@
 //! a mask says they may go (land), and covers the rest with rectangular
 //! [`Piece`]s, each a mesh of its own. [`MeshSet::weights_to`] and
 //! [`MeshSet::weights_onto`] give conservative weights from and onto the
-//! whole grid, in the file's numbering.
+//! whole grid, in the file's numbering, and [`MeshSet::burn`] burns
+//! polygons in longitude and latitude onto it, densified into each band's
+//! projection.
 //!
 //! # CF bounds, SCRIP corners and halos
 //!

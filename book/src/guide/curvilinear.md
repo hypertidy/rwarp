@@ -394,6 +394,48 @@ On IPSL's CMIP6 files (checked in scratch, not in CI), split at 20 S:
 The worst cells covered are 0.03 km² slivers next to the grid poles,
 where 5e-10 is rounding on a cell a millionth of a source pixel.
 
+`MeshSet::burn` burns polygons and points in longitude and latitude
+onto the set's cells. It takes the bands the set was built with and a
+tolerance in the bands' world units, and returns controlledburn's tables
+in the set's numbering:
+
+```rust,ignore
+use controlledburn::BurnMode;
+
+// countries: Vec<Geometry> in lon/lat (edges straight in degrees)
+let r = set.burn(&countries, &bands, 1.0, BurnMode::Coverage)?;
+// r.runs and r.edges: (row, col) of the set's cells, fraction of each cell's area
+```
+
+Each band takes the part of each polygon within its cells' latitudes,
+widened by its tallest cell. A polar LAEA can't hold the far pole, so
+without that cut Antarctica in the north band, or a whole-world box,
+would come out inside out. Edges are straight in longitude and latitude.
+bigcurve densifies them into each band's projection until no chord is
+further than the tolerance from the edge's image. A fraction is then
+good to about the tolerance times the length of edge in the cell, over
+the cell's area. A polygon cut at 180° or closed along a pole comes out
+of a polar projection with both sides of the cut on one line. Each ring
+is split where it meets itself, and that line is taken out before the
+walk. Where the bands meet, the thin gap between their cells is burned
+onto no cell.
+
+On the same files (scratch), at a tolerance of 1 m:
+
+| | eORCA1 | ORCA2 |
+|---|---|---|
+| A whole-world box | every cell kept covered in full | the same |
+| Five boxes on 1° lines (Arctic, Antarctic, across 180°, across 20 S), against `weights_onto` from a 1° indicator at densify 64 | 8e-6 | 6e-6 |
+| Natural Earth 10 m countries (258, 548k vertices) | 1.0 s | 3.1 s |
+
+The comparison is two separate walks: a polygon into the mesh's index
+space, and each cell's outline into the source's pixels. On a 30° wide
+land cell of ORCA2 the two differed by 1e-3 at densify 16, and the gap
+fell sixteenfold at densify 64, as the outlines' error should. Most of
+the time goes on one-row pieces round a whole latitude circle, which
+walk every polygon near their band. Antarctica lands only in the south
+band.
+
 ### Overlapping swaths
 
 A mesh is one sheet: `from_corners` refuses cells of both orientations,

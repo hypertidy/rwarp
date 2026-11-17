@@ -12,8 +12,9 @@ source, for `exact_weights` and `warp()`'s exact footprint, through
 for coordinates that jump at the seam (4e, 2026-11-17; section 3), and a
 mesh is a warp target, through `MeshTarget` (4f, 2026-11-17; section 3),
 and a whole ocean grid is a `MeshSet` of pieces in two polar projections
-with damaged land left out (4g, 2026-11-17; section 3). Later stages
-proposed.
+with damaged land left out (4g, 2026-11-17; section 3), and polygons in
+longitude and latitude burn onto a set (4h, 2026-11-17; section 3).
+Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -716,9 +717,85 @@ and `Piece`.
   (0.9998 without the halved fold row), shared out to 8e-14 (1.2 s),
   covered to 1e-9 (0.1 s). The worst covered are 0.03 km² slivers by the
   grid poles.
-- **Not built.** Burning polygons onto a set (each band would need the
-  polygons in its own projection, densified); `warp()` from a set (the
-  lattice takes one world; `Weights::apply` regrids instead).
+- **Not built.** `warp()` from a set (the lattice takes one world;
+  `Weights::apply` regrids instead). Burning came in 4h.
+
+### Burning onto a set (built, 4h)
+
+Built (2026-11-17, decided with the user: bigcurve as a plain
+dependency, edges straight in longitude and latitude):
+`MeshSet::burn(geoms, bands, tolerance, opts)` in `src/mesh/set.rs`.
+
+- **Geometries in the bounds' coordinates.** The burn takes the bands
+  the set was built with (their rows are checked) and, for each, cuts,
+  densifies and projects every polygon, then burns it on each piece
+  whose box in that world it meets, as a `QuadMesh`. Records are moved
+  to the set's numbering and merged in controlledburn's order (by
+  geometry, then row and column). Pieces on one row are always apart (a
+  rectangle holds one maximal run of each of its rows), so no run needs
+  joining across pieces. Points are found in the first piece holding
+  them. Lines are refused, as on a `QuadMesh`.
+- **The far pole.** A polar LAEA sends its antipode to the edge of its
+  disk, so a polygon round it (Antarctica in the north band, a
+  whole-world box in either) comes out inside out. Each band cuts its
+  polygons to the y range of its kept cells' vertices, widened by its
+  tallest cell (Sutherland and Hodgman, one side at a time), before they
+  go to its world. Cutting per piece instead was tried and dropped. It
+  was slower, because neighbouring strips densified the same polygons
+  again. It was also wrong on ORCA2's garbled land cells near 26 N,
+  whose meshes are built from shared corners and reach well beyond
+  their own bounds.
+- **Densifying.** Each edge is cut into equal pieces no longer than the
+  band's tallest cell, from its lexicographically smaller end (an edge
+  shared by two rings is cut the same from both). Each piece then goes
+  to bigcurve's `Resampler` with `Planar` edges and the caller's
+  tolerance in world units, one batched forward call per level. The
+  first cut stops d3-geo's test from passing over an edge whose ends
+  land together, such as a parallel all the way round.
+- **Cuts at 180 and along a pole.** In polar LAEA both sides of a cut at
+  180 land on one line, within 1e-16. Where that line is also a piece's
+  outer wall, the walk's choice of boundary arc (the one of least
+  winding about an interior point) fails. A whole-world box burned
+  nothing on the one-row piece whose west wall is the 180 meridian: each
+  excursion with its closing arc wound round the piece. So each
+  projected ring is split where it comes back to a point it has been at
+  (within 1e-12 of its largest coordinate). Loops with under 1e-12 of
+  its box's area are dropped. A loop with the ring's own turn keeps the
+  ring's role, the others take the other, and holes go to the smallest
+  outer ring round their first point. A whole-world box becomes the
+  circle of its cut, and Antarctica cut at a parallel becomes its coast
+  and a hole.
+- **Tests.** `tests/mesh_set.rs`, on the analytic grid of 4g:
+  - a whole-world box (from -180 and from 0) covers every cell kept in
+    full, round the fold and the pole, including the piece walled at
+    180;
+  - five boxes on grid lines against closed forms, to 8e-8. The forms:
+    each cell edge is a chord of its parallel in its band's LAEA, so a
+    box edge along the parallel at `L` adds or takes the segment
+    `rho(L)^2 (dlam - sin dlam) / 2`. The boxes:
+    - the two polar caps (the far band gets nothing);
+    - a box across the bands with a hole;
+    - a box across 180, written past it and split at it, the same;
+    - a cap cut along a piece's wall;
+  - points in each band and in the cap, and none in the gap at the
+    equator, south of the grid or in a cell left out;
+  - refusals: lines, other bands, a tolerance that isn't positive, modes
+    other than coverage.
+- **On the CMIP6 files** (scratch; split at 20 S, tolerance 1 m):
+  - a whole-world box covers every kept cell of eORCA1 and ORCA2 in full;
+  - five boxes on 1 degree lines agree on every ocean cell, to 8e-6
+    (eORCA1) and 6e-6 (ORCA2), with `weights_onto` from a 1 degree
+    indicator at densify 64. The boxes: the Arctic past the fold, the
+    Antarctic, across 180, across the split, and the far south. At
+    densify 16 one 30 degree wide land cell of ORCA2 was 1e-3 out, and
+    the gap fell sixteenfold at 64: the weights' outline error, not the
+    burn's.
+  - Natural Earth 10 m countries (258 geometries, 548k vertices) burn
+    in 1.0 s onto eORCA1 and 3.1 s onto ORCA2. No cell sums past 1, and
+    Antarctica lands only in the south band.
+- **Not built.** A finer filter of which polygons each piece walks: a
+  one-row piece round most of a latitude circle has a box the size of
+  its band's disk, and walks nearly every polygon. `burn_par`.
 
 ### The exact footprint at the antimeridian
 
@@ -989,7 +1066,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch) |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve (4h, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

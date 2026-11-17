@@ -1,7 +1,13 @@
 //! A whole curvilinear grid as rectangular pieces, each a [`QuadMesh`] in
 //! its band's world coordinates: [`MeshSet`].
 
+use std::collections::HashMap;
 use std::ops::Range;
+
+use bigcurve::{from_fn, ForwardBatch, Options, Planar, Resampler, Vertex};
+use controlledburn::{
+    BurnMode, BurnOptions, BurnResult, Coord, Geometry, GridEdge, GridPoint, GridRun, Note, Polygon,
+};
 
 use super::cf::{cf_corners, Halo};
 use super::period::range_of;
@@ -76,6 +82,9 @@ impl Piece {
 ///   the set to a grid, [`MeshSet::weights_onto`] from a source onto the
 ///   set, each as one [`Weights`] in the set's numbering, from
 ///   [`exact_weights`] on every piece.
+/// - **Burning.** [`MeshSet::burn`] burns polygons and points given in the
+///   bounds' coordinates onto the set's cells, densified into each band's
+///   world.
 ///
 /// Where two bands meet, each side's cells have edges straight in their
 /// own projection, so the two bow apart between corners: a thin gap
@@ -132,6 +141,19 @@ pub struct MeshSet {
     nrow: usize,
     pieces: Vec<Piece>,
     dropped: Vec<(usize, usize)>,
+    clips: Vec<Clip>,
+}
+
+/// What [`MeshSet::burn`] cuts a band's polygons to, in the bounds'
+/// coordinates: the y range of the band's kept cells' vertices, widened
+/// by `step` each way, `step` being its tallest kept cell's height in y
+/// (also the longest edge handed to bigcurve). NaN for a band with no
+/// cells kept.
+#[derive(Debug, Clone)]
+struct Clip {
+    rows: Range<usize>,
+    y: [f64; 2],
+    step: f64,
 }
 
 /// Rectangles `(c0, c1, r0, r1)` (half-open) covering the `true` cells of
@@ -249,6 +271,7 @@ impl MeshSet {
 
         let mut pieces = Vec::new();
         let mut dropped = Vec::new();
+        let mut clips = Vec::with_capacity(bands.len());
         for (k, b) in bands.iter().enumerate() {
             let (rs, re) = (b.rows.start, b.rows.end);
             // the band's bounds, every column of the file, in its world
@@ -387,12 +410,37 @@ impl MeshSet {
                     .map(|q| (rs + q / w, q % w)),
             );
             pieces.extend(band_pieces);
+            // the y range of the kept cells' vertices, as the file has them
+            let (mut y0, mut y1, mut tall) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
+            for q in (0..h * w).filter(|&q| kept[q]) {
+                let (fr, fc) = file(rs + q / w, q % w);
+                let v = 4 * (fr * ncol + fc);
+                let [lo, hi] = range_of(&yb[v..v + 4]);
+                (y0, y1, tall) = (y0.min(lo), y1.max(hi), tall.max(hi - lo));
+            }
+            if tall <= 0.0 {
+                tall = y1 - y0;
+            }
+            clips.push(if tall > 0.0 && tall.is_finite() {
+                Clip {
+                    rows: rs..re,
+                    y: [y0 - tall, y1 + tall],
+                    step: tall,
+                }
+            } else {
+                Clip {
+                    rows: rs..re,
+                    y: [f64::NAN; 2],
+                    step: f64::NAN,
+                }
+            });
         }
         Ok(MeshSet {
             ncol: nc,
             nrow: nr,
             pieces,
             dropped,
+            clips,
         })
     }
 
@@ -539,6 +587,518 @@ impl MeshSet {
         }
         Ok(out)
     }
+
+    /// Burn polygons and points onto the set's cells: controlledburn's
+    /// tables, with `(row, col)` in the set's numbering and each edge's
+    /// fraction of its cell's own area, in the world of the cell's band.
+    /// Coverage mode only; lines are refused, as [`QuadMesh::burn`]
+    /// refuses them.
+    ///
+    /// - **Geometries are in the bounds' coordinates** (longitude and
+    ///   latitude, for an ocean grid), and `bands` are the bands the set was
+    ///   built with: their rows must match, and each `to_world` takes the
+    ///   geometries to its band's world.
+    /// - **Edges are straight in the bounds' coordinates.** Before a
+    ///   polygon goes to a band, each edge is cut into equal pieces no
+    ///   longer than the band's tallest cell is high, and each piece is
+    ///   densified by bigcurve (d3-geo's adaptive resampling, planar edges)
+    ///   until no chord strays more than `tolerance` from the edge's image,
+    ///   in the band's world units (metres, for LAEA). A fraction is then
+    ///   good to about `tolerance` times the length of polygon edge in the
+    ///   cell, over its area. The work grows as `1 / sqrt(tolerance)`.
+    /// - **Each band takes the polygons' part near its own cells**: they are
+    ///   cut to the y range of its cells' vertices, widened by its tallest
+    ///   cell each way. A projection holds one hemisphere well and the far
+    ///   pole not at all (a polar LAEA sends it to its edge), so without
+    ///   the cut a polygon round the far pole, Antarctica in a north-polar
+    ///   band, or a whole-world box, would come out inside out. The cut
+    ///   assumes no cell of the band reaches further than that beyond its
+    ///   vertices' range. That holds for an ocean grid in longitude and
+    ///   latitude, whose cells bulge far less than its tallest is high. A
+    ///   cell at the band's edge whose corners come from its neighbours'
+    ///   bounds (garbled land, as on ORCA2) could reach further.
+    /// - **Cuts at 180 degrees and along a pole** come out of a polar
+    ///   projection with both sides on one line. Each ring is split where
+    ///   it meets itself, within `1e-12` of its size, and the line taken
+    ///   out before it is walked: a whole-world box becomes the circle of
+    ///   its cut parallel, an Antarctica cut at one its coast and a hole.
+    /// - **Each piece** burns the polygons whose box in its world meets its
+    ///   own, as a [`QuadMesh`]; the pieces' records are merged, in
+    ///   controlledburn's order (by geometry, then row and column). Cells
+    ///   left out are never in them. Where bands meet, the gap between
+    ///   their cells (see the [type docs](MeshSet)) is burned onto no cell.
+    /// - **Points** are found in the first piece (bands in order) whose
+    ///   cell holds them, if any.
+    ///
+    /// ```
+    /// use rwarp::mesh::{Band, Halo, MeshSet};
+    /// use rwarp::CrsTransform;
+    /// use controlledburn::{BurnMode, Coord, Geometry, Polygon};
+    ///
+    /// // a global grid of 30 degree cells, bounds in lon/lat, in two
+    /// // bands of polar LAEA on the unit sphere split at the equator
+    /// let (nc, nr) = (12, 6);
+    /// let (mut xb, mut yb) = (Vec::new(), Vec::new());
+    /// for j in 0..nr {
+    ///     for i in 0..nc {
+    ///         for (di, dj) in [(0, 0), (1, 0), (1, 1), (0, 1)] {
+    ///             xb.push(-180.0 + 30.0 * (i + di) as f64);
+    ///             yb.push(-90.0 + 30.0 * (j + dj) as f64);
+    ///         }
+    ///     }
+    /// }
+    /// struct Laea(f64);
+    /// impl CrsTransform for Laea {
+    ///     fn convert(&self, lon: f64, lat: f64) -> Option<(f64, f64)> {
+    ///         // self.0: 1 for north-polar, -1 for south-polar
+    ///         let rho = 2.0 * ((90.0 - self.0 * lat).to_radians() / 2.0).sin();
+    ///         let (s, c) = lon.to_radians().sin_cos();
+    ///         Some((rho * s, -self.0 * rho * c))
+    ///     }
+    /// }
+    /// let (south, north) = (Laea(-1.0), Laea(1.0));
+    /// let bands = [Band { rows: 0..3, to_world: &south }, Band { rows: 3..6, to_world: &north }];
+    /// let set = MeshSet::from_cf_bounds(nc, nr, &xb, &yb, Halo::NONE, &bands, None).unwrap();
+    ///
+    /// // the whole world: every cell covered in full, by both bands
+    /// let ring = [(-180.0, -90.0), (180.0, -90.0), (180.0, 90.0), (-180.0, 90.0), (-180.0, -90.0)];
+    /// let world = Geometry::Polygon(Polygon::new(vec![ring.iter().map(|&(x, y)| Coord { x, y }).collect()]));
+    /// let r = set.burn(&[world], &bands, 1e-9, BurnMode::Coverage).unwrap();
+    /// assert!(r.edges.iter().all(|e| e.fraction > 0.999999));
+    /// assert!((r.covered_cells() - (nc * nr) as f64).abs() < 1e-3);
+    /// ```
+    pub fn burn(
+        &self,
+        geoms: &[Geometry],
+        bands: &[Band],
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+    ) -> Result<BurnResult, String> {
+        let opts = opts.into();
+        if opts.mode != BurnMode::Coverage {
+            return Err("only coverage mode is defined for a grid front end".into());
+        }
+        if !(tolerance > 0.0 && tolerance.is_finite()) {
+            return Err(format!("the tolerance must be positive, not {tolerance}"));
+        }
+        if bands.len() != self.clips.len()
+            || bands.iter().zip(&self.clips).any(|(b, c)| b.rows != c.rows)
+        {
+            let rows: Vec<_> = self.clips.iter().map(|c| c.rows.clone()).collect();
+            return Err(format!(
+                "the bands must be those the set was built with, rows {rows:?}"
+            ));
+        }
+        if let Some(k) = geoms
+            .iter()
+            .position(|g| matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_)))
+        {
+            return Err(format!(
+                "geometry {k}: lines are not supported by the grid front ends yet"
+            ));
+        }
+        let boxes: Vec<[f64; 4]> = self.pieces.iter().map(|p| mesh_box(&p.mesh)).collect();
+        let mut out = BurnResult::default();
+        for (k, (band, clip)) in bands.iter().zip(&self.clips).enumerate() {
+            let pieces: Vec<usize> = (0..self.pieces.len())
+                .filter(|&i| self.pieces[i].world == k)
+                .collect();
+            if pieces.is_empty() {
+                continue;
+            }
+            let forward =
+                from_fn(|x: f64, y: f64| band.to_world.convert(x, y).map(|(a, b)| [a, b]));
+            let mut rs = Resampler::with_edge(forward, Planar::new(), &Options::new(tolerance));
+            // the polygons in the band's world, with their positions and boxes
+            let (mut world, mut ids, mut wbox) = (Vec::new(), Vec::new(), Vec::new());
+            for (id, g) in geoms.iter().enumerate() {
+                let ps = match g {
+                    Geometry::Polygon(p) => std::slice::from_ref(p),
+                    Geometry::MultiPolygon(ps) => ps.as_slice(),
+                    _ => continue,
+                };
+                let (parts, bx) = project(ps, clip.y, clip.step, &mut rs).map_err(|v| {
+                    format!(
+                        "geometry {id}: the point ({}, {}) doesn't go to band {k}'s world",
+                        v[0], v[1]
+                    )
+                })?;
+                if !parts.is_empty() {
+                    world.push(Geometry::MultiPolygon(parts));
+                    ids.push(id as i32);
+                    wbox.push(bx);
+                }
+            }
+            for &i in &pieces {
+                let p = &self.pieces[i];
+                let sel: Vec<usize> = (0..world.len())
+                    .filter(|&g| meets(wbox[g], boxes[i]))
+                    .collect();
+                if sel.is_empty() {
+                    continue;
+                }
+                let sub: Vec<Geometry> = sel.iter().map(|&g| world[g].clone()).collect();
+                let res = p.mesh.burn(&sub, opts)?;
+                let id = |j: i32| ids[sel[j as usize]];
+                let (dr, dc) = (p.row_off as i32, p.col_off as i32);
+                out.runs.extend(res.runs.iter().map(|r| GridRun {
+                    row: r.row + dr,
+                    col_start: r.col_start + dc,
+                    col_end: r.col_end + dc,
+                    id: id(r.id),
+                }));
+                out.edges.extend(res.edges.iter().map(|e| GridEdge {
+                    row: e.row + dr,
+                    col: e.col + dc,
+                    fraction: e.fraction,
+                    id: id(e.id),
+                }));
+                out.notes.extend(res.notes.into_iter().map(|n| Note {
+                    geom_index: id(n.geom_index),
+                    message: n.message,
+                }));
+            }
+        }
+        // points: in the first piece whose cell holds them
+        for (id, g) in geoms.iter().enumerate() {
+            let cs = match g {
+                Geometry::Point(c) => std::slice::from_ref(c),
+                Geometry::MultiPoint(cs) => cs.as_slice(),
+                _ => continue,
+            };
+            for c in cs {
+                if let Some((row, col)) = self.locate_point(c, bands, &boxes) {
+                    out.points.push(GridPoint {
+                        row: row as i32,
+                        col: col as i32,
+                        id: id as i32,
+                    });
+                }
+            }
+        }
+        out.runs.sort_by_key(|r| (r.id, r.row, r.col_start));
+        out.edges.sort_by_key(|e| (e.id, e.row, e.col));
+        out.notes.sort_by_key(|n| n.geom_index);
+        out.notes.dedup();
+        Ok(out)
+    }
+
+    /// The set's cell `(row, col)` that holds point `c` (in the bounds'
+    /// coordinates), searching the bands in order: `None` outside every
+    /// band's y range, and where no piece holds it.
+    fn locate_point(
+        &self,
+        c: &Coord,
+        bands: &[Band],
+        boxes: &[[f64; 4]],
+    ) -> Option<(usize, usize)> {
+        for (k, (band, clip)) in bands.iter().zip(&self.clips).enumerate() {
+            if !(c.y >= clip.y[0] && c.y <= clip.y[1] && c.x.is_finite()) {
+                continue;
+            }
+            let Some((x, y)) = band.to_world.convert(c.x, c.y) else {
+                continue;
+            };
+            for (i, p) in self.pieces.iter().enumerate() {
+                let b = boxes[i];
+                if p.world != k || !(x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]) {
+                    continue;
+                }
+                if let Some((r, col)) = p.mesh.locate([x, y], None) {
+                    return Some((r + p.row_off, col + p.col_off));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Polygons `ps` (in the bounds' coordinates) in a band's world: each
+/// ring cut to the band's y range `y`, densified (`step`, `rs`) and split
+/// where it meets itself; a part with its ring's turn keeps the ring's
+/// role (outer or hole), one with the other turn takes the other. With
+/// the box `[x0, y0, x1, y1]` of the outer rings. Err with a point that
+/// doesn't go to the world.
+fn project<T: ForwardBatch>(
+    ps: &[Polygon],
+    y: [f64; 2],
+    step: f64,
+    rs: &mut Resampler<T, Planar>,
+) -> Result<(Vec<Polygon>, [f64; 4]), [f64; 2]> {
+    let mut parts = Vec::with_capacity(ps.len());
+    let mut bx = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for p in ps {
+        let (mut outer, mut holes) = (Vec::new(), Vec::new());
+        for (ri, r) in p.rings.iter().enumerate() {
+            let cut = clip_y(r, y);
+            if cut.len() < 3 {
+                if ri == 0 {
+                    break;
+                }
+                continue;
+            }
+            let wr = densify(rs, &cut, step)?;
+            let turn = signed_area(&wr);
+            for (part, a) in split_touching(&wr) {
+                if (ri == 0) == ((a > 0.0) == (turn > 0.0)) {
+                    outer.push((part, a.abs()));
+                } else {
+                    holes.push(part);
+                }
+            }
+        }
+        for c in outer.iter().flat_map(|(r, _)| r) {
+            bx = [
+                bx[0].min(c[0]),
+                bx[1].min(c[1]),
+                bx[2].max(c[0]),
+                bx[3].max(c[1]),
+            ];
+        }
+        parts.extend(assemble(outer, holes));
+    }
+    Ok((parts, bx))
+}
+
+/// The box `[x0, y0, x1, y1]` of a mesh's corners.
+fn mesh_box(m: &QuadMesh) -> [f64; 4] {
+    let ([x0, x1], [y0, y1]) = (range_of(&m.x), range_of(&m.y));
+    [x0, y0, x1, y1]
+}
+
+/// Whether boxes `[x0, y0, x1, y1]` meet.
+fn meets(a: [f64; 4], b: [f64; 4]) -> bool {
+    a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3]
+}
+
+/// Ring `r` (closed or not) cut to `lo <= y <= hi`, one side and then the
+/// other (Sutherland and Hodgman), open. Where the ring leaves and comes
+/// back, the cut runs along the line, there and back in places for a
+/// ring that isn't convex: an edge with no area. Empty for a ring with a
+/// coordinate that isn't finite, as [`QuadMesh::ring_to_index`] takes
+/// it, and for a NaN range.
+fn clip_y(r: &[Coord], [lo, hi]: [f64; 2]) -> Vec<[f64; 2]> {
+    let mut pts: Vec<[f64; 2]> = r.iter().map(|c| [c.x, c.y]).collect();
+    while pts.len() > 1 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    if pts.iter().any(|p| !(p[0].is_finite() && p[1].is_finite())) {
+        return Vec::new();
+    }
+    if pts.iter().all(|p| p[1] >= lo && p[1] <= hi) {
+        return pts;
+    }
+    let pts = clip_side(&pts, |y| y >= lo, lo);
+    clip_side(&pts, |y| y <= hi, hi)
+}
+
+/// Ring `pts` cut to the side of `y = c` where `inside(y)`.
+fn clip_side(pts: &[[f64; 2]], inside: impl Fn(f64) -> bool, c: f64) -> Vec<[f64; 2]> {
+    let n = pts.len();
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(n + 4);
+    let mut push = |p: [f64; 2]| {
+        if out.last() != Some(&p) {
+            out.push(p);
+        }
+    };
+    for k in 0..n {
+        let (a, b) = (pts[k], pts[(k + 1) % n]);
+        let (ia, ib) = (inside(a[1]), inside(b[1]));
+        if ia {
+            push(a);
+        }
+        if ia != ib {
+            let t = (c - a[1]) / (b[1] - a[1]);
+            push([a[0] + t * (b[0] - a[0]), c]);
+        }
+    }
+    while out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    out
+}
+
+/// Open ring `ring` (in the bounds' coordinates) to an open ring in a
+/// band's world: each edge cut into equal pieces no longer than `step`
+/// (from its lexicographically smaller end, so an edge shared by two
+/// rings is cut the same from both sides), then densified by `rs`. Err
+/// with a point that doesn't go to the world.
+fn densify<T: ForwardBatch>(
+    rs: &mut Resampler<T, Planar>,
+    ring: &[[f64; 2]],
+    step: f64,
+) -> Result<Vec<[f64; 2]>, [f64; 2]> {
+    let n = ring.len();
+    let mut src = Vec::with_capacity(n + 1);
+    for k in 0..n {
+        let (a, b) = (ring[k], ring[(k + 1) % n]);
+        src.push(a);
+        let m = ((b[0] - a[0]).hypot(b[1] - a[1]) / step).ceil();
+        if m > 1.0 {
+            // at most 2^16 pieces an edge; bigcurve takes it from there
+            let m = m.min(65536.0) as usize;
+            let rev = (b[0], b[1]) < (a[0], a[1]);
+            let (p, q) = if rev { (b, a) } else { (a, b) };
+            let cut = (1..m).map(|i| {
+                let t = i as f64 / m as f64;
+                [p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]
+            });
+            if rev {
+                src.extend(cut.collect::<Vec<_>>().into_iter().rev());
+            } else {
+                src.extend(cut);
+            }
+        }
+    }
+    src.push(ring[0]);
+    let v = rs.project_all(&src);
+    if let Some(bad) = v.iter().find(|v| !v.ok) {
+        return Err([bad.lon, bad.lat]);
+    }
+    let pairs: Vec<(Vertex, Vertex)> = v.windows(2).map(|w| (w[0], w[1])).collect();
+    let (mut interior, mut ends) = (Vec::new(), Vec::with_capacity(pairs.len()));
+    rs.edges(&pairs, &mut interior, &mut ends);
+    let mut out = Vec::with_capacity(v.len() + interior.len());
+    let mut from = 0;
+    for (k, &end) in ends.iter().enumerate() {
+        out.push([v[k].x, v[k].y]);
+        out.extend(interior[from..end].iter().map(|m| [m.x, m.y]));
+        from = end;
+    }
+    Ok(out)
+}
+
+/// The signed area of an open ring (positive anticlockwise), taken about
+/// its first point.
+fn signed_area(r: &[[f64; 2]]) -> f64 {
+    let Some(&o) = r.first() else { return 0.0 };
+    let mut a = 0.0;
+    for k in 1..r.len().saturating_sub(1) {
+        let (p, q) = (r[k], r[k + 1]);
+        a += (p[0] - o[0]) * (q[1] - o[1]) - (q[0] - o[0]) * (p[1] - o[1]);
+    }
+    a / 2.0
+}
+
+/// Open ring `r` split into loops where it comes back to a point it has
+/// been at (within `1e-12` of its largest coordinate), each with its
+/// signed area; loops with no area to speak of (under `1e-12` of the
+/// ring's box) are dropped.
+///
+/// A polygon cut at 180 degrees or closed along a pole comes out of a
+/// polar projection with both sides of the cut on one line: a slit in to
+/// the pole, or a bridge from a coast to the band's cut. The walk can't
+/// tell the two sides apart where the line is also a piece's wall, so
+/// the slit is taken out here: what is left is the polygon's own
+/// boundary, an Antarctica cut at a parallel as its coast and a hole.
+fn split_touching(r: &[[f64; 2]]) -> Vec<(Vec<[f64; 2]>, f64)> {
+    let ([x0, x1], [y0, y1]) = (
+        range_of(&r.iter().map(|p| p[0]).collect::<Vec<_>>()),
+        range_of(&r.iter().map(|p| p[1]).collect::<Vec<_>>()),
+    );
+    let scale = [x0, x1, y0, y1].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let near = 1e-12 * scale;
+    let small = 1e-12 * (x1 - x0) * (y1 - y0);
+    if near.is_nan() || near <= 0.0 {
+        return Vec::new();
+    }
+    let key = |p: [f64; 2]| ((p[0] / near).floor() as i64, (p[1] / near).floor() as i64);
+    // the loop being built, and where each of its points is by key
+    let mut stack: Vec<[f64; 2]> = Vec::with_capacity(r.len());
+    let mut at: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut loops = Vec::new();
+    for &p in r {
+        let (kx, ky) = key(p);
+        let mut hit = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &i in at.get(&(kx + dx, ky + dy)).into_iter().flatten() {
+                    let q = stack[i];
+                    if (p[0] - q[0]).abs() <= near && (p[1] - q[1]).abs() <= near {
+                        hit = hit.max(Some(i));
+                    }
+                }
+            }
+        }
+        match hit {
+            Some(i) => {
+                // back at stack[i]: what came after it is a loop
+                let tail = stack.split_off(i + 1);
+                for q in &tail {
+                    if let Some(v) = at.get_mut(&key(*q)) {
+                        v.pop();
+                    }
+                }
+                let mut lp = Vec::with_capacity(tail.len() + 1);
+                lp.push(stack[i]);
+                lp.extend(tail);
+                loops.push(lp);
+            }
+            None => {
+                at.entry((kx, ky)).or_default().push(stack.len());
+                stack.push(p);
+            }
+        }
+    }
+    loops.push(stack);
+    loops
+        .into_iter()
+        .filter(|l| l.len() >= 3)
+        .map(|l| {
+            let a = signed_area(&l);
+            (l, a)
+        })
+        .filter(|(_, a)| a.abs() > small)
+        .collect()
+}
+
+/// Polygons from outer rings (with their areas) and holes, each hole with
+/// the smallest outer ring round its first point; a hole round no outer
+/// ring is dropped. Rings closed, as controlledburn takes them.
+fn assemble(outer: Vec<(Vec<[f64; 2]>, f64)>, holes: Vec<Vec<[f64; 2]>>) -> Vec<Polygon> {
+    let close = |r: &[[f64; 2]]| -> Vec<Coord> {
+        r.iter()
+            .chain(r.first())
+            .map(|p| Coord { x: p[0], y: p[1] })
+            .collect()
+    };
+    let mut rings: Vec<Vec<Vec<Coord>>> = outer.iter().map(|(r, _)| vec![close(r)]).collect();
+    for h in holes {
+        let at = if outer.len() == 1 {
+            Some(0)
+        } else {
+            (0..outer.len())
+                .filter(|&i| winds(&outer[i].0, h[0]))
+                .min_by(|&i, &j| outer[i].1.total_cmp(&outer[j].1))
+        };
+        if let Some(i) = at {
+            rings[i].push(close(&h));
+        }
+    }
+    rings.into_iter().map(|rings| Polygon { rings }).collect()
+}
+
+/// Whether open ring `r` winds round point `p`.
+fn winds(r: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let n = r.len();
+    let mut w = 0i64;
+    for k in 0..n {
+        let (a, b) = (r[k], r[(k + 1) % n]);
+        let side = (b[0] - a[0]) * (p[1] - a[1]) - (p[0] - a[0]) * (b[1] - a[1]);
+        if a[1] <= p[1] {
+            if b[1] > p[1] && side > 0.0 {
+                w += 1;
+            }
+        } else if b[1] <= p[1] && side < 0.0 {
+            w -= 1;
+        }
+    }
+    w != 0
 }
 
 /// The target window `[col_off, row_off, ncol, nrow]` (full-grid pixels)
