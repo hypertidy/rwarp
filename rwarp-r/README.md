@@ -1,4 +1,4 @@
-# rwarp (R package)
+# rwarp (R package) <img src="man/figures/logo.png" align="right" height="139" alt="rwarp hex logo" />
 
 <!-- badges: start -->
 [![R-CMD-check](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/hypertidy/rwarp/actions/workflows/R-CMD-check.yaml)

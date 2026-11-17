@@ -1,5 +1,10 @@
 # rwarp (development version)
 
+* rwarp has a hex logo, drawn from rwarp's own output: MUR sea surface
+  temperature warped to Antarctic polar stereographic in a regular grid of
+  tiles, and one row per tile for the plan. The site has favicons to match.
+  The logo is made by the scripts in `design/logo/` of the repository.
+
 * The website (<https://hypertidy.github.io/rwarp/r/>) is fuller: a Get
   started article, grouped articles, the changelog, a light/dark switch,
   and source links that work. The `sentinel2-warp` and `ghrsst-polar`
