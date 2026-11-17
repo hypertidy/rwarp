@@ -139,6 +139,11 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       are, so polygons elsewhere are skipped and runs of edges away from
       it cut short, with the same result bit for bit. On ORCA2 the
       countries went from 3.0 s to 1.1 s.
+    - `MeshSet::burn_par(geoms, bands, tolerance, opts, threads)` gives
+      the same records on several threads. Pieces filter, walk and burn
+      their polygons in parallel. Projection stays on the calling
+      thread, since a band's transform needn't be thread-safe. On 8
+      threads ORCA2's countries take 0.44 s.
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
 - `mesh::MeshTarget`: a `QuadMesh` as a warp target, for regridding onto

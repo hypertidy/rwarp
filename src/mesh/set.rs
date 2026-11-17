@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bigcurve::{from_fn, ForwardBatch, Options, Planar, Resampler, Vertex};
 use controlledburn::{
@@ -11,6 +12,7 @@ use controlledburn::{
 
 use super::cf::{cf_corners, Halo};
 use super::period::range_of;
+use super::walk::{burn_plane, map_geoms, vertex_chunks, vertices};
 use super::{bow_tie, orient, shoelace2, CellMap, MeshTarget, MeshTransformer, QuadMesh};
 use crate::crs::CrsTransform;
 use crate::transform::Transformer;
@@ -639,6 +641,8 @@ impl MeshSet {
     /// - **Points** are found in the first piece (bands in order) whose
     ///   cell holds them, if any.
     ///
+    /// [`MeshSet::burn_par`] gives the same result on several threads.
+    ///
     /// ```
     /// use rwarp::mesh::{Band, Halo, MeshSet};
     /// use rwarp::CrsTransform;
@@ -683,11 +687,38 @@ impl MeshSet {
         tolerance: f64,
         opts: impl Into<BurnOptions>,
     ) -> Result<BurnResult, String> {
-        self.burn_with(geoms, bands, tolerance, opts.into(), true)
+        self.burn_with(geoms, bands, tolerance, opts.into(), true, 1)
     }
 
-    /// [`MeshSet::burn`], with each piece's polygons filtered and their
-    /// rings shortened by its [`Tiles`] (`trim`), or burned whole.
+    /// [`MeshSet::burn`] on up to `threads` threads (0 for all available),
+    /// with the same result record for record.
+    ///
+    /// - **On the calling thread:** each band's polygons go to its world
+    ///   there, one band after the other, since a band's [`CrsTransform`]
+    ///   needn't be thread-safe (libproj's aren't). So are the points.
+    /// - **On the threads:** each of the band's pieces filters and
+    ///   shortens its polygons, the costliest pieces first. The pieces'
+    ///   polygons are then walked into their index spaces in contiguous
+    ///   chunks of about equal vertex counts, taken in turn. Each piece is
+    ///   burned with [`controlledburn::burn_par`].
+    ///
+    /// With `threads = 1` nothing is spawned, as on wasm, and this is
+    /// [`MeshSet::burn`]. On ORCA2, Natural Earth's 10 m countries take
+    /// about 0.3 s of projecting before any thread starts (1.6 s at a
+    /// tolerance of 0.01 m).
+    pub fn burn_par(
+        &self,
+        geoms: &[Geometry],
+        bands: &[Band],
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+        threads: usize,
+    ) -> Result<BurnResult, String> {
+        self.burn_with(geoms, bands, tolerance, opts.into(), true, threads)
+    }
+
+    /// [`MeshSet::burn_par`], with each piece's polygons filtered and
+    /// their rings shortened by its [`Tiles`] (`trim`), or burned whole.
     fn burn_with(
         &self,
         geoms: &[Geometry],
@@ -695,6 +726,7 @@ impl MeshSet {
         tolerance: f64,
         opts: BurnOptions,
         trim: bool,
+        threads: usize,
     ) -> Result<BurnResult, String> {
         if opts.mode != BurnMode::Coverage {
             return Err("only coverage mode is defined for a grid front end".into());
@@ -718,6 +750,10 @@ impl MeshSet {
                 "geometry {k}: lines are not supported by the grid front ends yet"
             ));
         }
+        let threads = match threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        };
         let boxes: Vec<[f64; 4]> = self.pieces.iter().map(|p| mesh_box(&p.mesh)).collect();
         let mut out = BurnResult::default();
         for (k, (band, clip)) in bands.iter().zip(&self.clips).enumerate() {
@@ -765,7 +801,10 @@ impl MeshSet {
                     ids.push(id as i32);
                 }
             }
-            for &i in &pieces {
+            // each piece's polygons, filtered and shortened, the largest
+            // pieces first
+            let select = |j: usize| {
+                let i = pieces[j];
                 let p = &self.pieces[i];
                 // with no cell of any area, the walk has no point to wind round
                 let tiles = p
@@ -791,10 +830,53 @@ impl MeshSet {
                         sel.push(g);
                     }
                 }
+                (sub, sel)
+            };
+            let mut order: Vec<usize> = (0..pieces.len()).collect();
+            order.sort_by_key(|&j| {
+                let m = &self.pieces[pieces[j]].mesh;
+                std::cmp::Reverse(m.ncol() * m.nrow())
+            });
+            let subs = in_parallel(pieces.len(), &order, threads, select)?;
+            // walked into each piece's index space, in chunks, the largest
+            // first; one chunk a piece on one thread
+            let mut jobs = Vec::new();
+            for (j, (sub, _)) in subs.iter().enumerate() {
                 if sub.is_empty() {
                     continue;
                 }
-                let res = p.mesh.burn(&sub, opts)?;
+                let chunks = if threads == 1 {
+                    vec![(0, sub.len())]
+                } else {
+                    vertex_chunks(sub, threads * 8)
+                };
+                for (a, b) in chunks {
+                    let n: usize = sub[a..b].iter().map(vertices).sum();
+                    jobs.push((j, a, b, n));
+                }
+            }
+            let mut order: Vec<usize> = (0..jobs.len()).collect();
+            order.sort_by_key(|&q| std::cmp::Reverse(jobs[q].3));
+            let walk = |q: usize| {
+                let (j, a, b, _) = jobs[q];
+                let mesh = &self.pieces[pieces[j]].mesh;
+                let ring = |r: &[[f64; 2]]| mesh.ring_to_index(r);
+                let cell = |c: [f64; 2], h| mesh.locate(c, h);
+                map_geoms(&subs[j].0[a..b], a, mesh.nrow(), None, &ring, &cell)
+            };
+            let mut mapped = in_parallel(jobs.len(), &order, threads, walk)?.into_iter();
+            // each piece burned, in order
+            for (j, (sub, sel)) in subs.iter().enumerate() {
+                if sub.is_empty() {
+                    continue;
+                }
+                let p = &self.pieces[pieces[j]];
+                let mut plane = Vec::with_capacity(sub.len());
+                while plane.len() < sub.len() {
+                    let (pl, _) = mapped.next().ok_or("a piece lost its walked polygons")??;
+                    plane.extend(pl);
+                }
+                let res = burn_plane(p.mesh.ncol(), p.mesh.nrow(), &plane, opts, threads)?;
                 let id = |j: i32| ids[sel[j as usize]];
                 let (dr, dc) = (p.row_off as i32, p.col_off as i32);
                 out.runs.extend(res.runs.iter().map(|r| GridRun {
@@ -867,6 +949,51 @@ impl MeshSet {
         }
         None
     }
+}
+
+/// `f` for each of `0..n` on up to `threads` threads, taking the items in
+/// turn in the order `order` (the costliest first, say): the results in
+/// item order. One thread, or one item, runs on the calling thread.
+fn in_parallel<T: Send>(
+    n: usize,
+    order: &[usize],
+    threads: usize,
+    f: impl Fn(usize) -> T + Sync,
+) -> Result<Vec<T>, String> {
+    if threads <= 1 || n <= 1 {
+        return Ok((0..n).map(f).collect());
+    }
+    let (next, f) = (AtomicUsize::new(0), &f);
+    let mut done: Vec<(usize, T)> = Vec::with_capacity(n);
+    let joined = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads.min(n))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&i) = order.get(k) else {
+                            break out;
+                        };
+                        out.push((i, f(i)));
+                    }
+                })
+            })
+            .collect();
+        // every thread joined, so the scope has none left to panic over
+        hs.into_iter().fold(true, |ok, h| match h.join() {
+            Ok(v) => {
+                done.extend(v);
+                ok
+            }
+            Err(_) => false,
+        })
+    });
+    if !joined {
+        return Err("a burn thread panicked".into());
+    }
+    done.sort_by_key(|d| d.0);
+    Ok(done.into_iter().map(|d| d.1).collect())
 }
 
 /// One polygon in a band's world: open rings, the outer first, and the
@@ -1666,10 +1793,56 @@ mod tests {
         ];
         let geoms = polygons();
         let opts = BurnOptions::coverage();
-        let whole = set.burn_with(&geoms, &bands, 1.0, opts, false).unwrap();
-        let trimmed = set.burn_with(&geoms, &bands, 1.0, opts, true).unwrap();
+        let whole = set.burn_with(&geoms, &bands, 1.0, opts, false, 1).unwrap();
+        let trimmed = set.burn_with(&geoms, &bands, 1.0, opts, true, 1).unwrap();
         assert!(whole.runs.len() + whole.edges.len() > 1000);
         assert_eq!(whole, trimmed);
+    }
+
+    /// On any number of threads, the same burn record for record, with
+    /// points too; with chunks small enough that several pieces walk
+    /// theirs on several threads.
+    #[test]
+    fn burn_par_is_burn() {
+        let (set, south, north) = grid();
+        let bands = [
+            Band {
+                rows: 0..8,
+                to_world: &south,
+            },
+            Band {
+                rows: 8..16,
+                to_world: &north,
+            },
+        ];
+        let mut geoms = polygons();
+        geoms.push(Geometry::MultiPoint(
+            (0..50)
+                .map(|k| Coord {
+                    x: -175.0 + 7.0 * k as f64,
+                    y: -70.0 + 2.9 * k as f64,
+                })
+                .collect(),
+        ));
+        let one = set.burn(&geoms, &bands, 1.0, BurnMode::Coverage).unwrap();
+        assert!(!one.points.is_empty());
+        for (threads, trim) in [
+            (0, true),
+            (1, true),
+            (2, true),
+            (3, true),
+            (8, true),
+            (3, false),
+        ] {
+            let par = set
+                .burn_with(&geoms, &bands, 1.0, BurnOptions::coverage(), trim, threads)
+                .unwrap();
+            assert_eq!(one, par, "{threads} threads, trim {trim}");
+        }
+        // the walk's errors come back, not a panic
+        assert!(set
+            .burn_par(&geoms, &bands, f64::NAN, BurnMode::Coverage, 4)
+            .is_err());
     }
 
     /// Rings far from a strip lose their vertices there: one apart from it

@@ -794,7 +794,52 @@ dependency, edges straight in longitude and latitude):
     in 1.0 s onto eORCA1 and 3.1 s onto ORCA2 as built in #85; with the
     filter below, 0.74 s and 1.1 s. No cell sums past 1, and Antarctica
     lands only in the south band.
-- **Not built.** `burn_par`.
+- **Not built.** Nothing more for burning; `burn_par` below.
+
+### Burning on several threads (built, 4h follow-up)
+
+Built (2026-11-17, decided with the user: the same signature as `burn`
+plus `threads`, projection on the calling thread):
+`MeshSet::burn_par(geoms, bands, tolerance, opts, threads)`. `burn` is
+`burn_par` on one thread.
+
+- **Band by band**, as `burn` goes, so the first error is the same one.
+  - Each band's polygons go to its world on the calling thread, because
+    a `CrsTransform` needn't be `Sync` (libproj's handles aren't).
+  - The band's pieces then filter and shorten their polygons in
+    parallel, largest pieces first.
+  - The pieces' polygons are walked into their index spaces in chunks of
+    about equal vertex counts (`vertex_chunks`, as `QuadMesh::burn_par`
+    cuts them), largest chunks first, from one queue over all the
+    band's pieces. So one big piece doesn't hold up the rest.
+  - Each piece is burned with `controlledburn::burn_par` in order. That
+    stage is cheap (0.02 s of ORCA2's 1.1 s), and controlledburn sizes
+    its threads to the work.
+- **The same records.** The walk is per geometry and the chunks are put
+  back in order, so each piece hands controlledburn the same plane as
+  on one thread. controlledburn's own `burn_par` gives `burn`'s records.
+  With one thread nothing is spawned (for wasm), and the steps are
+  `QuadMesh::burn`'s. `walk.rs` now shares `map_geoms`, `vertex_chunks`
+  and a `burn_plane` (the controlledburn step) with the crate.
+- **Tests.**
+  - Unit (`src/mesh/set.rs`): on the damaged two-band grid, the 65
+    polygons and 50 points burn the same on 0, 1, 2, 3 and 8 threads,
+    filtered, and on 3 threads unfiltered.
+  - `tests/mesh_set.rs`: boxes and points on the analytic grid, on 0, 2
+    and 5 threads.
+- **On the CMIP6 files** (scratch, 32 cores): Natural Earth 10 m
+  countries, the same records on every count. The projection is the
+  floor: 0.33 s at 1 m and 1.6 s at 0.01 m on ORCA2.
+
+  | | 1 thread | 2 | 4 | 8 | 16 |
+  |---|---|---|---|---|---|
+  | eORCA1, 1 m | 0.75 s | 0.54 | 0.45 | 0.40 | 0.40 |
+  | eORCA1, 0.01 m | 4.00 s | 2.86 | 2.32 | 2.06 | 2.02 |
+  | ORCA2, 1 m | 1.12 s | 0.73 | 0.54 | 0.44 | 0.40 |
+  | ORCA2, 0.01 m | 5.59 s | 3.65 | 2.69 | 2.20 | 1.99 |
+- **Not built.** Projection in parallel. It would take a transform per
+  thread: a closure that builds one, as `weights_to` builds a
+  transformer per piece. The user chose to keep `burn`'s signature.
 
 ### Walking only what reaches a piece (built, 4h follow-up)
 

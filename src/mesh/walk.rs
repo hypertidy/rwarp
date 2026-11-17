@@ -1159,19 +1159,31 @@ pub(crate) fn burn_with(
         plane.extend(pl);
         points.extend(pt);
     }
-    let grid = GridSpec::new(0.0, 0.0, ncol as f64, nrow as f64, ncol as u32, nrow as u32);
-    let mut res =
-        controlledburn::burn_par(&plane, &grid, opts, threads).map_err(|e| e.to_string())?;
+    let mut res = burn_plane(ncol, nrow, &plane, opts, threads)?;
     res.points.extend(points);
     Ok(res)
 }
 
+/// Burn index-space geometries on the `ncol` by `nrow` grid with
+/// controlledburn, on up to `threads` threads (it uses fewer for less
+/// work, and the calling thread alone for one).
+pub(crate) fn burn_plane(
+    ncol: usize,
+    nrow: usize,
+    plane: &[Geometry],
+    opts: BurnOptions,
+    threads: usize,
+) -> Result<BurnResult, String> {
+    let grid = GridSpec::new(0.0, 0.0, ncol as f64, nrow as f64, ncol as u32, nrow as u32);
+    controlledburn::burn_par(plane, &grid, opts, threads).map_err(|e| e.to_string())
+}
+
 /// Index-space geometries (one per input, in order) and points.
-type Mapped = (Vec<Geometry>, Vec<GridPoint>);
+pub(crate) type Mapped = (Vec<Geometry>, Vec<GridPoint>);
 
 /// Contiguous `[a, b)` ranges of `geoms`, at most `n` of them, of
 /// about equal vertex counts; one range when a thread isn't worth it.
-fn vertex_chunks(geoms: &[Geometry], n: usize) -> Vec<(usize, usize)> {
+pub(crate) fn vertex_chunks(geoms: &[Geometry], n: usize) -> Vec<(usize, usize)> {
     // at least this many vertices a chunk
     const MIN_VERTICES: usize = 1 << 12;
     let w: Vec<usize> = geoms.iter().map(vertices).collect();
@@ -1193,7 +1205,7 @@ fn vertex_chunks(geoms: &[Geometry], n: usize) -> Vec<(usize, usize)> {
     out
 }
 
-fn vertices(g: &Geometry) -> usize {
+pub(crate) fn vertices(g: &Geometry) -> usize {
     let poly = |p: &Polygon| p.rings.iter().map(Vec::len).sum::<usize>();
     match g {
         Geometry::Polygon(p) => poly(p),
@@ -1206,7 +1218,7 @@ fn vertices(g: &Geometry) -> usize {
 /// Map `geoms` (whose first has id `id0`) into the index plane, each
 /// polygon at every whole period at which it overlaps the grid, with
 /// `period`.
-fn map_geoms(
+pub(crate) fn map_geoms(
     geoms: &[Geometry],
     id0: usize,
     nrow: usize,

@@ -553,6 +553,27 @@ fn burn_boxes_against_their_areas() {
     assert!(d < 1e-6, "{d:e}");
 }
 
+/// `burn_par` gives `burn`'s records on any number of threads.
+#[test]
+fn burn_par_is_burn() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let (south, north) = (World(0, false), World(1, false));
+    let bands = [Band { rows: 0..EQUATOR, to_world: &south }, Band { rows: EQUATOR..NR, to_world: &north }];
+    let poly = |b| Geometry::Polygon(Polygon::new(vec![lonlat_box(b)]));
+    let geoms = vec![
+        poly([-180.0, 180.0, -90.0, 90.0]),
+        poly([-180.0, 180.0, 60.0, 90.0]),
+        poly([-127.5, 232.5, -90.0, -48.0]),
+        poly([150.0, 210.0, -60.0, -30.0]),
+        Geometry::MultiPoint((0..40).map(|k| Coord { x: 9.0 * k as f64, y: -75.0 + 4.0 * k as f64 }).collect()),
+    ];
+    let one = s.burn(&geoms, &bands, 0.1, BurnMode::Coverage).unwrap();
+    for threads in [0, 2, 5] {
+        assert_eq!(one, s.burn_par(&geoms, &bands, 0.1, BurnMode::Coverage, threads).unwrap(), "{threads} threads");
+    }
+}
+
 /// Points are found in the cell that holds them, in either band and in
 /// the cap; points in a cell left out, in the gap where the bands meet,
 /// or off the grid are found nowhere.
