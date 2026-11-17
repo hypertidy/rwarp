@@ -59,6 +59,28 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Fixed
 
+- `QuadMesh::ring_to_index` (and so `burn`, `burn_par`, `cover_ring`) on
+  meshes with cells of no area inside them, such as a T-point pivot of a
+  tripolar grid, a collapsed column, or a pole row in a polar projection
+  (stage 4b, #37). Four fixes:
+  - A ring crossing such a cell jumps in index space at one world point.
+    It was joined straight to the next piece's end, misplacing the
+    following cell's coverage. It's now linked through the collapsed
+    cell, and, where that cell is on the boundary, across the walls. A
+    jump the walk can't follow is an error, not a wrong ring.
+  - The equal-area split of a cell with a side of no length (a triangle)
+    put its centre on the collapsed corner and its unit centre outside
+    the unit square, so it was inexact and placed index points outside
+    the cell. It's now exact.
+  - A vertex at a collapsed corner took a position from another of the
+    cell's triangles.
+  - A ring starting on a corner whose owner had no area was taken as
+    starting outside the mesh.
+  - Bounded meshes without such cells give the same output bit for bit.
+  - Also: a cell's area that is zero to rounding is now zero, so a cell
+    collapsed onto a line, with its corners not quite on it, no longer
+    takes an orientation and gets the mesh refused as folded.
+
 - `QuadMesh::ring_to_index` for a ring that touches the mesh at a single
   boundary point from outside: it left and re-entered at the same point,
   and the walk closed it along the whole boundary, so `burn` and
@@ -78,15 +100,37 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `QuadMesh::from_cf_bounds`: a mesh from each cell's own four vertices,
+  CF bounds (`lon_bnds(j, i, 4)`) or SCRIP corners
+  (`grid_corner_lon(grid_size, 4)`), with a `Halo` of rows and columns
+  dropped first (stage 4b, #37, decision N3).
+  - Vertex order: found from the data (CF's or any rotation or
+    reflection of it).
+  - Shared corners: neighbours must share them, to a thousandth of a
+    cell.
+  - Overlap: refused, as a halo left in gives.
+  - NEMO: `Halo::NEMO_F_PIVOT` and `Halo::NEMO_T_PIVOT` are the ORCA
+    layouts as CMIP6 files have them (the last two columns, the first
+    row and the last row). At a T pivot the row the fold runs through is
+    halved, and its model cells are two mesh cells.
+  - Real data: checked on IPSL's eORCA1 and ORCA2. Areas agree with
+    `areacello` to 1e-4 in total, and a cap over the fold is covered to
+    1e-10 of its area. Both files have land cells (eORCA1 south of 76 S,
+    flattened by a north-polar projection; corrupt bounds in ORCA2) that
+    are refused, so for now those rows are dropped.
+- `QuadMesh::find_overlap`: two cells that overlap, a point inside one
+  owned by the other too, for copies that keep orientation, which
+  `from_corners` doesn't check.
+
 - `QuadMesh::ring_to_index`, and so `burn`, `burn_par` and `cover_ring`,
   cross outer walls that meet in the world: a periodic grid's seam
   (column line `ncol` on column line 0) and a tripolar grid's fold (the
   last row line on itself, corner `i` on corner `ncol - i`), with
   nothing declared (stage 4a of `design/curvilinear-frontend.md`, #37).
   Give the grid's corners in a projection in which it is one sheet:
-  for a global ocean grid, Lambert azimuthal equal-area on the north
-  pole, whose planar areas are true areas. The walls need to agree only
-  to rounding.
+  for an ocean grid's tripolar north, Lambert azimuthal equal-area on
+  the north pole, whose planar areas are true areas. The walls need to
+  agree only to rounding.
   - Before: a ring crossing a seam or fold was joined across the mesh in
     index space, and cells along the crossing were off by up to a whole
     cell.

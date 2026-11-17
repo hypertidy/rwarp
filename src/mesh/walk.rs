@@ -23,8 +23,15 @@
 //! the other, its index position jumps between the walls at one world
 //! point. That is taken as an exit and a re-entry with nothing outside
 //! between, and the arc chosen runs along the walls. A vertex on such a
-//! wall is placed in each piece's own cell, not only in the cell that
+//! wall is placed in each piece's own triangle, not only in the cell that
 //! owns it.
+//!
+//! A cell with no area (a collapsed column, a T-point pivot of a tripolar
+//! grid) makes the same kind of jump inside the mesh: the ring passes from
+//! one side of it to another at one world point. The walk links the two
+//! straight through the collapsed cell's index square, which weighs
+//! nothing, and where that cell is on an outer wall, through it to the
+//! wall and then across the walls ([`Link`]).
 //!
 //! The walk uses the equal-area map whatever the mesh's [`CellMap`] (which
 //! is for its point methods): under `Bilinear` the preimage of a straight
@@ -153,6 +160,55 @@ struct Node {
 
 fn lerp(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
     [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]
+}
+
+/// Whether two index points are different points, not one to rounding.
+fn apart(p: [f64; 2], q: [f64; 2]) -> bool {
+    (p[0] - q[0]).abs() > JUMP_EPS || (p[1] - q[1]).abs() > JUMP_EPS
+}
+
+/// How the walk goes from the end of one piece to the start of the next
+/// when they are one world point at two index points. Nothing with area
+/// lies between them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Link {
+    /// The same index point.
+    Same,
+    /// Straight through one cell with no area whose closure holds both.
+    Direct,
+    /// Across two outer walls that meet in the world (a seam, a fold).
+    Walls,
+    /// Through a cell with no area to this point on its outer wall, then
+    /// across the walls (`false`); or across the walls first (`true`).
+    Via([f64; 2], bool),
+}
+
+/// Push the nodes that take the walk across `link` to index point `q` (at
+/// world point `w`).
+fn push_link(nodes: &mut Vec<Node>, link: Link, q: [f64; 2], w: [f64; 2]) {
+    let mut node = |idx: [f64; 2], out_before: bool| {
+        nodes.push(Node {
+            idx: Some(idx),
+            world: w,
+            out_before,
+        })
+    };
+    match link {
+        Link::Same => {}
+        Link::Direct => node(q, false),
+        Link::Walls => node(q, true),
+        Link::Via(y, walls_first) => {
+            node(y, walls_first);
+            node(q, !walls_first);
+        }
+    }
+}
+
+fn lost(w: [f64; 2]) -> String {
+    format!(
+        "the ring crosses cells with no area at ({}, {}) in a way the walk can't follow",
+        w[0], w[1]
+    )
 }
 
 /// The winding number of a closed polygon about `p`.
@@ -402,13 +458,13 @@ impl QuadMesh {
                         let p0 = match e0 {
                             Some(e) => self.crossing(e, a, b),
                             None => ia
-                                .filter(|&q| Self::in_cell(q, r, c))
+                                .filter(|&q| self.in_triangle(q, r, c, k))
                                 .unwrap_or_else(|| self.tri_index(r, c, k, a)),
                         };
                         let p1 = match e1 {
                             Some(e) => self.crossing(e, a, b),
                             None => ib
-                                .filter(|&q| Self::in_cell(q, r, c))
+                                .filter(|&q| self.in_triangle(q, r, c, k))
                                 .unwrap_or_else(|| self.tri_index(r, c, k, b)),
                         };
                         out.push(Piece { t0, t1, p0, p1 });
@@ -462,12 +518,18 @@ impl QuadMesh {
     ) {
         scratch.seen.clear();
         scratch.pieces.clear();
-        let start = self.locate(a, hint);
-        let start = match &start {
-            Some(s) => std::slice::from_ref(s),
-            None => &[],
+        // the cell that owns `a`; failing that (`a` outside, or on a corner
+        // whose owner by the low-index rule has no area, as next to a
+        // tripolar grid's pivot) the cells near it
+        let start: Vec<(usize, usize)> = match self.locate(a, hint) {
+            Some(s) => vec![s],
+            None => self
+                .buckets()
+                .candidates(a)
+                .map(|k| (k / self.ncol, k % self.ncol))
+                .collect(),
         };
-        self.flood(a, b, ia, ib, start, scratch);
+        self.flood(a, b, ia, ib, &start, scratch);
         let pieces = &mut scratch.pieces;
         pieces.sort_by(|p, q| p.t0.total_cmp(&q.t0).then(p.t1.total_cmp(&q.t1)));
         // Complete when the pieces join from 0 to 1; otherwise the segment
@@ -556,9 +618,108 @@ impl QuadMesh {
                 || (p[0] - nc).abs() <= WALL_EPS
                 || (p[1] - nr).abs() <= WALL_EPS
         };
-        ((p[0] - q[0]).abs() > JUMP_EPS || (p[1] - q[1]).abs() > JUMP_EPS)
-            && on_wall(p)
-            && on_wall(q)
+        apart(p, q) && on_wall(p) && on_wall(q)
+    }
+
+    /// The cells whose closure holds index point `p`.
+    fn cells_at(&self, p: [f64; 2]) -> Vec<(usize, usize)> {
+        let span = |v: f64, n: usize| {
+            let lo = ((v - WALL_EPS).floor() as i64).clamp(0, n as i64 - 1) as usize;
+            let hi = ((v + WALL_EPS).floor() as i64).clamp(0, n as i64 - 1) as usize;
+            lo..=hi
+        };
+        let mut out = Vec::new();
+        for r in span(p[1], self.nrow) {
+            for c in span(p[0], self.ncol) {
+                if Self::in_cell(p, r, c) {
+                    out.push((r, c));
+                }
+            }
+        }
+        out
+    }
+
+    fn flat(&self, (r, c): (usize, usize)) -> bool {
+        self.cells[r * self.ncol + c].area2 == 0.0
+    }
+
+    /// The index point of world point `w` on an outer side of cell
+    /// `(row, col)`, if `w` is on one.
+    fn on_outer_side(&self, row: usize, col: usize, w: [f64; 2]) -> Option<[f64; 2]> {
+        let outer = [
+            row == 0,
+            col + 1 == self.ncol,
+            row + 1 == self.nrow,
+            col == 0,
+        ];
+        (0..4).filter(|&k| outer[k]).find_map(|k| {
+            let e = Edge::Side { row, col, k };
+            let (e0, e1) = self.edge_world(e);
+            let d = [e1[0] - e0[0], e1[1] - e0[1]];
+            let len2 = d[0] * d[0] + d[1] * d[1];
+            let s = if len2 > 0.0 {
+                (((w[0] - e0[0]) * d[0] + (w[1] - e0[1]) * d[1]) / len2).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let f = lerp(e0, e1, s);
+            let tol = 1e-9 * (w[0].abs() + w[1].abs()) + 1e-6 * len2.sqrt();
+            ((f[0] - w[0]).abs() <= tol && (f[1] - w[1]).abs() <= tol)
+                .then(|| self.edge_index(e, s))
+        })
+    }
+
+    /// How to go from index point `p` to index point `q`, both at world
+    /// point `w` with no area between them, or `None` when the walk can't
+    /// tell (a chain of cells with no area).
+    fn link(&self, p: [f64; 2], q: [f64; 2], w: [f64; 2]) -> Option<Link> {
+        if !apart(p, q) {
+            return Some(Link::Same);
+        }
+        let (at_p, at_q) = (self.cells_at(p), self.cells_at(q));
+        let shared = |flat: bool| {
+            at_p.iter()
+                .any(|&k| self.flat(k) == flat && at_q.contains(&k))
+        };
+        if shared(true) {
+            return Some(Link::Direct);
+        }
+        if self.glued(p, q) {
+            return Some(Link::Walls);
+        }
+        if shared(false) {
+            // a triangle of a degenerate split (an inexact cell)
+            return Some(Link::Direct);
+        }
+        // a cell with no area at the boundary, as at the pivot of a
+        // tripolar grid's fold where it meets the seam
+        for (ends, walls_first) in [(&at_p, false), (&at_q, true)] {
+            for &k in ends.iter().filter(|&&k| self.flat(k)) {
+                if let Some(y) = self.on_outer_side(k.0, k.1, w) {
+                    let (a, b) = if walls_first { (p, y) } else { (y, q) };
+                    if self.glued(a, b) {
+                        return Some(Link::Via(y, walls_first));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether index point `p` is in the closure of triangle `k` of cell
+    /// `(row, col)` in index space, to rounding. (A cell's closure is not
+    /// enough: where two corners are one world point, a vertex there has
+    /// an index point at each, one per triangle.)
+    fn in_triangle(&self, p: [f64; 2], row: usize, col: usize, k: usize) -> bool {
+        let (c, r) = (col as f64, row as f64);
+        let at = |u: [f64; 2]| [c + u[0], r + u[1]];
+        let ux = self.cells[row * self.ncol + col].unit;
+        let (x, a, b) = (at(ux), at(UNIT[k]), at(UNIT[(k + 1) % 4]));
+        let s = orient(x, a, b).signum();
+        s != 0.0
+            && [orient(x, a, p), orient(a, b, p), orient(b, x, p)]
+                .iter()
+                .all(|&v| s * v >= -WALL_EPS)
     }
 
     /// Whether index point `p` is in cell `(row, col)`'s closure, to
@@ -624,17 +785,25 @@ impl QuadMesh {
                 if p.t1 <= cur + T_EPS {
                     continue;
                 }
-                let prev = nodes.last().and_then(|q| q.idx);
-                let glued = p.t0 <= cur + T_EPS && prev.is_some_and(|q| self.glued(q, p.p0));
-                if p.t0 > cur + T_EPS || glued {
+                let w0 = lerp(a, b, p.t0);
+                let link = match nodes.last().and_then(|q| q.idx) {
+                    Some(q) if p.t0 <= cur + T_EPS => {
+                        self.link(q, p.p0, w0).ok_or_else(|| lost(w0))?
+                    }
+                    _ => Link::Same,
+                };
+                if p.t0 > cur + T_EPS || link == Link::Walls {
                     // re-entry after a stretch outside (or a start
                     // outside), or across two outer walls that meet in
                     // the world (a seam, a fold): closed along the walls
                     nodes.push(Node {
                         idx: Some(p.p0),
-                        world: lerp(a, b, p.t0),
+                        world: w0,
                         out_before: true,
                     });
+                } else if link != Link::Same {
+                    // across a cell with no area
+                    push_link(&mut nodes, link, p.p0, w0);
                 } else if cur == 0.0 && vidx[k].is_none() {
                     // starts on the boundary at a vertex the mesh does not own
                     nodes.push(Node {
@@ -651,8 +820,9 @@ impl QuadMesh {
                 }
                 if p.t1 >= 1.0 - T_EPS {
                     // the vertex's own position, unless it is on the other
-                    // side of a seam or fold from this piece
-                    let v = vidx[k1].filter(|&q| !self.glued(q, p.p1));
+                    // side of a seam, a fold or a cell with no area from
+                    // this piece
+                    let v = vidx[k1].filter(|&q| !apart(q, p.p1));
                     nodes.push(Node {
                         idx: Some(v.unwrap_or(p.p1)),
                         world: b,
@@ -675,22 +845,18 @@ impl QuadMesh {
                 });
             }
         }
-        // a ring that starts on a seam or fold and comes back to its start
-        // from the other side
+        // a ring that starts on a seam, a fold or a cell with no area and
+        // comes back to its start from the other side
         if let (Some((q, pushed)), Some(l)) = (first, nodes.last().and_then(|q| q.idx)) {
-            if self.glued(l, q) {
+            let link = self.link(l, q, pts[0]).ok_or_else(|| lost(pts[0]))?;
+            if link != Link::Same {
+                let mut head = Vec::new();
+                push_link(&mut head, link, q, pts[0]);
                 if pushed {
-                    nodes[0].out_before = true;
-                } else {
-                    nodes.insert(
-                        0,
-                        Node {
-                            idx: Some(q),
-                            world: pts[0],
-                            out_before: true,
-                        },
-                    );
+                    // the start is nodes[0] already; keep its new link
+                    nodes[0].out_before = head.pop().is_some_and(|n| n.out_before);
                 }
+                nodes.splice(0..0, head);
             }
         }
         if nodes.iter().all(|q| q.idx.is_none()) {

@@ -20,7 +20,7 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 |---|---|---|---|
 | N1 | cell map default for coverage | coverage uses `EqualArea` on every mesh; `Bilinear` default for point methods | decided: A, `EqualArea` for coverage (2026-11-16) |
 | N2 | non-convex cells | equal-area split; fallback note never seen | keep, and test that it never fires |
-| N3 | folds other than tripolar | folds that flip orientation refused at construction | decided: A, refuse; one mesh per scan for overlapping swaths; stage 4 adds overlaps that keep orientation (2026-11-17) |
+| N3 | folds other than tripolar | folds that flip orientation refused at construction | decided: A, refuse; one mesh per scan for overlapping swaths; overlaps that keep orientation refused by `from_cf_bounds` (4b) (2026-11-17) |
 | N4 | `mesh` public or crate-private | public, documented unstable | decided: A, public; may break at a 0.x minor release, not a patch (2026-11-17) |
 | N5 | robust predicates | plain `f64`, no snapping yet | plain `f64`, snap first |
 | N6 | `f64` edge fractions in controlledburn | `f32` in `burn`, `f64` in `CoverageWindow` | decided: `f32`, documented (0.3.0) |
@@ -100,28 +100,29 @@ only) is the caller's choice. The `mesh` module docs show it
 ("Overlapping swaths: one mesh per scan", a doctest).
 
 Stage 4 (#37) extends the refusal to overlaps that keep orientation,
-which today's test misses:
+which the orientation test misses (built, 4b, 2026-11-17):
 
 - `QuadMesh::from_corners` refuses a mesh whose cells have both
   orientations. That catches overlapping swath scans: towards the swath
   edges the cells between two scans flip.
 - A copy that keeps orientation passes. NEMO's halos are that: the
   cyclic columns repeat at a shift in index space, and the north-fold
-  row repeats rotated 180 degrees in index space (T-pivot: the last row
-  mirrors row `jpj - 2`; F-pivot: row `jpj - 1`). A shift and a
-  half-turn both keep orientation, so an ORCA mesh with its halos would
-  be accepted and those cells counted twice. (Worked out from the index
-  maps, not yet seen on an ORCA file.)
-- In stage 4 the constructor from CF bounds takes the halo layout and
-  drops the duplicates (the seam and fold are walls that meet, which the
-  walk crosses since 4a, not data), and the mesh is
-  checked for overlap: each cell's centre located with `locate_all`, the
-  mesh refused if any centre has two owners. That is one location per
-  cell; it catches copies of any kind, though not an overlap thinner
-  than half a cell.
-
-Until then the `from_corners` docs say to drop duplicated rows and
-columns first.
+  row repeats rotated 180 degrees in index space. At an F pivot the last
+  row mirrors row `jpj - 1`. At a T pivot it mirrors row `jpj - 2`, and
+  row `jpj - 1` mirrors itself, its cells the same ground in pairs. A
+  shift and a half-turn both keep orientation, so an ORCA mesh with its
+  halos would be accepted and those cells counted twice. Seen on IPSL's
+  eORCA1 (F) and ORCA2 (T) CMIP6 files.
+- `QuadMesh::from_cf_bounds` takes the halo layout (`Halo`, with
+  `NEMO_F_PIVOT` and `NEMO_T_PIVOT`) and drops the duplicates. At a T
+  pivot it keeps the lower half of each cell of the row that mirrors
+  itself. The seam and fold are walls that meet, which the walk crosses
+  since 4a, not data. It then refuses the mesh if
+  `QuadMesh::find_overlap` finds two cells that overlap. That check
+  probes each cell once, at a point inside it, and reports a second
+  owner; it catches copies of any kind, though not an overlap thinner
+  than about half a cell. `from_corners` doesn't run it (it costs about
+  what building the mesh does), and its docs point to it.
 
 ![Tripolar fold vs overlapping sheets](figures/folds.svg)
 

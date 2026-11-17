@@ -157,11 +157,57 @@ Outer walls that meet in the world are crossed like any side, with
 nothing to declare. That covers a periodic grid whose seam has no jump in
 its coordinates (column line `ncol` on column line 0) and a tripolar ocean
 grid, whose last row line folds onto itself. Give the grid its corners in
-a projection in which it is one sheet. For a global ocean grid, Lambert
-azimuthal equal-area on the north pole does this, and its planar areas
-are true areas. A tripolar grid can't be a mesh in longitude and latitude,
-since the geographic pole is inside one of its cells. Coordinates that
-jump at the seam (longitudes 360 apart) are not handled yet.
+a projection in which it is one sheet. For an ocean grid's tripolar
+north, Lambert azimuthal equal-area on the north pole does this, and its
+planar areas are true areas. It holds down to the Southern Ocean. Near
+80 S it flattens cells 500 to 1, and an ice-shelf row there can become a
+bow-tie, which is refused. A tripolar grid can't be a mesh in longitude
+and latitude, since the geographic pole is inside one of its cells.
+Coordinates that jump at the seam (longitudes 360 apart) are not handled
+yet.
+
+### CF bounds and ocean-model halos
+
+`QuadMesh::from_cf_bounds` builds a mesh from each cell's own four
+vertices: CF's `lon_bnds(j, i, 4)`, or SCRIP's `grid_corner_lon(grid_size,
+4)` with `grid_dims` giving the columns, then the rows. The vertex order
+is found from the data (CF's, or any rotation or reflection of it), and
+neighbours must agree on the corners they share.
+
+Ocean-model files store some cells twice (a halo), and those copies have
+to go or they are counted twice. A `Halo` names the columns and rows to
+drop. `Halo::NEMO_F_PIVOT` (eORCA1, ORCA1) and `Halo::NEMO_T_PIVOT`
+(ORCA2) are NEMO's layout as CMIP6 files have it: the last two columns
+repeat the first two; the first row is land with collapsed bounds; the
+last row repeats one below it. At a T pivot the fold runs through the
+centres of the row before that one, so each of its cells is the same
+ground as its mirror. The mesh keeps the half of each below the fold, and
+a model cell there is two mesh cells, one half each.
+
+A wrong layout is refused rather than counted twice. Neighbours that
+don't share corners are refused, and so are cells that overlap, which is
+what a halo left in gives (`QuadMesh::find_overlap`). The flag for the
+centre fold is refused on a row that doesn't mirror itself.
+
+```rust,ignore
+use rwarp::mesh::{CellMap, Halo, QuadMesh};
+
+// vertices_longitude / vertices_latitude (ny, nx, 4) from an eORCA1 file,
+// projected to Lambert azimuthal equal-area on the north pole
+let mesh = QuadMesh::from_cf_bounds(nx, ny, &xb, &yb, Halo::NEMO_F_PIVOT, CellMap::EqualArea)?;
+// mesh cell (row, col) is the file's (row + 1, col)
+```
+
+On IPSL's CMIP6 eORCA1 north of 76 S and ORCA2 north of 49 N, mesh cell
+areas agree with `areacello` to 1e-4 in total. A cap north of 60 N, across
+the fold, both pivots and the seam, is covered to 1e-10 of its area.
+Neither whole file builds as it stands; the cells that stop them are all
+land:
+
+- eORCA1's rows south of 76 S are too flattened in that projection.
+- IPSL's ORCA2 bounds are corrupt over land between 9 N and 49 N.
+
+Drop such rows with the halo's `rows`, or repair the bounds, for now.
 
 ### Overlapping swaths
 
@@ -187,9 +233,11 @@ example, which checks the area each scan covers, is in the
 [`mesh` module docs](../api/rwarp/mesh/index.html#overlapping-swaths-one-mesh-per-scan).
 
 A row or column stored twice, such as an ocean model's halo, keeps its
-orientation and isn't refused yet: drop duplicated rows and columns
-first. Halos, CF bounds and a declared period for longitudes are the
-rest of stage 4 ([#37](https://github.com/hypertidy/rwarp/issues/37)).
+orientation, and `from_corners` doesn't check for it (the check costs
+about what building the mesh does). `QuadMesh::find_overlap` finds it,
+and `from_cf_bounds` refuses it. A declared period for longitudes, and
+the comparison with ESMF, are the rest of stage 4
+([#37](https://github.com/hypertidy/rwarp/issues/37)).
 
 `mesh` is public and unstable: it changes more often than the rest of
 the crate and may break at any 0.x minor release, though not at a patch
