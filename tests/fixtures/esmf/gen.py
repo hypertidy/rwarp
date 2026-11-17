@@ -253,17 +253,24 @@ def write_map(path, header, kind, result):
 # folds"). Planar areas there are areas on the sphere.
 RADIUS = 6371229.0
 
+# Elementary functions from the C library, element by element. numpy's own
+# (SIMD) versions differ in the last bit between CPUs, which would make the
+# tripolar fixtures depend on the runner.
+_sin, _cos, _sinh, _cosh, _asin, _atan2, _hypot = (
+    np.vectorize(f, otypes=[float])
+    for f in (math.sin, math.cos, math.sinh, math.cosh, math.asin, math.atan2, math.hypot))
+
 
 def laea(lon, lat):
-    rho = 2 * RADIUS * np.sin(np.radians(90 - lat) / 2)
+    rho = 2 * RADIUS * _sin(np.radians(90 - lat) / 2)
     lam = np.radians(lon)
-    return rho * np.sin(lam), -rho * np.cos(lam)
+    return rho * _sin(lam), -rho * _cos(lam)
 
 
 def laea_inv(x, y):
-    rho = np.hypot(x, y)
-    lat = 90 - 2 * np.degrees(np.arcsin(rho / (2 * RADIUS)))
-    return np.degrees(np.arctan2(x, -y)), lat
+    rho = _hypot(x, y)
+    lat = 90 - 2 * np.degrees(_asin(rho / (2 * RADIUS)))
+    return np.degrees(_atan2(x, -y)), lat
 
 
 # The tripolar cap: confocal ellipses x = a cosh(mu) cos(t), y = a sinh(mu)
@@ -295,8 +302,8 @@ def tripolar_corners(ncol, nrow, a, mu, turn, shift):
     k = np.minimum(i, ncol - i)
     t = 2 * np.pi * k / ncol
     sign = np.where(i > ncol // 2, -1.0, 1.0)
-    ex = a * np.cosh(m) * np.cos(t)
-    ey = a * np.sinh(m) * np.sin(t) * sign
+    ex = a * _cosh(m) * _cos(t)
+    ey = a * _sinh(m) * _sin(t) * sign
     c, s = math.cos(math.radians(turn)), math.sin(math.radians(turn))
     return ex * c - ey * s + shift[0], ex * s + ey * c + shift[1]
 
