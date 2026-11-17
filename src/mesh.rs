@@ -222,6 +222,18 @@
 //! assert_eq!(cols, vec![0, 35]);
 //! ```
 //!
+//! # A whole ocean grid: [`MeshSet`]
+//!
+//! No one projection holds a whole tripolar ocean grid with straight-edged
+//! cells, and model files often have land cells with damaged bounds.
+//! [`MeshSet::from_cf_bounds`] splits the rows into [`Band`]s, each in a
+//! projection that holds it (north-polar and south-polar Lambert azimuthal
+//! equal-area for an ORCA grid), leaves out cells that aren't valid where
+//! a mask says they may go (land), and covers the rest with rectangular
+//! [`Piece`]s, each a mesh of its own. [`MeshSet::weights_to`] and
+//! [`MeshSet::weights_onto`] give conservative weights from and onto the
+//! whole grid, in the file's numbering.
+//!
 //! # CF bounds, SCRIP corners and halos
 //!
 //! [`QuadMesh::from_cf_bounds`] takes each cell's own four vertices (CF's
@@ -327,6 +339,7 @@ use std::sync::OnceLock;
 mod cf;
 mod period;
 mod rect;
+mod set;
 mod source;
 mod target;
 mod walk;
@@ -335,6 +348,7 @@ pub use cf::Halo;
 pub use period::{unwrap_bounds, unwrap_grid};
 pub(crate) use period::Period;
 pub use rect::Rectilinear;
+pub use set::{Band, MeshSet, Piece};
 pub use source::MeshTransformer;
 pub use target::{MeshTarget, WORLD_GT};
 
