@@ -3,7 +3,9 @@
 Status: stages 1 and 2 implemented (`src/mesh.rs`, `src/mesh/walk.rs`,
 `src/mesh/rect.rs`; 2026-10-31 and 2026-11-01), stage 3 built (#36,
 #72), stage 4 started: walls that meet in the world (a seam, a fold) are
-walked across (4a, 2026-11-17; section 3). Later stages proposed.
+walked across (4a, 2026-11-17; section 3), and meshes come from CF bounds
+and SCRIP corners with ocean-model halos dropped and overlapping cells
+refused (4b, 2026-11-17; section 3). Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -20,8 +22,7 @@ that keeps the four triangles furthest from degenerate), ownership by
 canonical side orientation, `locate` with a walking hint, `locate_all`,
 and CSR buckets built on first use. Not yet: a declared period for
 coordinates that jump at the seam (section 3; there is no `Topology`
-enum), `from_cf_bounds`, the boundary index (it belongs with the walk in
-stage 2). Decisions 1 to 5 below were taken
+enum), the boundary index (it belongs with the walk in stage 2). Decisions 1 to 5 below were taken
 at their recommendations, provisionally; 1, 3 and 4 are now decided (N1,
 N3 and N4 in `decisions.md`). `mesh` is public and unstable: it may break
 at a 0.x minor release, not a patch.
@@ -261,9 +262,125 @@ What stage 4 still needs:
   keeps planar areas true, with edges straight in that projection: not
   great circles, not rhumb lines. The difference from ESMF's great
   circles is second order in cell size, and the ESMF comparison measures
-  it.
-- CF bounds and SCRIP corners (`from_cf_bounds`), the halo layout, the
-  overlap check (N3), and the ESMF comparison.
+  it. One north-polar projection doesn't hold the whole globe, though
+  (4b, below): near 80 S its cells are flattened 500 to 1 or more, and
+  the bend of their long sides exceeds their width.
+- The ESMF comparison, and the southern rows of a global ORCA grid (a
+  second mesh in another projection, or longitude with a declared
+  period).
+
+### CF bounds, SCRIP corners and halos (built, 4b)
+
+Built (2026-11-17): `QuadMesh::from_cf_bounds(ncol, nrow, xb, yb, halo,
+map)` in `src/mesh/cf.rs`, for each cell's own four vertices, row-major
+with the vertex last: CF's `lon_bnds(j, i, 4)`, and SCRIP's
+`grid_corner_lon(grid_size, 4)` with `grid_dims` giving `ncol, nrow`.
+
+- **Halo.** `Halo { cols, rows, fold_through_centres }` names the columns
+  and rows dropped at each end before the mesh is built. Mesh cell
+  `(row, col)` is the file's `(row + rows[0], col + cols[0])`.
+- **Vertex order.** CF's, or any rotation or reflection of it, found from
+  the data: the first of the eight under which neighbours share corners.
+- **Shared corners.** Neighbours must agree to a thousandth of the larger
+  cell (rounding, `f32` storage), or the bounds are refused, with the two
+  cells named and a hint when the copies are 360 or 2 pi apart. Corner
+  `(j, i)` is taken from cell `(j, i)`, whose first vertex it is.
+- **Overlap (N3).** `QuadMesh::find_overlap` probes each cell once, at
+  the centroid of the larger triangle of the diagonal inside it, and
+  reports a second owner. `from_cf_bounds` refuses on one. It isn't run
+  by `from_corners`: on eORCA1 it costs about what building the mesh
+  does (30 ms against 24 ms for 100,000 cells, the bucket index
+  included).
+
+NEMO's layout, as CMIP6 files have it, checked on IPSL's eORCA1
+(F-point pivot) and ORCA2 (T-point pivot) from the public CMIP6 zarr
+store:
+
+- The last two columns repeat the first two.
+- The first row is the closed southern boundary: land, with eORCA1's
+  bounds collapsing each cell to a point, so they share no corners.
+- The last row repeats a row below it, mirrored by a half-turn: row
+  `ny - 2` at an F pivot, row `ny - 3` at a T pivot.
+- At a T pivot the fold runs through the centres of row `ny - 2`, which
+  mirrors itself: its cells are the same ground in pairs. The two pivot
+  cells in it are collapsed (one to a segment, one to a point).
+  IPSL's `areacello` gives one cell of each pair the whole area and the
+  other 0.
+
+`Halo::NEMO_F_PIVOT` and `Halo::NEMO_T_PIVOT` drop the last two columns,
+the first row and the last row. Dropping columns `[0, 2]` rather than
+`[1, 1]` keeps mesh column `c` the file's column `c`. At a T pivot, it
+also keeps the collapsed pivot cell off the seam (both layouts work).
+With `fold_through_centres` (T pivot) the last row is cut at the
+midpoints of its column-line sides and the lower halves kept. The top
+wall then folds onto itself, as at an F pivot, and a model cell of that
+row is two mesh cells, one half each. The flag is refused when that row
+doesn't mirror itself (an F pivot taken for a T). The other way round
+(a T pivot taken for an F), the row's overlapping pairs are refused.
+
+The walk needed four fixes for cells with no area, which a T pivot puts
+inside the mesh (and which polar projections and collapsed bounds give
+anyway):
+
+- A ring crossing one jumps in index space at one world point. It's now
+  linked straight through the collapsed cell. Where that cell is on the
+  boundary (a T pivot on the seam), it goes through the cell to its wall,
+  then across the walls. A jump the walk can't follow is an error, not a
+  wrong ring.
+- The equal-area split of a cell with a side of no length (a triangle)
+  was inexact, with its centre on the collapsed corner and its unit
+  centre outside the square. Sides of no length are now left out of the
+  test that every triangle has area. Its triangle on that side has none
+  in either space, and the split is exact.
+- A vertex at a collapsed corner has an index point per triangle, so a
+  piece takes the vertex's own position only when it lies in the piece's
+  triangle, not merely its cell.
+- A start vertex no cell owns (a corner whose owner by the low-index
+  rule has no area) seeds the flood from the cells near it.
+
+An area that is zero to rounding is now zero (`shoelace2` checks its
+forward error bound), so a collapsed cell whose corners are not quite on
+one line has no orientation of its own.
+
+Tested in `tests/mesh_cf.rs`. ORCA-like disks are written as CF bounds,
+halo and all, for both pivots and both column layouts:
+
+- random polygons and 80,000 more round the pivots, against the world
+  clip;
+- the mesh tiling the disk once;
+- the halved row's pairs summing to the file's cells;
+- every halo left in refused with its cause;
+- all eight vertex orders giving the same mesh bit for bit;
+- shared corners within rounding taken, and beyond it refused;
+- longitudes a period apart named.
+
+`tests/mesh_walk.rs` adds a collapsed column and a cell collapsed to a
+point. The bounded mesh hashes are unchanged.
+
+On the real files, projected to spherical north-polar LAEA:
+
+- **ORCA2, rows north of 49 N (180 x 34).** Every wrong layout is refused
+  with its cause. The mesh builds in 2.4 ms. Ocean cell areas against
+  `areacello` are 0.9998 in total; the median cell is -8e-5 and the worst
+  -1.4% (the halved fold row). A cap north of 60 N, over the fold, both
+  pivots and the seam, is covered to 2e-10 of its area.
+- **eORCA1 north of 76 S (360 x 283).** The same refusals, and a build in
+  54 ms. Areas are 0.9999 in total, with cells between -0.5% and +0.2%.
+  The cap is covered to 3e-11.
+
+Neither whole file builds, for reasons in the data, all on land:
+
+- eORCA1 south of 76 S has 377 bow-ties and 59 flipped cells in that
+  projection (its ice-shelf rows, flattened as above).
+- IPSL's ORCA2 bounds are corrupt over land between 9 N and 49 N: 119
+  bow-ties and 47 flipped cells, some of them spanning 30 degrees of
+  longitude.
+
+Both are refused, rightly for the walk, since a bad cell can spill a
+ring into good ones. For whole files, that needs a choice: drop the
+southern land rows (the halo's `rows[0]` does it), repair land bounds
+from the centres, or let a cell mask make holes (swath gaps, "later"
+below).
 
 - **Poles.** Cells straight in degrees that touch latitude 90 are valid
   planar quadrilaterals (possibly triangles). A pole *inside* a cell is
@@ -271,17 +388,18 @@ What stage 4 still needs:
   polar projection.
 - **Halos.** Ocean-model files often keep duplicated cells: NEMO's
   cyclic columns, and at the north fold a row that mirrors one below it
-  (T-pivot: the last row mirrors row `jpj - 2`; F-pivot: row `jpj - 1`).
-  The copies keep orientation (a shift, a half-turn in index space), so
-  the sign test below doesn't see them. The constructor from CF bounds
-  takes the halo layout and drops the duplicates: the seam and fold are
-  walls that meet, not data.
+  (T pivot: the last row mirrors row `jpj - 2`, and row `jpj - 1` mirrors
+  itself; F pivot: the last row mirrors row `jpj - 1`). The copies keep
+  orientation (a shift, a half-turn in index space), so the sign test
+  below doesn't see them. `from_cf_bounds` takes the halo layout and
+  drops the duplicates (built, 4b): the seam and fold are walls that
+  meet, not data.
 - **Other folds** (overlapping swath scan lines, MODIS bow-tie): cells
   overlap in world space, so location is ambiguous and a walk follows one
   sheet. Decided (N3, 2026-11-17): refused for coverage. Construction
-  refuses cells of both orientations (built in stage 1); stage 4 adds an
-  overlap check for copies that keep orientation (each cell's centre
-  located with `locate_all`, refused with two owners). An overlapping
+  refuses cells of both orientations (built in stage 1); `find_overlap`
+  finds copies that keep orientation (one probe per cell, refused with a
+  second owner; built, 4b, and run by `from_cf_bounds`). An overlapping
   swath is used as one mesh per scan (the `mesh` module docs show it);
   how overlapping scans combine is the caller's choice.
 
@@ -339,20 +457,24 @@ option for parity on folded swaths (m20 rwarp roadmap item 4), separate
 from this.
 
 ```rust
-pub struct QuadMesh { /* corners (nrow + 1) x (ncol + 1), topology, cell map */ }
+// as built (stages 1 and 4b); the first sketch had a `topology` argument
+// on each constructor, dropped with 4a
+pub struct QuadMesh { /* corners (nrow + 1) x (ncol + 1), cell map */ }
 
 impl QuadMesh {
     pub fn from_corners(ncol: usize, nrow: usize, x: Vec<f64>, y: Vec<f64>,
-                        map: CellMap, topology: Topology) -> Result<Self, String>;
+                        map: CellMap) -> Result<Self, String>;
     /// Corners from centres, GDAL's PixelCenter rule.
     pub fn from_centres(ncol: usize, nrow: usize, x: &[f64], y: &[f64],
-                        map: CellMap, topology: Topology) -> Result<Self, String>;
-    /// CF bounds, nrow x ncol x 4; corners must be shared by neighbours.
+                        map: CellMap) -> Result<Self, String>;
+    /// CF bounds or SCRIP corners, nrow x ncol x 4, halo dropped; corners
+    /// must be shared by neighbours; refused when cells overlap.
     pub fn from_cf_bounds(ncol: usize, nrow: usize, xb: &[f64], yb: &[f64],
-                          map: CellMap, topology: Topology) -> Result<Self, String>;
+                          halo: Halo, map: CellMap) -> Result<Self, String>;
+    pub fn find_overlap(&self) -> Option<[(usize, usize); 2]>;
     pub fn cell_area(&self, row: usize, col: usize) -> f64;
     pub fn locate(&self, p: [f64; 2], hint: Option<(usize, usize)>) -> Option<(usize, usize)>;
-    pub fn locate_all(&self, p: [f64; 2], out: &mut Vec<(usize, usize)>);
+    pub fn locate_all(&self, p: [f64; 2]) -> Vec<(usize, usize)>;
 }
 ```
 
@@ -550,7 +672,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); a declared period for coordinates that jump at the seam; CF bounds and SCRIP corners; halo layout (duplicates dropped) and an overlap check for copies that keep orientation (N3); the ESMF comparison on a tripolar grid | the world clip on an annulus, a fold and a tripolar disk (built); generator 5; a tripolar mesh with a halo row kept: refused without the layout, equal with it |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); a declared period for coordinates that jump at the seam; the southern rows of a global ORCA grid; the ESMF comparison on a tripolar grid | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); generator 5 |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

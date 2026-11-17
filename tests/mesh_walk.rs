@@ -229,6 +229,8 @@ fn oracle(m: &QuadMesh, rings: &[Vec<[f64; 2]>]) -> Vec<Option<f64>> {
             }
             let a = m.cell_area(r, c);
             if a == 0.0 {
+                // no area: its fraction weighs nothing
+                out[r * m.ncol() + c] = None;
                 continue;
             }
             let q = m.corners(r, c);
@@ -635,10 +637,37 @@ fn collapsed_cells_take_no_coverage() {
     let w = nc + 1;
     x[2 * w + 2] = x[2 * w + 3];
     y[2 * w + 2] = y[2 * w + 3];
-    // and a fully collapsed cell: (0, 4) with its far corners merged onto the near ones
     let m = QuadMesh::from_corners(nc, nr, x, y, CellMap::EqualArea).unwrap();
     let ring = vec![[0.5, 0.5], [4.5, 0.6], [4.4, 3.5], [0.6, 3.4]];
     check("collapsed", &m, &[ring], 2e-6);
+}
+
+/// Cells with no area inside the mesh, as at a T-point pivot of a
+/// tripolar grid: a column collapsed onto its left wall, and a cell
+/// collapsed to a point. A ring crossing one jumps in index space
+/// between two sides of the collapsed cell at one world point.
+#[test]
+fn rings_across_cells_with_no_area() {
+    let (nc, nr, mut x, mut y) = lattice(7, 5, |i, j| [i + 0.1 * j, j + 0.05 * i]);
+    let w = nc + 1;
+    for j in 0..=nr {
+        // column 2 collapsed: column line 3 onto column line 2
+        x[j * w + 3] = x[j * w + 2];
+        y[j * w + 3] = y[j * w + 2];
+    }
+    // cell (2, 5) collapsed to its corner (2, 5)
+    for (j, i) in [(2, 6), (3, 6), (3, 5)] {
+        x[j * w + i] = x[2 * w + 5];
+        y[j * w + i] = y[2 * w + 5];
+    }
+    let m = QuadMesh::from_corners(nc, nr, x, y, CellMap::EqualArea).unwrap();
+    assert_eq!(m.cell_area(1, 2), 0.0);
+    assert_eq!(m.cell_area(2, 5), 0.0);
+    let ring = vec![[0.5, 0.5], [6.5, 0.7], [6.4, 4.5], [0.6, 4.4]];
+    check("across", &m, &[ring], 2e-6);
+    for (i, rings) in cases(&m, 20261117, 300).iter().enumerate() {
+        check(&format!("no area case {i}"), &m, rings, 2e-6);
+    }
 }
 
 #[test]

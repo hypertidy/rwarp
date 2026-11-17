@@ -89,9 +89,11 @@
 //! in its coordinates (column line `ncol` on column line 0) and a
 //! tripolar grid (ORCA and similar), whose last row line folds onto
 //! itself (corner `i` on corner `ncol - i`). Give such a grid its corners
-//! in a projection in which it is one sheet. For a global ocean grid,
-//! Lambert azimuthal equal-area on the north pole does this, and its
-//! planar areas are true areas. A ring that crosses the seam or the fold
+//! in a projection in which it is one sheet. For an ocean grid's tripolar
+//! north, Lambert azimuthal equal-area on the north pole does this, and
+//! its planar areas are true areas; it holds down to the Southern Ocean,
+//! but near 80 S it flattens cells 500 to 1 and some become bow-ties. A
+//! ring that crosses the seam or the fold
 //! leaves through one wall and comes back through the other at the same
 //! world point, and each cell gets its coverage as anywhere else. The two
 //! walls need to agree only to rounding.
@@ -136,6 +138,44 @@
 //! assert!((area - 400.0).abs() < 1e-3, "{area}");
 //! // cells either side of the seam share it
 //! assert!(res.edges.iter().any(|e| e.col == 0) && res.edges.iter().any(|e| e.col == 23));
+//! ```
+//!
+//! # CF bounds, SCRIP corners and halos
+//!
+//! [`QuadMesh::from_cf_bounds`] takes each cell's own four vertices (CF's
+//! `lon_bnds(j, i, 4)`, SCRIP's `grid_corner_lon(grid_size, 4)`) and a
+//! [`Halo`]: the rows and columns an ocean model's file stores again (its
+//! halo) or that hold no cells, which are dropped before the mesh is built.
+//! A halo left in overlaps the cells it copies and is refused, rather than
+//! counted twice. [`Halo::NEMO_F_PIVOT`] and [`Halo::NEMO_T_PIVOT`] are
+//! NEMO's ORCA layouts.
+//!
+//! ```
+//! use rwarp::mesh::{CellMap, Halo, QuadMesh};
+//!
+//! // An annulus of 24 columns written as CF bounds with a cyclic halo:
+//! // two more columns at the end, repeating the first two.
+//! let (nc, nr) = (26, 3);
+//! let corner = |i: usize, j: usize| {
+//!     let a = (i % 24) as f64 / 24.0 * std::f64::consts::TAU;
+//!     let r = 100.0 + 20.0 * j as f64;
+//!     [r * a.cos(), r * a.sin()]
+//! };
+//! let (mut xb, mut yb) = (Vec::new(), Vec::new());
+//! for j in 0..nr {
+//!     for i in 0..nc {
+//!         for p in [corner(i, j), corner(i + 1, j), corner(i + 1, j + 1), corner(i, j + 1)] {
+//!             xb.push(p[0]);
+//!             yb.push(p[1]);
+//!         }
+//!     }
+//! }
+//! let kept = QuadMesh::from_cf_bounds(nc, nr, &xb, &yb, Halo::NONE, CellMap::EqualArea);
+//! assert!(kept.unwrap_err().contains("overlap"));
+//!
+//! let halo = Halo { cols: [0, 2], ..Halo::NONE };
+//! let mesh = QuadMesh::from_cf_bounds(nc, nr, &xb, &yb, halo, CellMap::EqualArea).unwrap();
+//! assert_eq!((mesh.ncol(), mesh.nrow()), (24, 3));
 //! ```
 //!
 //! # Overlapping swaths: one mesh per scan
@@ -202,9 +242,11 @@
 
 use std::sync::OnceLock;
 
+mod cf;
 mod rect;
 mod walk;
 
+pub use cf::Halo;
 pub use rect::Rectilinear;
 
 use crate::geoloc_transform::inverse_bilinear;
@@ -274,12 +316,16 @@ impl QuadMesh {
     /// overlap, as on an overlapping swath scan, and location would be
     /// ambiguous; build one mesh per scan instead, see the
     /// [module docs](crate::mesh#overlapping-swaths-one-mesh-per-scan)). Zero-area
-    /// cells (collapsed corners) are allowed; they contain no point.
+    /// cells (collapsed corners, or an area zero to rounding) are allowed;
+    /// they contain no point, and a ring may cross them (their coverage
+    /// fraction then weighs nothing).
     ///
-    /// Overlap that keeps orientation isn't detected yet: a row or column
+    /// Overlap that keeps orientation isn't checked here: a row or column
     /// stored twice, such as an ocean model's halo (NEMO's cyclic columns,
     /// or the duplicated row at its north fold), passes, and its cells
-    /// would be counted twice. Drop duplicated rows and columns first.
+    /// would be counted twice. [`QuadMesh::find_overlap`] finds it (it
+    /// costs about what building the mesh does), and
+    /// [`QuadMesh::from_cf_bounds`] drops a halo and refuses what's left.
     pub fn from_corners(
         ncol: usize,
         nrow: usize,
@@ -594,7 +640,8 @@ impl QuadMesh {
         let q = self.corners(row, col);
         let x = cell.centre;
         if p == x {
-            return Some(0);
+            // the first triangle with area (one on a side of no length has none)
+            return (0..4).find(|&k| q[k] != q[(k + 1) % 4]);
         }
         // the centre is in the cell's kernel, so the rays from it to the
         // corners cut the plane into four wedges, each less than a half
@@ -741,14 +788,24 @@ pub(crate) fn validate_corners(ncol: usize, nrow: usize, x: &[f64], y: &[f64]) -
     Ok(if neg > 0 { -1.0 } else { 1.0 })
 }
 
-/// Twice the signed area of a quadrilateral.
+/// Twice the signed area of a quadrilateral; exactly 0 when that is zero
+/// to rounding (a cell collapsed onto a line, with corners not quite on
+/// it, as the halves of a tripolar grid's pivot cell are), so its sign is
+/// never taken for an orientation.
 fn shoelace2(q: &[[f64; 2]; 4]) -> f64 {
-    let mut s = 0.0;
+    let (mut s, mut mag) = (0.0, 0.0);
     for k in 0..4 {
         let (a, b) = (q[k], q[(k + 1) % 4]);
-        s += a[0] * b[1] - b[0] * a[1];
+        let (u, v) = (a[0] * b[1], b[0] * a[1]);
+        s += u - v;
+        mag += u.abs() + v.abs();
     }
-    s
+    // the forward error bound of the sum, with room
+    if s.abs() <= 16.0 * f64::EPSILON * mag {
+        0.0
+    } else {
+        s
+    }
 }
 
 /// Whether two opposite sides of the quadrilateral cross properly.
@@ -797,7 +854,18 @@ fn split(q: &[[f64; 2]; 4], sign: f64) -> Cell {
         [2.0 * t(x, 3) / a, 2.0 * t(x, 0) / a]
     };
     let margin = 1e-12 * (sign * area2);
-    let proper = |x: [f64; 2]| (0..4).all(|k| t(x, k) > margin);
+    // A side of no length (two corners on one point, as at a pole in a
+    // polar projection) has a triangle of no area wherever the centre is,
+    // matched by a unit triangle of no area (the unit centre on that side
+    // of the square); only the other three need area.
+    let live: [bool; 4] = std::array::from_fn(|k| q[k] != q[(k + 1) % 4]);
+    let lowest = |x: [f64; 2]| {
+        (0..4)
+            .filter(|&k| live[k])
+            .map(|k| t(x, k))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let proper = |x: [f64; 2]| lowest(x) > margin;
     if proper(mean) {
         return Cell {
             area2,
@@ -817,7 +885,7 @@ fn split(q: &[[f64; 2]; 4], sign: f64) -> Cell {
     let dir = [-(g0[1] + g2[1]), g0[0] + g2[0]];
     // the interval of t with every T_k(mean + t dir) > margin
     let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
-    for k in 0..4 {
+    for k in (0..4).filter(|&k| live[k]) {
         let a0 = t(mean, k) - margin;
         let g = grad(k);
         let b = g[0] * dir[0] + g[1] * dir[1];
@@ -835,10 +903,7 @@ fn split(q: &[[f64; 2]; 4], sign: f64) -> Cell {
         // the balanced point that keeps the four triangles furthest from
         // degenerate: min_k T_k is concave along the line, so a ternary
         // search finds its maximum
-        let worst = |tt: f64| {
-            let x = [mean[0] + tt * dir[0], mean[1] + tt * dir[1]];
-            (0..4).map(|k| t(x, k)).fold(f64::INFINITY, f64::min)
-        };
+        let worst = |tt: f64| lowest([mean[0] + tt * dir[0], mean[1] + tt * dir[1]]);
         let (mut a, mut b) = (lo, hi);
         for _ in 0..200 {
             let (m1, m2) = (a + (b - a) / 3.0, b - (b - a) / 3.0);
@@ -872,7 +937,7 @@ fn split(q: &[[f64; 2]; 4], sign: f64) -> Cell {
                     w[0] * q[0][0] + w[1] * q[1][0] + w[2] * q[2][0] + w[3] * q[3][0],
                     w[0] * q[0][1] + w[1] * q[1][1] + w[2] * q[2][1] + w[3] * q[3][1],
                 ];
-                let m = (0..4).map(|k| t(x, k)).fold(f64::INFINITY, f64::min);
+                let m = lowest(x);
                 if m > best.0 {
                     best = (m, x);
                 }
