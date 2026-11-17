@@ -112,8 +112,9 @@ which today's test misses:
   half-turn both keep orientation, so an ORCA mesh with its halos would
   be accepted and those cells counted twice. (Worked out from the index
   maps, not yet seen on an ORCA file.)
-- In stage 4 the tripolar constructor takes the halo layout and drops the
-  duplicates (the fold is a neighbour rule, not data), and the mesh is
+- In stage 4 the constructor from CF bounds takes the halo layout and
+  drops the duplicates (the seam and fold are walls that meet, which the
+  walk crosses since 4a, not data), and the mesh is
   checked for overlap: each cell's centre located with `locate_all`, the
   mesh refused if any centre has two owners. That is one location per
   cell; it catches copies of any kind, though not an overlap thinner

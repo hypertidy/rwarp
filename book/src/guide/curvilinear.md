@@ -151,6 +151,18 @@ let res = mesh
 assert!(!res.edges.is_empty());
 ```
 
+### Seams and folds
+
+Outer walls that meet in the world are crossed like any side, with
+nothing to declare. That covers a periodic grid whose seam has no jump in
+its coordinates (column line `ncol` on column line 0) and a tripolar ocean
+grid, whose last row line folds onto itself. Give the grid its corners in
+a projection in which it is one sheet. For a global ocean grid, Lambert
+azimuthal equal-area on the north pole does this, and its planar areas
+are true areas. A tripolar grid can't be a mesh in longitude and latitude,
+since the geographic pole is inside one of its cells. Coordinates that
+jump at the seam (longitudes 360 apart) are not handled yet.
+
 ### Overlapping swaths
 
 A mesh is one sheet: `from_corners` refuses cells of both orientations,
@@ -176,8 +188,8 @@ example, which checks the area each scan covers, is in the
 
 A row or column stored twice, such as an ocean model's halo, keeps its
 orientation and isn't refused yet: drop duplicated rows and columns
-first. Grids that fold (tripolar) and halos are stage 4
-([#37](https://github.com/hypertidy/rwarp/issues/37)).
+first. Halos, CF bounds and a declared period for longitudes are the
+rest of stage 4 ([#37](https://github.com/hypertidy/rwarp/issues/37)).
 
 `mesh` is public and unstable: it changes more often than the rest of
 the crate and may break at any 0.x minor release, though not at a patch
