@@ -9,8 +9,9 @@ refused (4b, 2026-11-17; section 3), and weights on a tripolar grid are
 compared with ESMF's (4c, 2026-11-17; section 3), and a mesh is a warp
 source, for `exact_weights` and `warp()`'s exact footprint, through
 `MeshTransformer` (4d, 2026-11-17; section 3), and a period is declared
-for coordinates that jump at the seam (4e, 2026-11-17; section 3). Later
-stages proposed.
+for coordinates that jump at the seam (4e, 2026-11-17; section 3), and a
+mesh is a warp target, through `MeshTarget` (4f, 2026-11-17; section 3).
+Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -271,8 +272,7 @@ What stage 4 still needs:
   period (4e, below) holds them; a whole ORCA file is still two meshes
   (the north in a polar projection), not built as one.
 - A mesh as the target of weights (the reverse map, onto a tripolar
-  grid): the same overlaps as a mesh source's, normalised by the mesh
-  cell's area. Not built.
+  grid): built, 4f, below.
 
 ### CF bounds, SCRIP corners and halos (built, 4b)
 
@@ -461,8 +461,8 @@ What it shows:
   S 1.1e-2). That matches the regular cases of `tests/esmf.rs`, because
   ESMF's great circles bow poleward of the parallels.
 
-Not covered: the reverse direction, lon/lat to the tripolar grid. It
-would use the same overlaps, normalised by the mesh cell's area.
+The reverse direction, onto the tripolar grid, is compared in 4f
+(below).
 
 ### A mesh as a warp source (built, 4d)
 
@@ -499,8 +499,74 @@ the compiled-in CRS backend, and `with_backend` with caller-supplied
 
   `tests/esmf_tripolar.rs` now takes its weights from it, the same as
   the `cover_ring` assembly to 1e-13.
-- **Not built.** A mesh as the target of weights. (A mesh in longitude
-  whose coordinates jump at the seam came with the declared period, 4e.)
+- **Not built here.** A mesh as the target of weights came in 4f, and a
+  mesh in longitude whose coordinates jump at the seam with the declared
+  period, 4e.
+
+### A mesh as a warp target (built, 4f)
+
+Built (2026-11-17): `rwarp::mesh::MeshTarget<T>` (`src/mesh/target.rs`),
+a `Transformer` whose destination pixels are a `QuadMesh`'s cells.
+
+- **A wrapper, not a pipeline.** A target pixel/line is a point of the
+  mesh's index space. `QuadMesh::to_world` takes it to the mesh's world
+  coordinates, and an inner transformer, whose destination geotransform
+  is the identity (`WORLD_GT`), takes it to the source. So the source is
+  whatever the inner transformer's is:
+  - `from_grid` builds a `GenImgProjTransformer` with the source's size,
+    so a longitude/latitude source wraps round its centre as gdalwarp's
+    does (`CENTER_LONG`) and reports `source_wrap`;
+  - a `GenImgGeolocTransformer` gives geolocation arrays as the source;
+  - a `MeshTransformer` with `WORLD_GT` gives mesh to mesh.
+
+  `source_wrap` and `source_cells` pass through, the latter with the mesh
+  step in front of the inner `dst_to_world`.
+- **The cells.** The lattice's points lie on the sides of index-space
+  pixels, where both cell maps are linear, so each outline is the cell's
+  own quadrilateral, `densify` points a side, taken to the source exactly
+  and joined straight there. Points shared by neighbours are transformed
+  once, so the outlines tile. Each cell is measured on its own, so the
+  mesh's seam, fold and period play no part on this side, and a halo
+  is dropped at construction. Areas are in the source's space, under the
+  weights' measure (`lonlat_measure` on the sphere). A cell's sides are
+  straight in the mesh's coordinates, not the source's, so near a pole
+  in longitude and latitude it needs `densify`: the cap's cell over the
+  pole is 69% off in area at densify 1 and 1.1% at densify 8, against
+  ESMF's great circles.
+- **Why not the mesh source's overlaps, transposed** (the first plan
+  here)? They would be measured in the mesh's world coordinates, and
+  only `exact_weights` would get them. This way `warp()` targets a mesh
+  with any kernel, the source keeps its own measure (areas on the sphere
+  for lon/lat), and any source works, a mesh included. In one plane the
+  two agree (`tests/mesh_target.rs`).
+- **Tests.**
+  - `tests/mesh_target.rs`:
+    - in one plane, grid to mesh overlaps are mesh to grid's, transposed
+      (2e-14 of a pixel); each cell's `dst_area` is its area (2e-13);
+    - mesh to mesh is symmetric (7e-15 of a cell);
+    - from a global 2.5 degree lon/lat grid with areas on the sphere:
+      - every cell is covered to 2e-13, across the source's seam and
+        over the pole (the pole's cell takes all 144 cells of the top
+        row);
+      - the seam elsewhere gives the same overlaps (6e-15 of a pixel);
+      - the cap's area on the sphere approaches its LAEA area at second
+        order in `densify` (7e-4, 5e-5, 3e-6 at 2, 8, 32);
+    - `warp()`'s `Average` is `apply(FracArea)` bit for bit;
+    - `Bilinear` of a linear field is exact at cell centres;
+    - transform round trips;
+    - target windows tile the mesh exactly;
+    - the CRS backend matches the written-out projection.
+  - `tests/esmf_tripolar.rs`, the `onto_tripolar` fixtures: the same
+    grids as 4c, the other way round.
+    - Cartesian ESMF matches to 3e-13 (S, `frac_b`, field and areas):
+      from the grid in the plane, as itself and as a mesh, and mesh to
+      mesh from the lon/lat grid's corners in the plane.
+    - Spherical ESMF is recorded. S differs by up to 3e-2 on the cap's
+      smallest cells, 13 to 55 km across near its grid poles. There a
+      300 km source edge's great circle and straight line part by a large
+      share of a small cell (d / h). Over cells more than 100 km across,
+      from the grid in the plane, S differs by 3e-3, as in 4c. Areas
+      differ by up to 1e-3, on the outer row.
 
 ### A declared period (built, 4e)
 
@@ -848,7 +914,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch) |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

@@ -177,8 +177,8 @@ to compact text fixtures, so `cargo test` needs no ESMF.
   rotated pole; lon/lat to EPSG:3031 at 25 km; rectilinear (Gaussian
   latitudes) to regular; a curvilinear ocean grid with corner bounds to
   lon/lat (built in stage 4 as a whole analytic tripolar cap, to lon/lat and
-  to its own plane: `tests/esmf_tripolar.rs`, curvilinear-frontend.md
-  section 3); a mesh (an ICON or MPAS fragment) to lon/lat
+  to its own plane, and from both onto the cap: `tests/esmf_tripolar.rs`,
+  curvilinear-frontend.md section 3); a mesh (an ICON or MPAS fragment) to lon/lat
   (after stage 5).
 - **What's compared:** weights per pair, `frac_b`, `area_b`, and the regridded
   field for a smooth analytic function and for a constant (which must stay
@@ -330,8 +330,11 @@ rounding in the mesh's plane, with the spherical differences recorded
 (`tests/esmf_tripolar.rs`, 4c). A mesh in longitude declares its period
 (`QuadMesh::with_period`, 4e): outlines across its seam and round a pole
 are measured as for geolocation arrays, and the southern rows of an ORCA
-grid are a mesh in longitude and latitude. A mesh as the destination
-isn't built.
+grid are a mesh in longitude and latitude. A mesh is the destination
+through `mesh::MeshTarget` (4f): each cell is a destination pixel
+measured in the source's space, and against ESMF onto the tripolar cap
+the weights agree to rounding in the plane, with the spherical
+differences recorded (`onto_tripolar` fixtures).
 
 ## 7. Stage 5: meshes
 

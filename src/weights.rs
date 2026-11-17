@@ -20,7 +20,9 @@
 //!   [`MeshTransformer`](crate::mesh::MeshTransformer)) the end points go
 //!   to source world coordinates instead, are joined by straight lines
 //!   there, and source cells are the quadrilaterals through their corners'
-//!   world positions.
+//!   world positions. A mesh target
+//!   ([`MeshTarget`](crate::mesh::MeshTarget)) makes destination cells the
+//!   mesh's: edges straight in the mesh's world coordinates.
 //! - **Measure.** By default areas are planar in source pixel space: for a
 //!   source whose pixel-to-world map is affine (any regular grid in its own
 //!   CRS) that is world area in the source CRS, up to one constant. With

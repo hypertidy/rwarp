@@ -24,6 +24,11 @@
 //! `exact_weights_match_cover_ring` checks them against the same assembled
 //! by hand from [`QuadMesh::cover_ring`].
 //!
+//! The `onto_tripolar` cases are the same grids the other way round, the
+//! cap as the destination: [`exact_weights`] through a [`MeshTarget`],
+//! each cap cell's outline taken to the regular grid and measured there
+//! (`onto_*` below).
+//!
 //! `cargo test --test esmf_tripolar -- --nocapture` prints the measured
 //! differences. No CRS is involved: the projection is written out here.
 
@@ -31,8 +36,9 @@ mod esmf_common;
 
 use controlledburn::CoverageWindow;
 use esmf_common::{diff, fixture_path, read_fixture, smooth, Fixture, Ours};
-use rwarp::mesh::{CellMap, Halo, MeshTransformer, QuadMesh};
-use rwarp::weights::{exact_weights, Normalization, WeightOptions};
+use rwarp::mesh::{CellMap, Halo, MeshTarget, MeshTransformer, QuadMesh, WORLD_GT};
+use rwarp::transform::{CenterLong, GenImgProjTransformer};
+use rwarp::weights::{exact_weights, lonlat_measure, GridWindow, Normalization, WeightOptions, Weights};
 use rwarp::CrsTransform;
 
 /// The fixtures' sphere (NEMO's).
@@ -454,3 +460,193 @@ fn spherical_esmf_differences_on_a_tripolar_grid_are_recorded() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Onto the tripolar cap
+// ---------------------------------------------------------------------------
+
+struct Same;
+impl CrsTransform for Same {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        Some((x, y))
+    }
+}
+
+/// Whether an `onto` fixture's source is lon/lat (else the plane).
+fn src_lonlat(fx: &Fixture) -> bool {
+    match fx.header("src_kind") {
+        "lonlat" => true,
+        "laea" => false,
+        k => panic!("src_kind {k}"),
+    }
+}
+
+/// The source grid's cells in the plane: its corners taken there and
+/// joined straight, ESMF's Cartesian cells.
+fn grid_in_plane(fx: &Fixture) -> QuadMesh {
+    let g: [f64; 6] = fx.nums("src_gt");
+    let [w, h] = fx.nums::<2>("src_size").map(|v| v as usize);
+    let ll = src_lonlat(fx);
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    for j in 0..=h {
+        for i in 0..=w {
+            let (gx, gy) = (g[0] + i as f64 * g[1], g[3] + j as f64 * g[5]);
+            let p = if ll { laea(gx, gy) } else { [gx, gy] };
+            x.push(p[0]);
+            y.push(p[1]);
+        }
+    }
+    QuadMesh::from_corners(w, h, x, y, CellMap::EqualArea).unwrap()
+}
+
+/// How rwarp takes the source grid onto the cap.
+#[derive(Debug, Clone, Copy)]
+enum Onto {
+    /// The grid as itself, through a `GenImgProjTransformer`: cells in
+    /// source pixel space, areas on the sphere (`lonlat_measure`) for
+    /// lon/lat.
+    Grid,
+    /// The grid's cells in the plane (`grid_in_plane`), through a
+    /// `MeshTransformer`: mesh to mesh.
+    Plane,
+}
+
+/// rwarp's map from the fixture's source grid onto the cap, in ESMF's
+/// terms, areas in square metres (of the plane, or of the sphere of
+/// radius `RADIUS`).
+fn ours_onto(m: &QuadMesh, fx: &Fixture, how: Onto, densify: usize) -> (Ours, Weights) {
+    let g: [f64; 6] = fx.nums("src_gt");
+    let [sw, sh] = fx.nums::<2>("src_size").map(|v| v as usize);
+    let ll = src_lonlat(fx);
+    let src = GridWindow::new(sw, sh);
+    let (w, scale) = match how {
+        Onto::Plane => {
+            let inner = MeshTransformer::with_backend(grid_in_plane(fx), WORLD_GT, Box::new(Same), Box::new(Same)).unwrap();
+            let t = MeshTarget::new(m.clone(), inner);
+            (exact_weights(&t, &src, m.ncol(), m.nrow(), &WeightOptions::new(densify)), 1.0)
+        }
+        Onto::Grid => {
+            let mut inner = GenImgProjTransformer::with_backend(g, WORLD_GT, Box::new(FromPlane(ll)), Box::new(ToPlane(ll))).unwrap();
+            let mut opts = WeightOptions::new(densify);
+            let mut scale = (g[1] * g[5]).abs();
+            if ll {
+                inner = inner.with_center_long(CenterLong::At(g[0] + 180.0)).with_source_size([sw, sh]);
+                opts = opts.with_measure(lonlat_measure(g).unwrap());
+                scale = (g[1].to_radians() * g[5].to_radians()).abs() * RADIUS * RADIUS;
+            }
+            let t = MeshTarget::new(m.clone(), inner);
+            (exact_weights(&t, &src, m.ncol(), m.nrow(), &opts), scale)
+        }
+    };
+    let s = w.normalised(Normalization::DestArea);
+    let (row, col) = w.esmf_row_col(m.ncol(), sw);
+    let covered = w.dst_covered();
+    let o = Ours {
+        s: row.into_iter().zip(col).zip(s).collect(),
+        frac_b: covered.iter().zip(&w.dst_area).map(|(c, a)| if *a > 0.0 { c / a } else { 0.0 }).collect(),
+        area_b: w.dst_area.iter().map(|a| a * scale).collect(),
+    };
+    (o, w)
+}
+
+/// The smooth field at each source grid cell's corner mean in the plane,
+/// in ESMF's order.
+fn grid_field(fx: &Fixture) -> Vec<f64> {
+    field(&grid_in_plane(fx))
+}
+
+/// Cartesian ESMF onto the cap has rwarp's cells: both grids' cells
+/// straight between their corners in the plane. In the plane the grid is
+/// taken as itself (`Onto::Grid`) and as a mesh (`Onto::Plane`); the
+/// lon/lat grid only as a mesh of its corners in the plane, whose cells
+/// are what ESMF's are. Weights, fractions and areas agree to rounding,
+/// through the lon/lat grid's seam (0 E) and its pole.
+#[test]
+fn cartesian_esmf_matches_onto_a_tripolar_grid() {
+    let m = source();
+    for (name, how) in [
+        ("onto_tripolar_laea", Onto::Grid),
+        ("onto_tripolar_laea", Onto::Plane),
+        ("onto_tripolar_lonlat", Onto::Plane),
+    ] {
+        let fx = read_fixture(&format!("{name}.cart.txt"));
+        let (o, w) = ours_onto(&m, &fx, how, 1);
+        let d = diff(&fx, &o, &grid_field(&fx));
+        let area = max_rel(&o.area_b, &fx.area_b, 1.0);
+        eprintln!("{name:20} cart {how:?}: {d:?}, max relative area difference {area:.2e}");
+        assert!(d.esmf_rows < 1e-9, "{name}: ESMF row sums off by {:e}", d.esmf_rows);
+        assert!(d.s < 1e-9, "{name} {how:?}: S differs by {:e}", d.s);
+        assert!(d.frac_b < 1e-9, "{name} {how:?}: frac_b differs by {:e}", d.frac_b);
+        assert!(area < 1e-12, "{name} {how:?}: area differs by {area:e}");
+        assert!(d.field < 1e-9, "{name} {how:?}: field differs by {:e}", d.field);
+        if src_lonlat(&fx) {
+            let (seam, pole) = grid_crossings(&fx, &w);
+            eprintln!("{name:20} cap cells across the grid's seam {seam}, with all of its top row {pole}");
+            assert!(seam > 0 && pole == 1, "{name}: seam {seam}, pole {pole}");
+        }
+    }
+}
+
+/// Cap cells with weights in the source grid's first and last columns of
+/// one row (across its seam), and those with weights in every cell of its
+/// top row (round the pole).
+fn grid_crossings(fx: &Fixture, w: &Weights) -> (usize, usize) {
+    let [sw, sh] = fx.nums::<2>("src_size").map(|v| v as u32);
+    let mut by_dst: std::collections::HashMap<(u32, u32), Vec<(u32, u32)>> = Default::default();
+    for i in 0..w.len() {
+        by_dst.entry((w.dst_row[i], w.dst_col[i])).or_default().push((w.src_row[i], w.src_col[i]));
+    }
+    let (mut seam, mut pole) = (0, 0);
+    for cells in by_dst.values() {
+        seam += cells.iter().any(|&(r, c)| c == 0 && cells.contains(&(r, sw - 1))) as usize;
+        pole += (cells.iter().filter(|&&(r, _)| r == sh - 1).count() == sw as usize) as usize;
+    }
+    (seam, pole)
+}
+
+/// Spherical ESMF onto the cap: both grids' corners in lon/lat, joined by
+/// great circles. rwarp's cap cells are straight in the plane. Its source
+/// cells are straight in the plane too for `onto_tripolar_laea`. For
+/// `onto_tripolar_lonlat` they are the grid's own lon/lat cells, with
+/// areas on the sphere, and each cap cell's outline is joined straight in
+/// lon/lat between its densify points. The differences are recorded as
+/// ceilings, about 1.5 times what was measured (ESMF 8.9.1), as `[S,
+/// frac_b, field, area_b]`: numbers to shrink, not failures.
+///
+/// They are the cells' definition, as the other way round (the Cartesian
+/// test above matches to rounding), but S differs more in this direction.
+/// The largest differences are on the cap's smallest cells, 13 to 55 km
+/// across near its grid poles, cut by source edges 300 km (or 6 degrees)
+/// long: where great circles and straight lines part by d, a cap cell of
+/// side h moves a share d / h of its area between source cells. Over cap
+/// cells more than 100 km across, S differs by 3e-3 at most for
+/// `onto_tripolar_laea`, as for the cap as the source. Areas differ most
+/// on the cap's outer row (1e-3), whose sides are the longest. For
+/// lon/lat at densify 1 the cap's cells are joined straight in lon/lat
+/// between their corners, which near the pole is far from straight in the
+/// plane: the cell over the pole, with corners 90 degrees of longitude
+/// apart, is 69% off in area at densify 1 and 1.1% at densify 8.
+#[test]
+fn spherical_esmf_differences_onto_a_tripolar_grid_are_recorded() {
+    #[rustfmt::skip]
+    let ceilings: [(&str, usize, [f64; 4]); 3] = [
+        ("onto_tripolar_laea",   1, [4.6e-2, 1e-9, 7.2e-4, 1.5e-3]),
+        ("onto_tripolar_lonlat", 1, [5.5e-2, 1e-9, 1.7e-3, 1.05]),
+        ("onto_tripolar_lonlat", 8, [6.5e-2, 1e-9, 1.35e-3, 1.7e-2]),
+    ];
+    let m = source();
+    for (name, densify, [cs, cf, cv, ca]) in ceilings {
+        let fx = read_fixture(&format!("{name}.sph.txt"));
+        let (o, _) = ours_onto(&m, &fx, Onto::Grid, densify);
+        let d = diff(&fx, &o, &grid_field(&fx));
+        let area = max_rel(&o.area_b, &fx.area_b, RADIUS * RADIUS);
+        let inside = s_inside(&fx, &o);
+        eprintln!("{name:20} sph densify {densify}: {d:?}, S inside {inside:.2e}, max relative area difference {area:.2e}");
+        assert!(d.esmf_rows < 1e-9, "{name}: ESMF row sums off by {:e}", d.esmf_rows);
+        assert!(d.s <= cs, "{name} densify {densify}: S differs by {:e} > {cs:e}", d.s);
+        assert!(d.frac_b <= cf, "{name} densify {densify}: frac_b differs by {:e} > {cf:e}", d.frac_b);
+        assert!(d.field <= cv, "{name} densify {densify}: field differs by {:e} > {cv:e}", d.field);
+        assert!(area <= ca, "{name} densify {densify}: area_b differs by {area:e} > {ca:e}");
+    }
+}
+

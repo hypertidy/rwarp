@@ -100,6 +100,31 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `mesh::MeshTarget`: a `QuadMesh` as a warp target, for regridding onto
+  a curvilinear grid given by its corners, such as an ocean model's
+  tripolar grid (stage 4f of `design/curvilinear-frontend.md`, #37).
+  - How: target pixel `(col, row)` is mesh cell `(row, col)`. A target
+    pixel goes to the mesh's world coordinates and then through an inner
+    transformer to the source. `from_grid(src_crs, src_gt, src_size,
+    mesh, mesh_crs)` makes that a `GenImgProjTransformer`, wrapping a
+    lon/lat source's longitudes as gdalwarp does. `new(mesh, inner)`
+    takes any transformer whose destination geotransform is
+    `mesh::WORLD_GT`: geolocation arrays, or another mesh
+    (`MeshTransformer`), for mesh to mesh.
+  - What it gives: `exact_weights` measures each cell as a target pixel
+    in the source's space, under any measure (`lonlat_measure` for areas
+    on the sphere), across a lon/lat source's seam and over its pole.
+    `warp()` regrids onto the mesh with any kernel; point kernels sample
+    each cell's centre.
+  - Checks (`tests/mesh_target.rs`): in one plane, the overlaps are the
+    mesh source's transposed (2e-14), and mesh to mesh is symmetric. From
+    a global lon/lat grid every cell is covered in full and the seam's
+    position doesn't matter. `warp()` is `Weights::apply` bit for bit.
+  - Against ESMF onto the tripolar cap (`tests/esmf_tripolar.rs`, new
+    `onto_tripolar` fixtures from `gen.py`; the existing fixtures are
+    unchanged bit for bit): Cartesian in the plane to rounding (3e-13);
+    spherical recorded, S up to 3e-2 on the cap's smallest cells and
+    3e-3 over cells more than 100 km across.
 - A declared period for coordinates that jump at the seam, such as
   longitude: `QuadMesh::with_period` and `Rectilinear::with_period`
   (stage 4e of `design/curvilinear-frontend.md`, #37).

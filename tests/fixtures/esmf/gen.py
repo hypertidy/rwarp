@@ -40,6 +40,10 @@ grid in the same plane and a regular lon/lat grid up to the pole:
 - <case>.sph.txt: spherical, the same corners in lon/lat with great-circle
   edges, source and destination. The test records the difference.
 
+The onto_tripolar cases are the same grids the other way round: the regular
+grid is the source and the tripolar cap the destination (rwarp's
+mesh::MeshTarget).
+
 Fixture layout: '# key value' header lines, then 'n_b n_s', then n_b lines
 'frac_b area_b' (destination row-major), then n_s lines 'row col S' (ESMF's
 1-based destination and source indices, row-major over each grid).
@@ -293,6 +297,15 @@ TRIPOLAR_CASES = [
      "tripolar cap to 6 x 3 degree lon/lat cells, rows from 54 N up to the pole"),
 ]
 
+# The same grids the other way round: onto the tripolar cap.
+ONTO_TRIPOLAR_CASES = [
+    # name, source kind, src_gt, src_size, note
+    ("onto_tripolar_laea", "laea", [-3_900_000, 300_000, 0, -3_900_000, 0, 300_000], (26, 26),
+     "300 km cells in the cap's plane, rows from the bottom up, onto the tripolar cap"),
+    ("onto_tripolar_lonlat", "lonlat", [0, 6, 0, 54, 0, 3], (60, 12),
+     "6 x 3 degree lon/lat cells, rows from 54 N up to the pole, onto the tripolar cap"),
+]
+
 
 def tripolar_corners(ncol, nrow, a, mu, turn, shift):
     """Corner arrays x, y, shape (nrow + 1, ncol + 1), in the LAEA plane."""
@@ -331,27 +344,50 @@ def tripolar(names):
     counter-clockwise in the plane (rows run up, or towards the pole)."""
     x, y = tripolar_corners(**TRIPOLAR)
     write_grid(os.path.join(HERE, "tripolar.grid.txt"), x, y)
-    src = {"cart": ((x.T, y.T), tuple(v.T for v in centres(x, y)))}
-    src["sph"] = tuple(laea_inv(*xy) for xy in src["cart"])
-    for name, kind, gt, size, note in TRIPOLAR_CASES:
-        if names and name not in names and "tripolar" not in names:
-            continue
+    cap = {"cart": ((x.T, y.T), tuple(v.T for v in centres(x, y)))}
+    cap["sph"] = tuple(laea_inv(*xy) for xy in cap["cart"])
+    how = {"cart": "Cartesian in the LAEA plane (m)",
+           "sph": "spherical, great-circle edges (area_b in steradians)"}
+    systems = [("cart", esmpy.CoordSys.CART), ("sph", esmpy.CoordSys.SPH_DEG)]
+
+    def regular(kind, gt, size):
+        """A regular grid's corners and centres, in the plane and in lon/lat."""
         corner, centre = (pixel_to_geo(gt, *lattice(*size, off)) for off in (False, True))
         if kind == "laea":
-            dst = {"cart": (corner, centre), "sph": (laea_inv(*corner), laea_inv(*centre))}
-        else:
-            dst = {"cart": (laea(*corner), laea(*centre)), "sph": (corner, centre)}
-        for sys_, coord_sys in [("cart", esmpy.CoordSys.CART), ("sph", esmpy.CoordSys.SPH_DEG)]:
-            res = conserve(grid(*src[sys_], coord_sys), grid(*dst[sys_], coord_sys))
-            how = {"cart": "Cartesian in the LAEA plane (m)",
-                   "sph": "spherical, great-circle edges (area_b in steradians)"}[sys_]
+            return {"cart": (corner, centre), "sph": (laea_inv(*corner), laea_inv(*centre))}
+        return {"cart": (laea(*corner), laea(*centre)), "sph": (corner, centre)}
+
+    def wanted(name):
+        return not names or name in names or "tripolar" in names
+
+    for name, kind, gt, size, note in TRIPOLAR_CASES:
+        if not wanted(name):
+            continue
+        dst = regular(kind, gt, size)
+        for sys_, coord_sys in systems:
+            res = conserve(grid(*cap[sys_], coord_sys), grid(*dst[sys_], coord_sys))
             header = [
                 f"case {name}: {note}",
-                f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, {how}",
+                f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, {how[sys_]}",
                 "src tripolar.grid.txt",
                 f"dst_kind {kind}",
                 f"dst_gt {' '.join(repr(float(v)) for v in gt)}",
                 f"dst_size {size[0]} {size[1]}",
+            ]
+            write_map(os.path.join(HERE, f"{name}.{sys_}.txt"), header, sys_, res)
+    for name, kind, gt, size, note in ONTO_TRIPOLAR_CASES:
+        if not wanted(name):
+            continue
+        src = regular(kind, gt, size)
+        for sys_, coord_sys in systems:
+            res = conserve(grid(*src[sys_], coord_sys), grid(*cap[sys_], coord_sys))
+            header = [
+                f"case {name}: {note}",
+                f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, {how[sys_]}",
+                f"src_kind {kind}",
+                f"src_gt {' '.join(repr(float(v)) for v in gt)}",
+                f"src_size {size[0]} {size[1]}",
+                "dst tripolar.grid.txt",
             ]
             write_map(os.path.join(HERE, f"{name}.{sys_}.txt"), header, sys_, res)
 
@@ -384,7 +420,7 @@ def main():
             work = tempfile.mkdtemp()
             write(os.path.join(HERE, f"{name}.tr.txt"), case, "tr", tempest(case, work))
             shutil.rmtree(work)
-    if not names or any(n.startswith("tripolar") for n in names):
+    if not names or any("tripolar" in n for n in names):
         tripolar(names)
 
 
