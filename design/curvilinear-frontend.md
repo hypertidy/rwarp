@@ -5,7 +5,8 @@ Status: stages 1 and 2 implemented (`src/mesh.rs`, `src/mesh/walk.rs`,
 #72), stage 4 started: walls that meet in the world (a seam, a fold) are
 walked across (4a, 2026-11-17; section 3), and meshes come from CF bounds
 and SCRIP corners with ocean-model halos dropped and overlapping cells
-refused (4b, 2026-11-17; section 3). Later stages proposed.
+refused (4b, 2026-11-17; section 3), and weights on a tripolar grid are
+compared with ESMF's (4c, 2026-11-17; section 3). Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -261,13 +262,14 @@ What stage 4 still needs:
   mesh in a polar projection. North polar Lambert azimuthal equal-area
   keeps planar areas true, with edges straight in that projection: not
   great circles, not rhumb lines. The difference from ESMF's great
-  circles is second order in cell size, and the ESMF comparison measures
-  it. One north-polar projection doesn't hold the whole globe, though
+  circles is second order in cell size, as the ESMF comparison measures
+  (4c, below). One north-polar projection doesn't hold the whole globe, though
   (4b, below): near 80 S its cells are flattened 500 to 1 or more, and
   the bend of their long sides exceeds their width.
-- The ESMF comparison, and the southern rows of a global ORCA grid (a
-  second mesh in another projection, or longitude with a declared
-  period).
+- The southern rows of a global ORCA grid (a second mesh in another
+  projection, or longitude with a declared period).
+- Weights from a mesh as a `Weights` value: there is no API for it yet,
+  and the ESMF comparison assembles them from `cover_ring`.
 
 ### CF bounds, SCRIP corners and halos (built, 4b)
 
@@ -402,6 +404,65 @@ below).
   second owner; built, 4b, and run by `from_cf_bounds`). An overlapping
   swath is used as one mesh per scan (the `mesh` module docs show it);
   how overlapping scans combine is the caller's choice.
+
+### ESMF on a tripolar grid (built, 4c)
+
+Built (2026-11-17): `tests/esmf_tripolar.rs`, with fixtures made by
+`tests/fixtures/esmf/gen.py` (ESMPy 8.9.1 in `ghcr.io/hypertidy/gdal-r-esmf`).
+
+- **Source.** An analytic tripolar cap, 48 x 16 cells, given by its
+  corners in north-polar LAEA on NEMO's sphere (`tripolar.grid.txt`).
+  - Shape: confocal ellipses about two grid poles. They are conformal, so
+    cells keep their shape and shrink only towards the poles, as in ORCA.
+    They are 13 to 363 km across, median 183 km.
+  - Walls: an F-point fold between the poles, and a seam that runs into
+    one of them.
+  - Placement: turned and shifted so that no grid line meets the
+    geographic pole.
+- **Destinations.** 300 km cells in the same plane, and 6 x 3 degree
+  lon/lat cells from 54 N to the pole. The top row of the lon/lat grid is
+  triangles with a corner on the pole.
+- **rwarp's weights.** Each destination outline goes through
+  `QuadMesh::cover_ring`. A weight is coverage times source area over
+  destination area (ESMF's `destarea`).
+
+What it shows:
+
+- **Cartesian ESMF in the plane** has rwarp's cells exactly.
+  - Agreement: the maps agree to rounding. S agrees to 3e-14 and frac_b
+    to 4e-14, the entries are the same, and areas agree to the bit.
+  - Coverage: destination cells cross the seam (8 to 10 of them) and the
+    fold (13 to 38). They also cover both grid poles and the geographic
+    pole.
+  - Layout: the NEMO layout of the same grid, read with
+    `Halo::NEMO_F_PIVOT`, is the same mesh to the bit. That layout is CF
+    bounds with a land row, the cyclic columns and the mirrored fold row.
+- **Spherical ESMF** joins the same corners, in lon/lat, by great circles.
+  The differences come from that cell definition, and the test records
+  them as ceilings:
+  - S: up to 2.6e-3, and 1.7e-3 over destination cells both maps cover
+    completely. The largest are on the source's outer row, whose long
+    edges are furthest from the pole.
+  - The regridded smooth field: 1e-4.
+  - Cell areas: 3e-4 for the LAEA destination, 9e-4 for the lon/lat one.
+- **Cells half the size.** On grids with cells half the size on both
+  sides (measured, not committed), the differences shrink:
+  - area differences fall to a quarter, second order in cell size as
+    expected above;
+  - the field's fall to about 0.3;
+  - S's fall to a half, since an edge shifted by h^2 is a share h of a
+    cell of side h.
+- **Lon/lat destination.** Joining its corners straight in the plane
+  (densify 1) is closer to ESMF than following the parallels (densify 8:
+  S 1.1e-2). That matches the regular cases of `tests/esmf.rs`, because
+  ESMF's great circles bow poleward of the parallels.
+
+Not covered:
+
+- No API makes `Weights` from a mesh; the test assembles them in about
+  30 lines.
+- The reverse direction, lon/lat to the tripolar grid, isn't run. It uses
+  the same overlaps, normalised by the mesh cell's area.
 
 ### The exact footprint at the antimeridian
 
@@ -672,7 +733,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); a declared period for coordinates that jump at the seam; the southern rows of a global ORCA grid; the ESMF comparison on a tripolar grid | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); generator 5 |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a declared period for coordinates that jump at the seam; the southern rows of a global ORCA grid | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); generator 5 |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

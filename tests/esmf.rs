@@ -21,72 +21,11 @@
 //! `proj` backend; proj4rs differs at rounding level and lacks `ob_tran`.
 #![cfg(feature = "proj")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+mod esmf_common;
 
+use esmf_common::{diff, read_fixture, smooth, Fixture, Ours};
 use rwarp::transform::GenImgProjTransformer;
 use rwarp::weights::{exact_weights, lonlat_measure, GridWindow, Normalization, WeightOptions};
-
-struct Fixture {
-    header: Vec<String>,
-    frac_b: Vec<f64>,
-    area_b: Vec<f64>,
-    /// (ESMF row, ESMF col) -> S
-    s: HashMap<(u64, u64), f64>,
-}
-
-impl Fixture {
-    fn header(&self, key: &str) -> &str {
-        self.header
-            .iter()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ').map(str::trim))
-            .unwrap_or_else(|| panic!("no '{key}' in fixture header"))
-    }
-
-    fn nums<const N: usize>(&self, key: &str) -> [f64; N] {
-        let v: Vec<f64> = self.header(key).split_whitespace().map(|x| x.parse().unwrap()).collect();
-        v.try_into().unwrap_or_else(|_| panic!("'{key}' needs {N} numbers"))
-    }
-}
-
-fn read_fixture(name: &str) -> Fixture {
-    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "esmf", name].iter().collect();
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let mut header = Vec::new();
-    let mut lines = text.lines();
-    let counts = loop {
-        let l = lines.next().expect("missing counts");
-        match l.strip_prefix("# ") {
-            Some(h) => header.push(h.to_string()),
-            None => break l,
-        }
-    };
-    let mut counts = counts.split_whitespace().map(|v| v.parse::<usize>().unwrap());
-    let (n_b, n_s) = (counts.next().unwrap(), counts.next().unwrap());
-    let (mut frac_b, mut area_b) = (Vec::with_capacity(n_b), Vec::with_capacity(n_b));
-    for l in lines.by_ref().take(n_b) {
-        let mut f = l.split_whitespace().map(|v| v.parse::<f64>().unwrap());
-        frac_b.push(f.next().unwrap());
-        area_b.push(f.next().unwrap());
-    }
-    let mut s = HashMap::with_capacity(n_s);
-    for l in lines {
-        let mut f = l.split_whitespace();
-        let row = f.next().unwrap().parse().unwrap();
-        let col = f.next().unwrap().parse().unwrap();
-        s.insert((row, col), f.next().unwrap().parse().unwrap());
-    }
-    assert_eq!((frac_b.len(), s.len()), (n_b, n_s), "{name}: truncated fixture");
-    Fixture { header, frac_b, area_b, s }
-}
-
-/// rwarp's side of one case, in ESMF's terms.
-struct Ours {
-    s: HashMap<(u64, u64), f64>,
-    /// Covered fraction and area (source pixels) per destination cell.
-    frac_b: Vec<f64>,
-    area_b: Vec<f64>,
-}
 
 fn ours(fx: &Fixture, densify: usize, spherical: bool) -> Ours {
     let [sw, sh] = fx.nums::<2>("src_size").map(|v| v as usize);
@@ -117,70 +56,10 @@ fn field(fx: &Fixture) -> Vec<f64> {
     for r in 0..sh {
         for c in 0..sw {
             let (x, y) = (c as f64 + 0.5, r as f64 + 0.5);
-            let lon = (gt[0] + x * gt[1] + y * gt[2]).to_radians();
-            let lat = (gt[3] + x * gt[4] + y * gt[5]).to_radians();
-            v.push(2.0 + lat.cos().powi(2) * (2.0 * lon).cos() + 0.5 * (3.0 * lat).sin());
+            v.push(smooth(gt[0] + x * gt[1] + y * gt[2], gt[3] + x * gt[4] + y * gt[5]));
         }
     }
     v
-}
-
-fn regrid(s: &HashMap<(u64, u64), f64>, src: &[f64], n_b: usize) -> Vec<f64> {
-    let mut d = vec![0.0; n_b];
-    for (&(row, col), &w) in s {
-        d[row as usize - 1] += w * src[col as usize - 1];
-    }
-    d
-}
-
-#[derive(Debug, Default)]
-struct Diff {
-    /// max |S ours - S ESMF| over the union of entries (a missing entry is 0)
-    s: f64,
-    /// entries in one map only, and the largest S among them
-    only: (usize, usize, f64),
-    /// max |frac_b ours - frac_b ESMF|
-    frac_b: f64,
-    /// max relative difference of the regridded smooth field, over
-    /// destination cells both cover completely
-    field: f64,
-    /// max |row sum - frac_b| of the ESMF map: ESMF's own constant check
-    esmf_rows: f64,
-}
-
-fn diff(fx: &Fixture, o: &Ours) -> Diff {
-    let mut d = Diff::default();
-    for (k, &e) in &fx.s {
-        match o.s.get(k) {
-            Some(&r) => d.s = d.s.max((r - e).abs()),
-            None => {
-                d.only.1 += 1;
-                d.only.2 = d.only.2.max(e.abs());
-                d.s = d.s.max(e.abs());
-            }
-        }
-    }
-    for (k, &r) in &o.s {
-        if !fx.s.contains_key(k) {
-            d.only.0 += 1;
-            d.only.2 = d.only.2.max(r.abs());
-            d.s = d.s.max(r.abs());
-        }
-    }
-    let n_b = fx.frac_b.len();
-    assert_eq!(o.frac_b.len(), n_b);
-    d.frac_b = o.frac_b.iter().zip(&fx.frac_b).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-    let src = field(fx);
-    let (fo, fe) = (regrid(&o.s, &src, n_b), regrid(&fx.s, &src, n_b));
-    let ones = vec![1.0; src.len()];
-    let rows = regrid(&fx.s, &ones, n_b);
-    for i in 0..n_b {
-        d.esmf_rows = d.esmf_rows.max((rows[i] - fx.frac_b[i]).abs());
-        if fx.frac_b[i] > 1.0 - 1e-9 && o.frac_b[i] > 1.0 - 1e-9 {
-            d.field = d.field.max(((fo[i] - fe[i]) / fe[i]).abs());
-        }
-    }
-    d
 }
 
 const CASES: [&str; 6] = ["regular_coarser", "regular_finer", "regular_overhang", "rotated_pole", "lonlat_3031", "lonlat_laea"];
@@ -196,7 +75,7 @@ fn cartesian_esmf_matches_exactly() {
         let tol = if name == "lonlat_laea" { 1e-7 } else { 1e-9 };
         let fx = read_fixture(&format!("{name}.cart.txt"));
         let o = ours(&fx, 1, false);
-        let d = diff(&fx, &o);
+        let d = diff(&fx, &o, &field(&fx));
         let area = o.area_b.iter().zip(&fx.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         eprintln!("{name:16} cart: {d:?}, max relative area difference {area:.2e}");
         assert!(d.s < tol, "{name}: S differs by {:e}", d.s);
@@ -234,7 +113,7 @@ fn spherical_esmf_differences_are_recorded() {
     for (name, [cs, cf, cv]) in ceilings {
         let fx = read_fixture(&format!("{name}.sph.txt"));
         for densify in [1, 8] {
-            let d = diff(&fx, &ours(&fx, densify, false));
+            let d = diff(&fx, &ours(&fx, densify, false), &field(&fx));
             eprintln!("{name:16} sph densify {densify}: {d:?}");
             assert!(d.esmf_rows < 1e-9, "{name}: ESMF row sums off by {:e}", d.esmf_rows);
             assert!(d.s <= cs, "{name} densify {densify}: S differs by {:e} > {cs:e}", d.s);
@@ -267,7 +146,7 @@ fn spherical_measure_against_spherical_esmf() {
     for (name, [cs, cf, cv]) in ceilings {
         let fx = read_fixture(&format!("{name}.sph.txt"));
         for densify in [1, 8] {
-            let d = diff(&fx, &ours(&fx, densify, true));
+            let d = diff(&fx, &ours(&fx, densify, true), &field(&fx));
             eprintln!("{name:16} sph measure densify {densify}: {d:?}");
             assert!(d.s <= cs, "{name} densify {densify}: S differs by {:e} > {cs:e}", d.s);
             assert!(d.frac_b <= cf, "{name} densify {densify}: frac_b differs by {:e} > {cf:e}", d.frac_b);
@@ -343,12 +222,12 @@ fn tempestremap_agrees_with_esmf() {
     for (name, [cs, cf, cv]) in ceilings {
         let (tr, esmf) = (read_fixture(&format!("{name}.tr.txt")), read_fixture(&format!("{name}.sph.txt")));
         let as_ours = |f: &Fixture| Ours { s: f.s.clone(), frac_b: f.frac_b.clone(), area_b: f.area_b.clone() };
-        let d = diff(&esmf, &as_ours(&tr));
+        let d = diff(&esmf, &as_ours(&tr), &field(&esmf));
         let area = tr.area_b.iter().zip(&esmf.area_b).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         eprintln!("{name:16} TempestRemap vs ESMF: {d:?}, max relative area difference {area:.2e}");
         assert_eq!(d.only.0 + d.only.1, 0, "{name}: different entries");
         assert!(d.s < 1e-10 && d.frac_b < 1e-10 && d.field < 1e-10 && area < 1e-10, "{name}: {d:?}, area {area:e}");
-        let r = diff(&tr, &ours(&tr, 1, true));
+        let r = diff(&tr, &ours(&tr, 1, true), &field(&tr));
         eprintln!("{name:16} rwarp (sphere) vs TempestRemap: {r:?}");
         assert!(r.esmf_rows < 1e-9, "{name}: TempestRemap row sums off by {:e}", r.esmf_rows);
         assert!(r.s <= cs && r.frac_b <= cf && r.field <= cv, "{name}: {r:?}");

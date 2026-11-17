@@ -175,8 +175,10 @@ to compact text fixtures, so `cargo test` needs no ESMF.
 
 - **Cases:** regular lon/lat to regular (coarser, finer, offset); lon/lat to
   rotated pole; lon/lat to EPSG:3031 at 25 km; rectilinear (Gaussian
-  latitudes) to regular; a curvilinear ocean grid (a small tripolar patch with
-  corner bounds) to lon/lat; a mesh (an ICON or MPAS fragment) to lon/lat
+  latitudes) to regular; a curvilinear ocean grid with corner bounds to
+  lon/lat (built in stage 4 as a whole analytic tripolar cap, to lon/lat and
+  to its own plane: `tests/esmf_tripolar.rs`, curvilinear-frontend.md
+  section 3); a mesh (an ICON or MPAS fragment) to lon/lat
   (after stage 5).
 - **What's compared:** weights per pair, `frac_b`, `area_b`, and the regridded
   field for a smooth analytic function and for a constant (which must stay

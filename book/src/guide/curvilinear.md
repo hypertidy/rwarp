@@ -209,6 +209,20 @@ land:
 
 Drop such rows with the halo's `rows`, or repair the bounds, for now.
 
+Against ESMF, on an analytic tripolar cap with a seam and a fold
+(`tests/esmf_tripolar.rs`), with each destination cell's outline
+covered by `cover_ring`:
+
+- **ESMF in the same plane** (Cartesian) has the same cells. The weights
+  agree to rounding.
+- **ESMF on the sphere** joins corners by great circles, and rwarp joins
+  them by straight lines in the projection. For cells 13 to 363 km across,
+  weights differ by up to 2.6e-3 and cell areas by up to 9e-4. The area
+  difference falls with the square of cell size.
+
+There is no `Weights` from a mesh yet: the test builds them from
+`cover_ring`, one destination cell at a time.
+
 ### Overlapping swaths
 
 A mesh is one sheet: `from_corners` refuses cells of both orientations,
@@ -235,9 +249,8 @@ example, which checks the area each scan covers, is in the
 A row or column stored twice, such as an ocean model's halo, keeps its
 orientation, and `from_corners` doesn't check for it (the check costs
 about what building the mesh does). `QuadMesh::find_overlap` finds it,
-and `from_cf_bounds` refuses it. A declared period for longitudes, and
-the comparison with ESMF, are the rest of stage 4
-([#37](https://github.com/hypertidy/rwarp/issues/37)).
+and `from_cf_bounds` refuses it. A declared period for longitudes is
+the rest of stage 4 ([#37](https://github.com/hypertidy/rwarp/issues/37)).
 
 `mesh` is public and unstable: it changes more often than the rest of
 the crate and may break at any 0.x minor release, though not at a patch

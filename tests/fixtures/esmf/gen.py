@@ -1,10 +1,11 @@
-"""Regenerate the ESMF oracle fixtures for tests/esmf.rs.
+"""Regenerate the ESMF oracle fixtures for tests/esmf.rs and tests/esmf_tripolar.rs.
 
-    /opt/gdal-py/bin/python tests/fixtures/esmf/gen.py
+    /opt/gdal-py/bin/python tests/fixtures/esmf/gen.py [case ...]
 
 Runs in ghcr.io/hypertidy/gdal-r-esmf (ESMPy, GDAL's Python bindings), or by
 hand from the workflow .github/workflows/esmf-fixtures.yml. design/conservative.md
-section 4 explains the suite.
+section 4 explains the suite. With case names, only those cases are made
+("tripolar" makes all the tripolar ones).
 
 Each case is a regular source grid and a destination grid, both given as CRS
 plus geotransform. Each destination cell's corners are taken from source pixel
@@ -26,6 +27,19 @@ area, as ESMF's S:
   does not map between grids that only partly overlap ("Invalid overlap
   mesh"), so regular_overhang has none.
 
+The tripolar cases (tests/esmf_tripolar.rs) have a curvilinear source: an
+analytic tripolar cap, with a seam and a fold, given by its corners in
+north-polar Lambert azimuthal equal-area on a sphere (tripolar.grid.txt),
+the plane in which rwarp holds it as one sheet. Destinations are a regular
+grid in the same plane and a regular lon/lat grid up to the pole:
+
+- <case>.cart.txt: Cartesian, in that plane. Every cell's edges are straight
+  between its corners there, as rwarp's source cells are and its destination
+  cells are at densify 1, so rwarp must match it to rounding: this checks the
+  walk through the seam, the fold and the poles against an independent code.
+- <case>.sph.txt: spherical, the same corners in lon/lat with great-circle
+  edges, source and destination. The test records the difference.
+
 Fixture layout: '# key value' header lines, then 'n_b n_s', then n_b lines
 'frac_b area_b' (destination row-major), then n_s lines 'row col S' (ESMF's
 1-based destination and source indices, row-major over each grid).
@@ -35,6 +49,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import esmpy
@@ -197,23 +212,32 @@ def tempest(case, work):
 
 def write(path, case, kind, result):
     name, src_crs, src_gt, src_size, dst_crs, dst_gt, dst_size, note = case
-    frac_b, area_b, row, col, s = result
-    order = np.lexsort((col, row))
-    fmt = "%.17g" if kind == "cart" else "%.12g"
     oracle = {
         "cart": f"ESMPy {esmpy.__version__} conserve, norm dstarea, Cartesian in source pixel space",
         "sph": f"ESMPy {esmpy.__version__} conserve, norm dstarea, spherical, great-circle edges",
         "tr": "TempestRemap first-order FV (--in_np 1), great-circle edges",
     }[kind]
+    header = [
+        f"case {name}: {note}",
+        f"oracle {oracle}",
+        f"proj {osr.GetPROJVersionMajor()}.{osr.GetPROJVersionMinor()}.{osr.GetPROJVersionMicro()}",
+        f"src_crs {src_crs}",
+        f"src_gt {' '.join(repr(float(v)) for v in src_gt)}",
+        f"src_size {src_size[0]} {src_size[1]}",
+        f"dst_crs {dst_crs}",
+        f"dst_gt {' '.join(repr(float(v)) for v in dst_gt)}",
+        f"dst_size {dst_size[0]} {dst_size[1]}",
+    ]
+    write_map(path, header, kind, result)
+
+
+def write_map(path, header, kind, result):
+    frac_b, area_b, row, col, s = result
+    order = np.lexsort((col, row))
+    fmt = "%.17g" if kind == "cart" else "%.12g"
     with open(path, "w") as f:
-        f.write(f"# case {name}: {note}\n")
-        f.write(f"# oracle {oracle}\n")
-        f.write(f"# proj {osr.GetPROJVersionMajor()}.{osr.GetPROJVersionMinor()}."
-                f"{osr.GetPROJVersionMicro()}\n")
-        f.write(f"# src_crs {src_crs}\n# src_gt {' '.join(repr(float(v)) for v in src_gt)}\n")
-        f.write(f"# src_size {src_size[0]} {src_size[1]}\n")
-        f.write(f"# dst_crs {dst_crs}\n# dst_gt {' '.join(repr(float(v)) for v in dst_gt)}\n")
-        f.write(f"# dst_size {dst_size[0]} {dst_size[1]}\n")
+        for h in header:
+            f.write(f"# {h}\n")
         f.write(f"{frac_b.size} {s.size}\n")
         for fb, ab in zip(frac_b, area_b):
             f.write(f"{fmt % fb} {fmt % ab}\n")
@@ -222,10 +246,116 @@ def write(path, case, kind, result):
     print(f"{os.path.basename(path)}: {frac_b.size} destination cells, {s.size} weights")
 
 
+# ---- a tripolar source ---------------------------------------------------------
+
+# NEMO's sphere, and north-polar Lambert azimuthal equal-area on it: the plane
+# in which rwarp holds a tripolar grid as one sheet (src/mesh.rs, "Seams and
+# folds"). Planar areas there are areas on the sphere.
+RADIUS = 6371229.0
+
+
+def laea(lon, lat):
+    rho = 2 * RADIUS * np.sin(np.radians(90 - lat) / 2)
+    lam = np.radians(lon)
+    return rho * np.sin(lam), -rho * np.cos(lam)
+
+
+def laea_inv(x, y):
+    rho = np.hypot(x, y)
+    lat = 90 - 2 * np.degrees(np.arcsin(rho / (2 * RADIUS)))
+    return np.degrees(np.arctan2(x, -y)), lat
+
+
+# The tripolar cap: confocal ellipses x = a cosh(mu) cos(t), y = a sinh(mu)
+# sin(t) about two grid poles at (+-a, 0). Row line 0 is the outer ellipse
+# (mu = MU), the last row line the segment between the poles (mu = 0); column
+# lines are at equal t. Elliptic coordinates are conformal, so cells keep
+# their shape and shrink only towards the two poles, as in ORCA. The last row
+# line folds onto itself (corner i on corner ncol - i: an F-point pivot), and
+# column line ncol is column line 0, a seam running into one pole. Both are
+# exact: mirrored corners are computed once. The cap is turned and shifted
+# so that no grid line meets the geographic pole or follows a destination
+# grid line; its outer row is at about 58 to 62 N.
+TRIPOLAR = dict(ncol=48, nrow=16, a=1_500_000.0, mu=1.475, turn=20.0, shift=(90_000.0, -50_000.0))
+
+TRIPOLAR_CASES = [
+    # name, destination kind, dst_gt, dst_size, note
+    ("tripolar_laea", "laea", [-3_900_000, 300_000, 0, -3_900_000, 0, 300_000], (26, 26),
+     "tripolar cap to 300 km cells in the same plane, rows from the bottom up"),
+    ("tripolar_lonlat", "lonlat", [0, 6, 0, 54, 0, 3], (60, 12),
+     "tripolar cap to 6 x 3 degree lon/lat cells, rows from 54 N up to the pole"),
+]
+
+
+def tripolar_corners(ncol, nrow, a, mu, turn, shift):
+    """Corner arrays x, y, shape (nrow + 1, ncol + 1), in the LAEA plane."""
+    j = np.arange(nrow + 1)[:, None]
+    i = np.arange(ncol + 1)[None, :] % ncol
+    m = mu * (nrow - j) / nrow
+    k = np.minimum(i, ncol - i)
+    t = 2 * np.pi * k / ncol
+    sign = np.where(i > ncol // 2, -1.0, 1.0)
+    ex = a * np.cosh(m) * np.cos(t)
+    ey = a * np.sinh(m) * np.sin(t) * sign
+    c, s = math.cos(math.radians(turn)), math.sin(math.radians(turn))
+    return ex * c - ey * s + shift[0], ex * s + ey * c + shift[1]
+
+
+def centres(x, y):
+    return tuple(0.25 * (v[:-1, :-1] + v[:-1, 1:] + v[1:, 1:] + v[1:, :-1]) for v in (x, y))
+
+
+def write_grid(path, x, y):
+    nrow, ncol = x.shape[0] - 1, x.shape[1] - 1
+    p = TRIPOLAR
+    with open(path, "w") as f:
+        f.write("# grid tripolar cap, confocal ellipses about two poles; corners in north-polar LAEA (m)\n")
+        f.write(f"# radius {RADIUS!r}\n")
+        f.write(f"# params a {p['a']!r} mu {p['mu']!r} turn {p['turn']!r} shift {p['shift'][0]!r} {p['shift'][1]!r}\n")
+        f.write(f"{ncol} {nrow}\n")
+        for xv, yv in zip(x.ravel(), y.ravel()):
+            f.write(f"{xv:.17g} {yv:.17g}\n")
+    print(f"{os.path.basename(path)}: {ncol} x {nrow} cells")
+
+
+def tripolar(names):
+    """The tripolar cases: corners in tripolar.grid.txt, maps as for the
+    regular cases. Every grid goes to ESMF indexed [col, row], with cells
+    counter-clockwise in the plane (rows run up, or towards the pole)."""
+    x, y = tripolar_corners(**TRIPOLAR)
+    write_grid(os.path.join(HERE, "tripolar.grid.txt"), x, y)
+    src = {"cart": ((x.T, y.T), tuple(v.T for v in centres(x, y)))}
+    src["sph"] = tuple(laea_inv(*xy) for xy in src["cart"])
+    for name, kind, gt, size, note in TRIPOLAR_CASES:
+        if names and name not in names and "tripolar" not in names:
+            continue
+        corner, centre = (pixel_to_geo(gt, *lattice(*size, off)) for off in (False, True))
+        if kind == "laea":
+            dst = {"cart": (corner, centre), "sph": (laea_inv(*corner), laea_inv(*centre))}
+        else:
+            dst = {"cart": (laea(*corner), laea(*centre)), "sph": (corner, centre)}
+        for sys_, coord_sys in [("cart", esmpy.CoordSys.CART), ("sph", esmpy.CoordSys.SPH_DEG)]:
+            res = conserve(grid(*src[sys_], coord_sys), grid(*dst[sys_], coord_sys))
+            how = {"cart": "Cartesian in the LAEA plane (m)",
+                   "sph": "spherical, great-circle edges (area_b in steradians)"}[sys_]
+            header = [
+                f"case {name}: {note}",
+                f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, {how}",
+                "src tripolar.grid.txt",
+                f"dst_kind {kind}",
+                f"dst_gt {' '.join(repr(float(v)) for v in gt)}",
+                f"dst_size {size[0]} {size[1]}",
+            ]
+            write_map(os.path.join(HERE, f"{name}.{sys_}.txt"), header, sys_, res)
+
+
 def main():
     esmpy.Manager(debug=False)
+    names = sys.argv[1:]
     for case in CASES:
         name, _, src_gt, (sw, sh), _, _, (dw, dh), _ = case
+        if names and name not in names:
+            continue
         # source: pixel space, and lon/lat (every case's source is EPSG:4326)
         s_corner, s_centre = lattice(sw, sh, False), lattice(sw, sh, True)
         s_corner_ll = pixel_to_geo(src_gt, *s_corner)
@@ -247,6 +377,8 @@ def main():
             work = tempfile.mkdtemp()
             write(os.path.join(HERE, f"{name}.tr.txt"), case, "tr", tempest(case, work))
             shutil.rmtree(work)
+    if not names or any(n.startswith("tripolar") for n in names):
+        tripolar(names)
 
 
 if __name__ == "__main__":

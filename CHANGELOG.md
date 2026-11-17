@@ -100,6 +100,18 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- ESMF on a tripolar grid (stage 4c of `design/curvilinear-frontend.md`,
+  #37; `tests/esmf_tripolar.rs`). The weights come from
+  `QuadMesh::cover_ring` on an analytic tripolar cap, with a seam into one
+  pole and an F-point fold. They are compared on two destinations: a grid
+  in the cap's own plane, and lon/lat up to the pole.
+  - Cartesian ESMF in the plane: the weights agree to rounding (3e-14).
+  - Spherical ESMF: the differences are great-circle edges, recorded as
+    ceilings. S differs by up to 2.6e-3 and areas by up to 9e-4, and the
+    area difference falls with the square of cell size.
+  - The NEMO layout of the same grid gives the same mesh to the bit.
+  - Fixtures come from `tests/fixtures/esmf/gen.py`, which now takes case
+    names. Its existing fixtures are unchanged bit for bit.
 - `QuadMesh::from_cf_bounds`: a mesh from each cell's own four vertices,
   CF bounds (`lon_bnds(j, i, 4)`) or SCRIP corners
   (`grid_corner_lon(grid_size, 4)`), with a `Halo` of rows and columns
