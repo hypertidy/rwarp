@@ -50,6 +50,13 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   `examples/mesh_burn_par.rs` now takes 0.24 s with `burn` (1.15 s
   before), and 0.06 s at 8 threads (0.23 s).
 
+- `mesh` says what "unstable" means (decision N4): the module may break
+  at a 0.x minor release, not at a patch release. Its docs show one mesh
+  per scan for a swath whose scans overlap (decision N3; a doctest), and
+  `QuadMesh::from_corners` says that overlap keeping orientation (a row
+  or column stored twice, such as an ocean model's halo) isn't detected
+  yet.
+
 ### Fixed
 
 - `QuadMesh::ring_to_index` for a ring that touches the mesh at a single
