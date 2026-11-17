@@ -100,6 +100,27 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `mesh::MeshSet`: a whole curvilinear grid as rectangular pieces, each a
+  `QuadMesh` in the projection of its band of rows, for an ocean model's
+  whole global grid (stage 4g of `design/curvilinear-frontend.md`, #37).
+  - `MeshSet::from_cf_bounds(ncol, nrow, xb, yb, halo, bands, droppable)`
+    projects each `Band` to its own world. It leaves out cells that are
+    bow-ties there, turned the wrong way or overlapping others, where
+    `droppable` allows (land), and refuses them otherwise. The rest are
+    covered by `Piece`s, so a cell left out is a hole.
+  - `weights_to` and `weights_onto` give conservative weights from and
+    onto the whole grid as one `Weights` in the file's numbering, from
+    `exact_weights` through a `MeshTransformer` or `MeshTarget` per
+    piece. Each piece is measured only over the pixels it reaches.
+  - For ORCA: bands in north-polar and south-polar LAEA on the model's
+    sphere, both equal-area, so areas add up across them. Where they meet
+    the cells bow apart, a gap of about dlam^2 / (6 dphi) of a cell (under
+    1% at 20 S on ORCA2).
+  - Checks (`tests/mesh_set.rs`): an analytic global tripolar grid with
+    damaged land, conservation to 7e-15, the gap within its bound, the
+    rest unchanged by the damage. On CMIP6's eORCA1 and ORCA2 whole (in
+    scratch): every ocean cell kept, 716 and 801 land cells left out, to
+    1 degree in about 1 s each.
 - `mesh::MeshTarget`: a `QuadMesh` as a warp target, for regridding onto
   a curvilinear grid given by its corners, such as an ocean model's
   tripolar grid (stage 4f of `design/curvilinear-frontend.md`, #37).

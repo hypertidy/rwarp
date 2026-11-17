@@ -338,6 +338,62 @@ Against ESMF, on the same tripolar cap as the target:
   plane, over cells more than 100 km across, the difference is 3e-3, as
   in the other direction.
 
+### Whole ORCA files
+
+One mesh can't hold a whole tripolar ocean grid. North-polar LAEA turns
+its far south into bow-ties, and longitude and latitude can't hold the
+cell over the North Pole. Model files also have land cells with damaged
+bounds: IPSL's CMIP6 eORCA1 has thin flipped strips south of 75 S, and
+its ORCA2 has garbled cells between 9 N and 49 N. No ocean cell is
+damaged in either.
+
+`MeshSet` takes the whole file. Its rows are split into bands, each in a
+projection that holds it. Cells that aren't valid there, or overlap
+others, are left out where a mask allows: give it the land. What's left
+is covered by rectangular pieces, each a mesh of its own, so a cell left
+out is a hole and every other cell keeps the file's geometry.
+
+```rust,ignore
+use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer};
+
+// lon_b, lat_b: the file's bounds (182 x 149 x 4 for ORCA2); land: !(areacello > 0)
+// south and north: lon/lat to south- and north-polar LAEA on the model's sphere,
+// as CrsTransforms; crs: the same two as CRS strings
+let bands = [
+    Band { rows: 0..54, to_world: &south },   // to about 20 S
+    Band { rows: 54..147, to_world: &north },
+];
+let set = MeshSet::from_cf_bounds(182, 149, &lon_b, &lat_b, Halo::NEMO_T_PIVOT, &bands, Some(&land))?;
+
+// conservative weights to a 1 degree grid, sources in the set's numbering
+let gt = [-180.0, 1.0, 0.0, 90.0, 0.0, -1.0];
+let opts = WeightOptions::new(2);
+let w = set.weights_to(|band, mesh| MeshTransformer::new(mesh, crs[band], gt, "+proj=longlat +R=6371229"), 360, 180, &opts)?;
+```
+
+`weights_onto` goes the other way, onto the set's cells. Both bands are
+equal-area on one sphere, so areas from either are square metres of it
+and weights add up across them. Where the bands meet, each side's cells
+are straight in their own projection and bow apart between corners,
+leaving a thin gap covered by neither. At the equator it takes about
+dlam² / (6 dphi) of each cell next to it, where dlam and dphi are the
+cells' width and height in radians: 2.3% for ORCA2's 2 by 0.5 degree cells
+there. So split where the cells are taller, south of the equatorial
+refinement; at 20 S it is under 1%.
+
+On IPSL's CMIP6 files (checked in scratch, not in CI), split at 20 S:
+
+| | eORCA1 | ORCA2 |
+|---|---|---|
+| Built in | 0.13 s, 50 pieces | 0.05 s, 56 pieces |
+| Land cells left out | 716 (no ocean) | 801 (no ocean) |
+| Ocean area vs `areacello` | 0.9999 | 0.9994; 0.9998 without the halved fold row, whose cells `areacello` counts whole |
+| To 1°: every cell shared out to | 1e-12 (1.0 s) | 8e-14 (1.2 s) |
+| From 1°, onto the set: covered to | 5e-10 (0.4 s) | 1e-9 (0.1 s) |
+
+The worst cells covered are 0.03 km² slivers next to the grid poles,
+where 5e-10 is rounding on a cell a millionth of a source pixel.
+
 ### Overlapping swaths
 
 A mesh is one sheet: `from_corners` refuses cells of both orientations,

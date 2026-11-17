@@ -130,164 +130,9 @@ impl QuadMesh {
         halo: Halo,
         map: CellMap,
     ) -> Result<Self, String> {
-        let n = ncol * nrow * 4;
-        if xb.len() != n || yb.len() != n {
-            return Err(format!(
-                "bounds arrays have {} and {} values, expected nrow * ncol * 4 = {n}",
-                xb.len(),
-                yb.len()
-            ));
-        }
-        if let Some(k) = xb.iter().chain(yb).position(|v| !v.is_finite()) {
-            let k = k % n;
-            return Err(format!(
-                "the bounds of cell ({}, {}) are not finite",
-                k / 4 / ncol,
-                k / 4 % ncol
-            ));
-        }
-        let [c0, c1] = halo.cols;
-        let [r0, r1] = halo.rows;
-        if c0 + c1 >= ncol || r0 + r1 >= nrow {
-            return Err(format!(
-                "the halo (columns {c0} + {c1}, rows {r0} + {r1}) leaves no cells of {ncol} x {nrow}"
-            ));
-        }
-        let (nc, nr) = (ncol - c0 - c1, nrow - r0 - r1);
-        // vertex `k` as stored, of the kept cell (j, i)
-        let v = |j: usize, i: usize, k: usize| {
-            let at = ((j + r0) * ncol + i + c0) * 4 + k;
-            [xb[at], yb[at]]
-        };
-        let extent = |j: usize, i: usize| {
-            let p: [[f64; 2]; 4] = std::array::from_fn(|k| v(j, i, k));
-            let (mut x0, mut y0, mut x1, mut y1) = (p[0][0], p[0][1], p[0][0], p[0][1]);
-            for q in &p[1..] {
-                (x0, y0, x1, y1) = (x0.min(q[0]), y0.min(q[1]), x1.max(q[0]), y1.max(q[1]));
-            }
-            (x1 - x0).max(y1 - y0)
-        };
-        // the first pair of shared corners that disagree under order `o`
-        let mismatch = |o: &[usize; 4]| -> Option<String> {
-            let far = |a: [f64; 2], b: [f64; 2], tol: f64| {
-                (a[0] - b[0]).abs() > tol || (a[1] - b[1]).abs() > tol
-            };
-            for j in 0..nr {
-                for i in 0..nc {
-                    // the next column's slots 0 and 3 are our 1 and 2; the
-                    // next row's 0 and 1 are our 3 and 2
-                    let pairs = [
-                        (i + 1 < nc, j, i + 1, [(1, 0), (2, 3)]),
-                        (j + 1 < nr, j + 1, i, [(3, 0), (2, 1)]),
-                    ];
-                    for (has, jn, in_, slots) in pairs {
-                        if !has {
-                            continue;
-                        }
-                        let tol = SHARED * extent(j, i).max(extent(jn, in_));
-                        for (s, t) in slots {
-                            let (a, b) = (v(j, i, o[s]), v(jn, in_, o[t]));
-                            if far(a, b, tol) {
-                                let d = [b[0] - a[0], b[1] - a[1]];
-                                let period = [d[0].abs(), d[1].abs()].iter().any(|&x| {
-                                    (x - 360.0).abs() < 1e-6
-                                        || (x - std::f64::consts::TAU).abs() < 1e-9
-                                });
-                                return Some(format!(
-                                    "cells ({}, {}) and ({}, {}) don't share a corner: ({}, {}) and ({}, {}){}",
-                                    j + r0,
-                                    i + c0,
-                                    jn + r0,
-                                    in_ + c0,
-                                    a[0],
-                                    a[1],
-                                    b[0],
-                                    b[1],
-                                    if period {
-                                        " are a period apart (longitudes across a seam?): unwrap \
-                                         them (`unwrap_bounds`) and declare the period \
-                                         (`QuadMesh::with_period`), or give the bounds in a \
-                                         projection in which the grid is one sheet"
-                                    } else {
-                                        ""
-                                    }
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        };
-        let mut first = None;
-        let mut order = None;
-        for o in &ORDERS {
-            match mismatch(o) {
-                None => {
-                    order = Some(*o);
-                    break;
-                }
-                Some(e) => {
-                    first.get_or_insert(e);
-                }
-            }
-        }
-        let Some(o) = order else {
-            return Err(format!(
-                "{} (in CF's vertex order; no other order fits either). Drop rows or columns \
-                 that aren't cells with `Halo`",
-                first.unwrap_or_default()
-            ));
-        };
-        // corner (j, i) from cell (j, i), whose first vertex it is; on the
-        // last row and column from the cell beside it
-        let w = nc + 1;
-        let (mut x, mut y) = (vec![0.0; w * (nr + 1)], vec![0.0; w * (nr + 1)]);
-        for j in 0..=nr {
-            for i in 0..=nc {
-                let p = match (j < nr, i < nc) {
-                    (true, true) => v(j, i, o[0]),
-                    (true, false) => v(j, nc - 1, o[1]),
-                    (false, true) => v(nr - 1, i, o[3]),
-                    (false, false) => v(nr - 1, nc - 1, o[2]),
-                };
-                x[j * w + i] = p[0];
-                y[j * w + i] = p[1];
-            }
-        }
-        if halo.fold_through_centres {
-            // the fold runs through the last row only if that row mirrors
-            // itself: its top corners are its bottom corners, reversed
-            let mut bottom: Vec<[f64; 2]> = (0..=nc)
-                .map(|i| [x[(nr - 1) * w + i], y[(nr - 1) * w + i]])
-                .collect();
-            bottom.sort_by(|a, b| a[0].total_cmp(&b[0]));
-            for i in 0..=nc {
-                let p = [x[nr * w + i], y[nr * w + i]];
-                let cell = |c: usize| extent(nr - 1, c.min(nc - 1));
-                let tol = SHARED * cell(i.saturating_sub(1)).max(cell(i));
-                let lo = bottom.partition_point(|q| q[0] < p[0] - tol);
-                let hit = bottom[lo..]
-                    .iter()
-                    .take_while(|q| q[0] <= p[0] + tol)
-                    .any(|q| (q[1] - p[1]).abs() <= tol);
-                if !hit {
-                    return Err(format!(
-                        "`fold_through_centres`, but row {} doesn't mirror itself: its top corner {i} \
-                         isn't one of its bottom corners (a fold along the row's top side, as at an \
-                         F-point pivot?)",
-                        nr - 1 + r0
-                    ));
-                }
-            }
-            // the last row cut at its column-line sides' midpoints
-            for i in 0..=nc {
-                let (lo, hi) = ((nr - 1) * w + i, nr * w + i);
-                x[hi] = 0.5 * (x[lo] + x[hi]);
-                y[hi] = 0.5 * (y[lo] + y[hi]);
-            }
-        }
-        let mesh = Self::from_corners_with_hint(nc, nr, x, y, map, "unwrap_bounds")?;
+        let c = cf_corners(ncol, nrow, xb, yb, halo)?;
+        let (nc, nr, r0, c0) = (c.ncol, c.nrow, halo.rows[0], halo.cols[0]);
+        let mesh = Self::from_corners_with_hint(nc, nr, c.x, c.y, map, "unwrap_bounds")?;
         if let Some([a, b]) = mesh.find_overlap() {
             let last = a.0 + 1 == nr && b.0 + 1 == nr;
             return Err(format!(
@@ -364,7 +209,7 @@ impl QuadMesh {
     /// A point inside cell `k` (which has area), for the overlap check:
     /// the centroid of the larger triangle of the diagonal that lies
     /// inside it. `None` if neither diagonal does.
-    fn probe(&self, k: usize) -> Option<[f64; 2]> {
+    pub(super) fn probe(&self, k: usize) -> Option<[f64; 2]> {
         let s = self.sign;
         let q = self.corners(k / self.ncol, k % self.ncol);
         // the diagonal whose two triangles both turn the cell's way
@@ -382,4 +227,187 @@ impl QuadMesh {
             (t[0][1] + t[1][1] + t[2][1]) / 3.0,
         ])
     }
+}
+
+/// Corner arrays from CF bounds: [`QuadMesh::from_cf_bounds`] before the
+/// mesh is built. Corner `(j, i)` is at `x[j * (ncol + 1) + i]`.
+pub(crate) struct CfCorners {
+    pub(crate) ncol: usize,
+    pub(crate) nrow: usize,
+    pub(crate) x: Vec<f64>,
+    pub(crate) y: Vec<f64>,
+}
+
+/// [`QuadMesh::from_cf_bounds`]'s checks and corners: lengths, finite
+/// values, the halo, the vertex order, shared corners and the T pivot's
+/// halved row.
+pub(crate) fn cf_corners(
+    ncol: usize,
+    nrow: usize,
+    xb: &[f64],
+    yb: &[f64],
+    halo: Halo,
+) -> Result<CfCorners, String> {
+    let n = ncol * nrow * 4;
+    if xb.len() != n || yb.len() != n {
+        return Err(format!(
+            "bounds arrays have {} and {} values, expected nrow * ncol * 4 = {n}",
+            xb.len(),
+            yb.len()
+        ));
+    }
+    if let Some(k) = xb.iter().chain(yb).position(|v| !v.is_finite()) {
+        let k = k % n;
+        return Err(format!(
+            "the bounds of cell ({}, {}) are not finite",
+            k / 4 / ncol,
+            k / 4 % ncol
+        ));
+    }
+    let [c0, c1] = halo.cols;
+    let [r0, r1] = halo.rows;
+    if c0 + c1 >= ncol || r0 + r1 >= nrow {
+        return Err(format!(
+            "the halo (columns {c0} + {c1}, rows {r0} + {r1}) leaves no cells of {ncol} x {nrow}"
+        ));
+    }
+    let (nc, nr) = (ncol - c0 - c1, nrow - r0 - r1);
+    // vertex `k` as stored, of the kept cell (j, i)
+    let v = |j: usize, i: usize, k: usize| {
+        let at = ((j + r0) * ncol + i + c0) * 4 + k;
+        [xb[at], yb[at]]
+    };
+    let extent = |j: usize, i: usize| {
+        let p: [[f64; 2]; 4] = std::array::from_fn(|k| v(j, i, k));
+        let (mut x0, mut y0, mut x1, mut y1) = (p[0][0], p[0][1], p[0][0], p[0][1]);
+        for q in &p[1..] {
+            (x0, y0, x1, y1) = (x0.min(q[0]), y0.min(q[1]), x1.max(q[0]), y1.max(q[1]));
+        }
+        (x1 - x0).max(y1 - y0)
+    };
+    // the first pair of shared corners that disagree under order `o`
+    let mismatch = |o: &[usize; 4]| -> Option<String> {
+        let far = |a: [f64; 2], b: [f64; 2], tol: f64| {
+            (a[0] - b[0]).abs() > tol || (a[1] - b[1]).abs() > tol
+        };
+        for j in 0..nr {
+            for i in 0..nc {
+                // the next column's slots 0 and 3 are our 1 and 2; the
+                // next row's 0 and 1 are our 3 and 2
+                let pairs = [
+                    (i + 1 < nc, j, i + 1, [(1, 0), (2, 3)]),
+                    (j + 1 < nr, j + 1, i, [(3, 0), (2, 1)]),
+                ];
+                for (has, jn, in_, slots) in pairs {
+                    if !has {
+                        continue;
+                    }
+                    let tol = SHARED * extent(j, i).max(extent(jn, in_));
+                    for (s, t) in slots {
+                        let (a, b) = (v(j, i, o[s]), v(jn, in_, o[t]));
+                        if far(a, b, tol) {
+                            let d = [b[0] - a[0], b[1] - a[1]];
+                            let period = [d[0].abs(), d[1].abs()].iter().any(|&x| {
+                                (x - 360.0).abs() < 1e-6 || (x - std::f64::consts::TAU).abs() < 1e-9
+                            });
+                            return Some(format!(
+                                    "cells ({}, {}) and ({}, {}) don't share a corner: ({}, {}) and ({}, {}){}",
+                                    j + r0,
+                                    i + c0,
+                                    jn + r0,
+                                    in_ + c0,
+                                    a[0],
+                                    a[1],
+                                    b[0],
+                                    b[1],
+                                    if period {
+                                        " are a period apart (longitudes across a seam?): unwrap \
+                                         them (`unwrap_bounds`) and declare the period \
+                                         (`QuadMesh::with_period`), or give the bounds in a \
+                                         projection in which the grid is one sheet"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
+    let mut first = None;
+    let mut order = None;
+    for o in &ORDERS {
+        match mismatch(o) {
+            None => {
+                order = Some(*o);
+                break;
+            }
+            Some(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    let Some(o) = order else {
+        return Err(format!(
+            "{} (in CF's vertex order; no other order fits either). Drop rows or columns \
+                 that aren't cells with `Halo`",
+            first.unwrap_or_default()
+        ));
+    };
+    // corner (j, i) from cell (j, i), whose first vertex it is; on the
+    // last row and column from the cell beside it
+    let w = nc + 1;
+    let (mut x, mut y) = (vec![0.0; w * (nr + 1)], vec![0.0; w * (nr + 1)]);
+    for j in 0..=nr {
+        for i in 0..=nc {
+            let p = match (j < nr, i < nc) {
+                (true, true) => v(j, i, o[0]),
+                (true, false) => v(j, nc - 1, o[1]),
+                (false, true) => v(nr - 1, i, o[3]),
+                (false, false) => v(nr - 1, nc - 1, o[2]),
+            };
+            x[j * w + i] = p[0];
+            y[j * w + i] = p[1];
+        }
+    }
+    if halo.fold_through_centres {
+        // the fold runs through the last row only if that row mirrors
+        // itself: its top corners are its bottom corners, reversed
+        let mut bottom: Vec<[f64; 2]> = (0..=nc)
+            .map(|i| [x[(nr - 1) * w + i], y[(nr - 1) * w + i]])
+            .collect();
+        bottom.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        for i in 0..=nc {
+            let p = [x[nr * w + i], y[nr * w + i]];
+            let cell = |c: usize| extent(nr - 1, c.min(nc - 1));
+            let tol = SHARED * cell(i.saturating_sub(1)).max(cell(i));
+            let lo = bottom.partition_point(|q| q[0] < p[0] - tol);
+            let hit = bottom[lo..]
+                .iter()
+                .take_while(|q| q[0] <= p[0] + tol)
+                .any(|q| (q[1] - p[1]).abs() <= tol);
+            if !hit {
+                return Err(format!(
+                        "`fold_through_centres`, but row {} doesn't mirror itself: its top corner {i} \
+                         isn't one of its bottom corners (a fold along the row's top side, as at an \
+                         F-point pivot?)",
+                        nr - 1 + r0
+                    ));
+            }
+        }
+        // the last row cut at its column-line sides' midpoints
+        for i in 0..=nc {
+            let (lo, hi) = ((nr - 1) * w + i, nr * w + i);
+            x[hi] = 0.5 * (x[lo] + x[hi]);
+            y[hi] = 0.5 * (y[lo] + y[hi]);
+        }
+    }
+    Ok(CfCorners {
+        ncol: nc,
+        nrow: nr,
+        x,
+        y,
+    })
 }

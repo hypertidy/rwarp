@@ -10,8 +10,10 @@ compared with ESMF's (4c, 2026-11-17; section 3), and a mesh is a warp
 source, for `exact_weights` and `warp()`'s exact footprint, through
 `MeshTransformer` (4d, 2026-11-17; section 3), and a period is declared
 for coordinates that jump at the seam (4e, 2026-11-17; section 3), and a
-mesh is a warp target, through `MeshTarget` (4f, 2026-11-17; section 3).
-Later stages proposed.
+mesh is a warp target, through `MeshTarget` (4f, 2026-11-17; section 3),
+and a whole ocean grid is a `MeshSet` of pieces in two polar projections
+with damaged land left out (4g, 2026-11-17; section 3). Later stages
+proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -269,8 +271,8 @@ What stage 4 still needs:
   (4b, below): near 80 S its cells are flattened 500 to 1 or more, and
   the bend of their long sides exceeds their width.
 - The southern rows of a global ORCA grid: longitude with a declared
-  period (4e, below) holds them; a whole ORCA file is still two meshes
-  (the north in a polar projection), not built as one.
+  period (4e, below) holds them. A whole ORCA file is a `MeshSet` in two
+  polar LAEAs (4g, below).
 - A mesh as the target of weights (the reverse map, onto a tripolar
   grid): built, 4f, below.
 
@@ -645,6 +647,79 @@ apart in the plane, are crossed by taking copies, not by gluing walls.
   (from -180 or from 0) share out every cell to 9e-16, in 0.2 s (ORCA2)
   and 0.4 s (eORCA1) on one thread, release build.
 
+### A whole ocean grid in pieces (built, 4g)
+
+Built (2026-11-17, decided with the user: leave damaged land out, two
+polar LAEAs): `rwarp::mesh::MeshSet` (`src/mesh/set.rs`), with `Band`
+and `Piece`.
+
+- **Bands.** `MeshSet::from_cf_bounds(ncol, nrow, xb, yb, halo, bands,
+  droppable)` splits the rows (after the halo) into bands, each with a
+  `CrsTransform` from the bounds' coordinates to its world. Each band's
+  bounds are projected and its corners found there by `from_cf_bounds`'
+  own steps (`cf_corners`: vertex order, shared corners, a T pivot's
+  halved last row in the last band).
+- **Cells left out.** In each band, cells that are bow-ties or turned
+  against most of the band are left out where `droppable` allows (land),
+  and are an error otherwise, named by their place in the file. Then
+  overlaps, by the overlap probes of 4b across all the band's pieces:
+  each droppable cell of an overlapping pair is left out, and the pieces
+  made again (up to eight rounds).
+- **Pieces.** The cells kept in a band are covered by rectangles, each
+  row's runs merged with the rectangle above when they span the same
+  columns. Each is a `QuadMesh` (`EqualArea`) of its own, so a cell left
+  out is a hole that no walk passes through. A piece that spans the
+  seam or the fold has them glued inside it (4a); between pieces nothing
+  needs joining, since each walk measures its own cells.
+- **Why not repair the land?** On both files a Laplace fill of the bad
+  cells' corners, grown one to three cells within land, made more bad
+  cells, not fewer (eORCA1 86 to 166 or more; ORCA2 122 to 189 or more).
+  The bad cells are one-cell strips whose corners all belong to land
+  cells that look fine.
+- **Weights.** `weights_to(transformer, dst_ncol, dst_nrow, opts)` runs
+  `exact_weights` through each piece's `MeshTransformer` and merges the
+  results, sources in the set's numbering; a target pixel's `dst_area`
+  is from the piece covering most of it. Each piece is measured only over
+  the target pixels it reaches: the box of its boundary (full width when
+  that spans half of it), grown on each side its cover touches until it
+  touches none. A piece's cells are one connected region, so that is all
+  of them, and the weights are the same bit for bit (densify 1 and 4) as
+  over the whole grid. eORCA1 to 1 degree took 5.2 s without the windows
+  and takes 1.0 s with them. `weights_onto(inner, src, opts)` runs a
+  `MeshTarget` on each piece. Cells left out get no entries and a NaN
+  `dst_area`.
+- **Where bands meet** each side's cells are straight in their own
+  projection and bow apart between corners: a gap covered by neither, up
+  to R dlam^2 / 4 high on each side at the equator, about dlam^2 / (6
+  dphi) of each cell next to it (2.3% for ORCA2's 2 by 0.5 degree cells
+  at the equator; under 1% at 20 S, where its cells are 2 by 1.9).
+- **Tests.** `tests/mesh_set.rs`, an analytic global grid in lon/lat CF
+  bounds (48 columns, regular rows from 78 S to 60 N, a tripolar cap
+  with a seam, a fold and the pole), two land blocks damaged by a moved
+  corner, bands in south-polar and north-polar LAEA split at the equator:
+  - the damaged land left out, and only land; each cell kept in exactly
+    one piece; undamaged, one piece a band;
+  - refusals (damage that may not be left out, bands that don't tile,
+    the file's numbering under a halo);
+  - to a 2.5 degree grid: every cell kept shared out to 7e-15; pixels
+    next to the equator short by the gap (8.7% for these 7.5 degree
+    cells, under its bound of 9.8%) and nowhere else (5e-14); away from
+    the damage, the undamaged set's weights (5e-15);
+  - windows: each piece's weights as over the whole grid, bit for bit;
+  - onto the set, areas on the sphere: every cell covered to 1e-13;
+  - NEMO's halo round the same cells gives the same set.
+- **On the CMIP6 files** (scratch; split at 20 S): eORCA1 builds in 0.13
+  s as 50 pieces, 716 land cells left out and no ocean, its ocean area
+  0.9999 of `areacello`; to 1 degree every cell is shared out to 1e-12
+  (1.0 s), and from 1 degree onto it covered to 5e-10 (0.4 s). ORCA2: 56
+  pieces, 801 land cells left out and no ocean, 0.9994 of `areacello`
+  (0.9998 without the halved fold row), shared out to 8e-14 (1.2 s),
+  covered to 1e-9 (0.1 s). The worst covered are 0.03 km² slivers by the
+  grid poles.
+- **Not built.** Burning polygons onto a set (each band would need the
+  polygons in its own projection, densified); `warp()` from a set (the
+  lattice takes one world; `Weights::apply` regrids instead).
+
 ### The exact footprint at the antimeridian
 
 Built (stage 3, #36): `Lattice::cover` in `src/warp.rs`, for sources
@@ -914,7 +989,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built) |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

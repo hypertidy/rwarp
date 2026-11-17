@@ -334,7 +334,10 @@ grid are a mesh in longitude and latitude. A mesh is the destination
 through `mesh::MeshTarget` (4f): each cell is a destination pixel
 measured in the source's space, and against ESMF onto the tripolar cap
 the weights agree to rounding in the plane, with the spherical
-differences recorded (`onto_tripolar` fixtures).
+differences recorded (`onto_tripolar` fixtures). A whole ocean grid is a
+`mesh::MeshSet` (4g): pieces in north-polar and south-polar LAEA, with
+damaged land left out, weights from and onto it in the file's numbering
+(eORCA1 and ORCA2 from CMIP6 whole, every ocean cell kept).
 
 ## 7. Stage 5: meshes
 
