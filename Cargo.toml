@@ -39,6 +39,9 @@ vaster = { version = "0.2.0" }
 # Exact coverage fractions for the exact-overlap area footprint. Pure Rust,
 # no dependencies, builds for wasm.
 controlledburn = "0.3.1"
+# Adaptive densification of polygon edges into a band's world, for
+# `MeshSet::burn`. Pure Rust, no dependencies, builds for wasm.
+bigcurve = "0.3.0"
 half = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 

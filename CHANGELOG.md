@@ -121,6 +121,22 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     rest unchanged by the damage. On CMIP6's eORCA1 and ORCA2 whole (in
     scratch): every ocean cell kept, 716 and 801 land cells left out, to
     1 degree in about 1 s each.
+  - `MeshSet::burn(geoms, bands, tolerance, opts)` (stage 4h) burns
+    polygons and points in the bounds' coordinates (longitude and
+    latitude) onto the set. It returns controlledburn's tables in the
+    set's numbering, as fractions of each cell's area.
+    - Edges are straight in the bounds' coordinates. bigcurve densifies
+      them into each band's world to `tolerance` (world units).
+    - Each band takes only the polygons' part within its cells' y
+      range, so a polygon round the far pole isn't turned inside out.
+    - Rings are split where a cut at 180 or along a pole brings them
+      back onto themselves.
+    - Checks: boxes on the analytic grid against closed-form areas, to
+      8e-8. On eORCA1 and ORCA2 (scratch): a whole-world box covers
+      every kept cell, and boxes agree with `weights_onto` to 8e-6.
+      Natural Earth's 10 m countries burn in 1 to 3 s.
+  - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
+    builds for wasm).
 - `mesh::MeshTarget`: a `QuadMesh` as a warp target, for regridding onto
   a curvilinear grid given by its corners, such as an ocean model's
   tripolar grid (stage 4f of `design/curvilinear-frontend.md`, #37).

@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use controlledburn::{BurnMode, BurnResult, Coord, Geometry, Polygon};
 use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, WORLD_GT};
 use rwarp::transform::{CenterLong, GenImgProjTransformer};
 use rwarp::weights::{lonlat_measure, GridWindow, WeightOptions, Weights};
@@ -364,3 +365,248 @@ fn pieces_reach_all_their_pixels() {
         assert!(ours.iter().all(|(k, v)| whole.get(k) == Some(v)), "densify {densify}");
     }
 }
+
+/// Burns onto the set take the bands it was built with.
+fn burn(s: &MeshSet, geoms: &[Geometry]) -> Result<BurnResult, String> {
+    let (south, north) = (World(0, false), World(1, false));
+    let bands = [Band { rows: 0..EQUATOR, to_world: &south }, Band { rows: EQUATOR..NR, to_world: &north }];
+    s.burn(geoms, &bands, 0.1, BurnMode::Coverage)
+}
+
+/// Each cell's burned fraction for geometry `id`, `(row, col)` to
+/// fraction; a cell met twice is an error.
+fn fractions(r: &BurnResult, id: i32) -> HashMap<(usize, usize), f64> {
+    let mut out = HashMap::new();
+    let mut put = |row: i32, col: i32, f: f64| {
+        assert!(out.insert((row as usize, col as usize), f).is_none(), "cell ({row}, {col}) twice");
+    };
+    for run in r.runs.iter().filter(|x| x.id == id) {
+        for col in run.col_start..run.col_end {
+            put(run.row, col, 1.0);
+        }
+    }
+    for e in r.edges.iter().filter(|x| x.id == id) {
+        put(e.row, e.col, e.fraction as f64);
+    }
+    out
+}
+
+/// A ring from `[lon, lat]` corners, closed.
+fn ring(pts: &[[f64; 2]]) -> Vec<Coord> {
+    pts.iter().chain(pts.first()).map(|p| Coord { x: p[0], y: p[1] }).collect()
+}
+
+/// The box `lon0..lon1` by `lat0..lat1`, its rings (outer first) and holes.
+fn lonlat_box(b: [f64; 4]) -> Vec<Coord> {
+    let [x0, x1, y0, y1] = b;
+    ring(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+}
+
+/// The area of a regular cell's box `[lon0, lon1, lat0, lat1]` covers
+/// (grid lines, lat0 < lat1, longitudes taken modulo 360), in its band's
+/// LAEA. Cell edges are chords of the parallels there and the box's
+/// edges along a parallel are arcs (densified): the arc at latitude `L`
+/// bows past the chord by the segment `S(L) = rho(L)^2 (dlam - sin dlam)
+/// / 2`, away from the band's pole, into the cell on that side of `L`,
+/// and covers the band's pole side of `L`.
+fn box_area(r: usize, c: usize, area: f64, b: [f64; 4]) -> f64 {
+    let [lon0, lon1, lat0, lat1] = b;
+    let mid = 7.5 * (c as f64 + 0.5);
+    if ![-360.0, 0.0, 360.0].iter().any(|k| (lon0..=lon1).contains(&(mid + k))) {
+        return 0.0;
+    }
+    let (a, b) = (-78.0 + 6.0 * r as f64, -72.0 + 6.0 * r as f64);
+    let dlam = 7.5f64.to_radians();
+    let south = r < EQUATOR;
+    let seg = |l: f64| {
+        let rho = 2.0 * R * ((90.0 + if south { l } else { -l }).to_radians() / 2.0).sin();
+        rho * rho * (dlam - dlam.sin()) / 2.0
+    };
+    let within = lat0 <= a && b <= lat1;
+    if south {
+        // the cell is the band between the arcs, with S(a) and less S(b);
+        // S(L) lies just south of L
+        let s = |l: f64| if lat0 < l && l <= lat1 { seg(l) } else { 0.0 };
+        (if within { area - seg(a) + seg(b) } else { 0.0 }) + s(a) - s(b)
+    } else {
+        // with S(b) and less S(a); S(L) lies just north of L
+        let s = |l: f64| if lat0 <= l && l < lat1 { seg(l) } else { 0.0 };
+        (if within { area + seg(a) - seg(b) } else { 0.0 }) + s(b) - s(a)
+    }
+}
+
+/// Cells with a corner moved, whose shape isn't the regular one.
+fn moved_cell(r: usize, c: usize) -> bool {
+    MOVED.iter().any(|&((j, i), _)| (r == j || r + 1 == j) && (c == i || c + 1 == i))
+}
+
+/// Burned fractions against `want(row, col, area)` on every cell kept, and
+/// nothing on cells left out: the worst difference.
+fn against(s: &MeshSet, got: &HashMap<(usize, usize), f64>, want: impl Fn(usize, usize, f64) -> Option<f64>) -> f64 {
+    let dropped: HashSet<_> = s.dropped().iter().copied().collect();
+    assert!(got.keys().all(|k| !dropped.contains(k)), "a cell left out was burned");
+    let mut worst = 0.0f64;
+    for r in 0..NR {
+        for c in 0..NC {
+            let Some((p, pr, pc)) = s.locate_cell(r, c) else { continue };
+            let area = p.mesh().cell_area(pr, pc);
+            let Some(f) = want(r, c, area) else { continue };
+            let g = got.get(&(r, c)).copied().unwrap_or(0.0);
+            assert!((g - f).abs() < 2e-6, "cell ({r}, {c}): burned {g}, expected {f}");
+            worst = worst.max((g - f).abs());
+        }
+    }
+    worst
+}
+
+/// A box round the whole world covers every cell kept in full, in both
+/// bands, round the pole and the fold: each band takes only the box's
+/// part near its own cells, so the far pole doesn't turn it inside out.
+/// The same in the grid's own longitudes, 0 to 360.
+#[test]
+fn burn_the_whole_world() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let geoms: Vec<Geometry> = [[-180.0, 180.0, -90.0, 90.0], [0.0, 360.0, -90.0, 90.0]]
+        .iter()
+        .map(|&b| Geometry::Polygon(Polygon::new(vec![lonlat_box(b)])))
+        .collect();
+    let r = burn(&s, &geoms).unwrap();
+    for id in 0..2 {
+        let got = fractions(&r, id);
+        let worst = against(&s, &got, |_, _, _| Some(1.0));
+        eprintln!("whole world ({id}): {} cells, worst {worst:.1e}", got.len());
+        assert_eq!(got.len(), NC * NR - s.dropped().len());
+    }
+}
+
+/// Boxes against their areas in closed form: the two polar caps (only the
+/// near band's cells; the far band gets nothing), a box across the bands
+/// with a hole, and a box across 180 written past it and split at it.
+#[test]
+fn burn_boxes_against_their_areas() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let poly = |rings: Vec<Vec<Coord>>| Geometry::Polygon(Polygon::new(rings));
+    let (outer, hole) = ([-30.0, 30.0, -30.0, 30.0], [-15.0, 15.0, -12.0, 12.0]);
+    let geoms = vec![
+        poly(vec![lonlat_box([-180.0, 180.0, -90.0, -60.0])]),
+        poly(vec![lonlat_box([-180.0, 180.0, 60.0, 90.0])]),
+        poly(vec![lonlat_box(outer), lonlat_box(hole).into_iter().rev().collect()]),
+        poly(vec![lonlat_box([150.0, 210.0, -60.0, -30.0])]),
+        Geometry::MultiPolygon(vec![
+            Polygon::new(vec![lonlat_box([150.0, 180.0, -60.0, -30.0])]),
+            Polygon::new(vec![lonlat_box([-180.0, -150.0, -60.0, -30.0])]),
+        ]),
+        // a cap cut at 232.5 E, the east wall of a piece by the damage
+        poly(vec![lonlat_box([-127.5, 232.5, -90.0, -48.0])]),
+    ];
+    let r = burn(&s, &geoms).unwrap();
+    let regular = |r: usize, c: usize| r < NREG && !moved_cell(r, c);
+
+    // the south cap: rows to 60 S in full, the row above it its slivers
+    let got = fractions(&r, 0);
+    let w = against(&s, &got, |r, c, a| regular(r, c).then(|| box_area(r, c, a, [-180.0, 180.0, -90.0, -60.0]) / a));
+    assert!(got.keys().all(|&(r, _)| r < 4), "the south cap reached row {:?}", got.keys().map(|k| k.0).max());
+    eprintln!("south cap: {} cells, worst {w:.1e}", got.len());
+
+    // the north cap: the cap's cells in full, round the fold and the pole
+    let got = fractions(&r, 1);
+    let w = against(&s, &got, |r, c, a| {
+        if r >= NREG {
+            Some(1.0)
+        } else {
+            regular(r, c).then(|| box_area(r, c, a, [-180.0, 180.0, 60.0, 90.0]) / a)
+        }
+    });
+    assert!(got.keys().all(|&(r, _)| r >= NREG - 1));
+    eprintln!("north cap: {} cells, worst {w:.1e}", got.len());
+
+    // across the bands, with a hole: each band's cells to the equator,
+    // none in the gap between them
+    let got = fractions(&r, 2);
+    let w = against(&s, &got, |r, c, a| {
+        regular(r, c).then(|| (box_area(r, c, a, outer) - box_area(r, c, a, hole)) / a)
+    });
+    eprintln!("across the bands, with a hole: {} cells, worst {w:.1e}", got.len());
+    assert!(got.contains_key(&(EQUATOR - 1, 3)) && got.contains_key(&(EQUATOR, 3)));
+    assert!(!got.contains_key(&(EQUATOR - 1, 1)) && !got.contains_key(&(EQUATOR, 1)), "inside the hole");
+
+    // a cap whose cut runs along a piece's wall: its slit is taken out,
+    // not walked
+    assert!(s.pieces().iter().any(|p| p.offset() == [0, 3] && p.mesh().ncol() == 31));
+    let got = fractions(&r, 5);
+    let w = against(&s, &got, |r, c, a| regular(r, c).then(|| box_area(r, c, a, [-127.5, 232.5, -90.0, -48.0]) / a));
+    eprintln!("a cap cut along a wall: {} cells, worst {w:.1e}", got.len());
+
+    // across 180: as written past it, and split at it
+    let b = [150.0, 210.0, -60.0, -30.0];
+    for id in [3, 4] {
+        let got = fractions(&r, id);
+        let w = against(&s, &got, |r, c, a| regular(r, c).then(|| box_area(r, c, a, b) / a));
+        eprintln!("across 180 ({id}): {} cells, worst {w:.1e}", got.len());
+        assert!(!got.is_empty());
+    }
+    let (one, two) = (fractions(&r, 3), fractions(&r, 4));
+    assert_eq!(one.len(), two.len());
+    let d = one.iter().map(|(k, v)| (v - two[k]).abs()).fold(0.0, f64::max);
+    assert!(d < 1e-6, "{d:e}");
+}
+
+/// Points are found in the cell that holds them, in either band and in
+/// the cap; points in a cell left out, in the gap where the bands meet,
+/// or off the grid are found nowhere.
+#[test]
+fn burn_points() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let dropped: HashSet<_> = s.dropped().iter().copied().collect();
+    let centre = |r: usize, c: usize| Coord { x: 7.5 * (c as f64 + 0.5), y: -75.0 + 6.0 * r as f64 };
+    let pts = vec![
+        centre(1, 3),
+        centre(EQUATOR - 1, 40),
+        centre(EQUATOR, 5),
+        Coord { x: 100.0 - 360.0, y: 20.0 },
+        // on the equator half way between corners: in the gap
+        Coord { x: 3.75, y: 0.0 },
+        Coord { x: 0.0, y: -85.0 },
+        Coord { x: 10.0, y: 90.0 },
+    ];
+    // every cell left out, at its own corners' centre: in no cell left out
+    let gone: Vec<Coord> = s.dropped().iter().map(|&(r, c)| centre(r, c)).collect();
+    let geoms = vec![Geometry::MultiPoint(pts.clone()), Geometry::Point(pts[1]), Geometry::MultiPoint(gone)];
+    let r = burn(&s, &geoms).unwrap();
+    let found: Vec<(i32, i32, i32)> = r.points.iter().filter(|p| p.id < 2).map(|p| (p.id, p.row, p.col)).collect();
+    eprintln!("{found:?}");
+    let e = EQUATOR as i32;
+    assert_eq!(&found[..4], &[(0, 1, 3), (0, e - 1, 40), (0, e, 5), (0, 16, 13)]);
+    // not the gap, nor south of the grid; the pole in one of the cap's cells
+    assert_eq!(found.len(), 6, "{found:?}");
+    assert!(found[4].0 == 0 && found[4].1 >= NREG as i32);
+    assert_eq!(found[5], (1, e - 1, 40));
+    assert!(r.points.iter().all(|p| !dropped.contains(&(p.row as usize, p.col as usize))));
+    assert!(r.runs.is_empty() && r.edges.is_empty());
+}
+
+/// What a burn onto a set refuses: lines, bands other than the set's,
+/// a tolerance that isn't positive, and modes other than coverage.
+#[test]
+fn burn_refusals() {
+    let s = set(&[], None).unwrap();
+    let (south, north) = (World(0, false), World(1, false));
+    let bands = [Band { rows: 0..EQUATOR, to_world: &south }, Band { rows: EQUATOR..NR, to_world: &north }];
+    let poly = vec![Geometry::Polygon(Polygon::new(vec![lonlat_box([0.0, 30.0, 0.0, 30.0])]))];
+    let line = vec![poly[0].clone(), Geometry::LineString(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 }])];
+    let e = s.burn(&line, &bands, 1.0, BurnMode::Coverage).unwrap_err();
+    assert!(e.contains("geometry 1") && e.contains("lines"), "{e}");
+    let one = [Band { rows: 0..NR, to_world: &north }];
+    assert!(s.burn(&poly, &one, 1.0, BurnMode::Coverage).unwrap_err().contains("the bands must be"));
+    let moved = [Band { rows: 0..EQUATOR + 1, to_world: &south }, Band { rows: EQUATOR + 1..NR, to_world: &north }];
+    assert!(s.burn(&poly, &moved, 1.0, BurnMode::Coverage).is_err());
+    for tol in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(s.burn(&poly, &bands, tol, BurnMode::Coverage).unwrap_err().contains("tolerance"));
+    }
+    assert!(s.burn(&poly, &bands, 1.0, BurnMode::Approx).is_err());
+    assert!(s.burn(&poly, &bands, 1.0, BurnMode::Coverage).is_ok());
+}
+
