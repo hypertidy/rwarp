@@ -320,6 +320,13 @@ For conservative regridding, the curvilinear destination's cells come from
 corner bounds (CF `bounds`, SCRIP corners), as ESMF defines them, not from
 interpolated centres. The note's cell-definition parameter covers this.
 
+Status (2026-11-17): a curvilinear *source* given by its corners is
+built. `QuadMesh::from_cf_bounds` reads CF bounds and SCRIP corners
+(4b), and `mesh::MeshTransformer` makes the mesh a source for
+`exact_weights` and `warp()` (4d). Against ESMF the weights agree to
+rounding in the mesh's plane, with the spherical differences recorded
+(`tests/esmf_tripolar.rs`, 4c). A mesh as the destination isn't built.
+
 ## 7. Stage 5: meshes
 
 A mesh source or destination is a list of polygons (faces) with shared edges:

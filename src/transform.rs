@@ -114,7 +114,9 @@ pub trait Transformer {
     /// onto the source window's cells ([`SourceCells::mesh`]) under the
     /// equal-area map, so weights are fractions of each cell's world area.
     /// Geolocation sources report it
-    /// ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)).
+    /// ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)),
+    /// and so does a mesh source
+    /// ([`MeshTransformer`](crate::mesh::MeshTransformer)).
     fn source_cells(&self) -> Option<&dyn SourceCells> {
         None
     }

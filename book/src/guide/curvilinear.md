@@ -209,9 +209,36 @@ land:
 
 Drop such rows with the halo's `rows`, or repair the bounds, for now.
 
+### Warping from a mesh
+
+`MeshTransformer` makes a mesh the source of a warp, with one value per
+cell: `new(mesh, mesh_crs, dst_gt, dst_crs)`. It is a `Transformer` whose
+source pixels are the mesh's cells, so `exact_weights` gives conservative
+weights from the mesh to the grid, and `warp` with `Footprint::Exact` and
+an area method regrids the data. Each target pixel's outline goes to the
+mesh's coordinates and is walked onto its cells, across the seam and the
+fold. A weight is the share of a cell's area that the outline covers.
+
+```rust,ignore
+use rwarp::mesh::MeshTransformer;
+use rwarp::weights::{exact_weights, ApplyOptions, Normalization, WeightOptions};
+
+// the eORCA1 mesh above, in LAEA on the north pole, to 0.5 degrees north of 60 N;
+// buf is a SourceBuffer of the mesh's cells, one value each
+let laea = "+proj=laea +lat_0=90 +lon_0=0 +R=6371229 +units=m";
+let dst_gt = [-180.0, 0.5, 0.0, 90.0, 0.0, -0.5];
+let t = MeshTransformer::new(mesh, laea, dst_gt, "+proj=longlat +R=6371229")?;
+let w = exact_weights(&t, &t.source_window(), 720, 60, &WeightOptions::new(4));
+let sst: Vec<f32> = w.apply(&buf, Normalization::FracArea, &ApplyOptions::new());
+```
+
+The buffer holds the mesh's cells row-major, so mesh cell `(row, col)` is
+source pixel `(col, row)`. Point kernels such as `Bilinear` map a target
+pixel into the mesh's index space through its cell map. They read
+neighbouring cells in index space, not across the seam or fold.
+
 Against ESMF, on an analytic tripolar cap with a seam and a fold
-(`tests/esmf_tripolar.rs`), with each destination cell's outline
-covered by `cover_ring`:
+(`tests/esmf_tripolar.rs`), with weights from `MeshTransformer`:
 
 - **ESMF in the same plane** (Cartesian) has the same cells. The weights
   agree to rounding.
@@ -219,9 +246,6 @@ covered by `cover_ring`:
   them by straight lines in the projection. For cells 13 to 363 km across,
   weights differ by up to 2.6e-3 and cell areas by up to 9e-4. The area
   difference falls with the square of cell size.
-
-There is no `Weights` from a mesh yet: the test builds them from
-`cover_ring`, one destination cell at a time.
 
 ### Overlapping swaths
 

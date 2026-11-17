@@ -29,8 +29,8 @@ pixel), so anything rwarp can warp it can make weights for.
 | `dst_row`, `dst_col` | entry | target cell, full-grid indices (offsets applied) |
 | `src_row`, `src_col` | entry | source cell, full-grid indices |
 | `frac` | entry | area of the overlap as a fraction of the source cell, unrounded `f64` |
-| `dst_area` | target cell | area of the target cell's outline, in source cells (in world units for a geolocation source); `NaN` if it failed to transform |
-| `src_cell_area` | entry | for a geolocation source, the source cell's world area; empty otherwise |
+| `dst_area` | target cell | area of the target cell's outline, in source cells (in world units for a geolocation or mesh source); `NaN` if it failed to transform |
+| `src_cell_area` | entry | for a geolocation or mesh source, the source cell's world area; empty otherwise |
 | `dst_off`, `dst_size` | | the target window the weights are for |
 
 Areas are measured in source pixel space, where a source cell has area 1.
@@ -51,6 +51,12 @@ is the outline's world area. This is planar area in the arrays'
 coordinates: square degrees for longitude and latitude, true area for
 arrays in an equal-area CRS. Arrays whose cells are not whole fall back
 to source pixel space; see [Limits](#limits).
+
+A curvilinear grid given by its cells' corners, such as an ocean model's
+tripolar grid, is a source through `MeshTransformer` (in `rwarp::mesh`).
+It is measured the same way, in the mesh's world coordinates, and the
+outlines are walked across the mesh's seam and fold. See
+[Curvilinear grids](curvilinear.md#warping-from-a-mesh).
 
 `frac` is relative to the source cell, not the target, so it doesn't depend
 on how the target is normalised. `dst_area` gives either normalisation:
@@ -179,4 +185,6 @@ columns.
   set of arrays, so every chunk of a warp uses the same measure.
 - **Destination cells are what a transformer describes.** A curvilinear
   target works through `GenImgGeolocTransformer` with its bilinear cell
-  definition. Cells from corner bounds and meshes are later stages.
+  definition. A mesh is a source only (`MeshTransformer`). The reverse
+  map, onto a mesh, uses the same overlaps normalised by the mesh cell's
+  area, and isn't built.

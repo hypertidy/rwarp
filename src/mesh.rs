@@ -49,6 +49,24 @@
 //! ring through a reused `CoverageWindow`. [`Rectilinear`] is the same
 //! front end for grids given by column and row edges.
 //!
+//! # A mesh as a warp source
+//!
+//! [`MeshTransformer`] makes a mesh the source of a warp, for data on a
+//! curvilinear grid with one value per cell, such as an ocean model's
+//! output on a tripolar grid. With a destination grid's geotransform and
+//! CRS, it is a [`Transformer`](crate::Transformer) whose source pixels
+//! are the mesh's cells:
+//!
+//! - [`exact_weights`](crate::weights::exact_weights) gives conservative
+//!   weights from the mesh to the grid, as fractions of each cell's world
+//!   area;
+//! - [`warp`](crate::warp::warp) with
+//!   [`Footprint::Exact`](crate::warp::Footprint::Exact) and an area
+//!   method (`Average`, `Mode`, `Rms`, ...) regrids the data directly.
+//!
+//! Destination outlines are walked onto the mesh, across a seam or fold,
+//! as for any ring. [`QuadMesh::window`] gives a source window's cells.
+//!
 //! # Ownership
 //!
 //! Every point of the mesh belongs to exactly one cell. Orientation tests
@@ -244,10 +262,12 @@ use std::sync::OnceLock;
 
 mod cf;
 mod rect;
+mod source;
 mod walk;
 
 pub use cf::Halo;
 pub use rect::Rectilinear;
+pub use source::MeshTransformer;
 
 use crate::geoloc_transform::inverse_bilinear;
 
