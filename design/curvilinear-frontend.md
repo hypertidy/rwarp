@@ -8,7 +8,9 @@ and SCRIP corners with ocean-model halos dropped and overlapping cells
 refused (4b, 2026-11-17; section 3), and weights on a tripolar grid are
 compared with ESMF's (4c, 2026-11-17; section 3), and a mesh is a warp
 source, for `exact_weights` and `warp()`'s exact footprint, through
-`MeshTransformer` (4d, 2026-11-17; section 3). Later stages proposed.
+`MeshTransformer` (4d, 2026-11-17; section 3), and a period is declared
+for coordinates that jump at the seam (4e, 2026-11-17; section 3). Later
+stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -23,9 +25,10 @@ validation (bow-ties and folds refused, zero-area cells allowed),
 for convex cells; for non-convex cells the balanced point in the kernel
 that keeps the four triangles furthest from degenerate), ownership by
 canonical side orientation, `locate` with a walking hint, `locate_all`,
-and CSR buckets built on first use. Not yet: a declared period for
-coordinates that jump at the seam (section 3; there is no `Topology`
-enum), the boundary index (it belongs with the walk in stage 2). Decisions 1 to 5 below were taken
+and CSR buckets built on first use. Not yet: the boundary index (it
+belongs with the walk in stage 2). A declared period for coordinates that
+jump at the seam came in stage 4 (4e, section 3); there is no `Topology`
+enum. Decisions 1 to 5 below were taken
 at their recommendations, provisionally; 1, 3 and 4 are now decided (N1,
 N3 and N4 in `decisions.md`). `mesh` is public and unstable: it may break
 at a 0.x minor release, not a patch.
@@ -253,12 +256,8 @@ The cases:
 
 What stage 4 still needs:
 
-- **Coordinates that jump at the seam** (longitude, period 360). The two
-  walls are then different places in the plane and nothing meets. As for
-  the exact footprint (stage 3b), a ring would be walked at each whole
-  period at which it meets the mesh, and the pieces burned together. A
-  period declared on the mesh is the only remaining use of a topology.
-  Generator 5.
+- **Coordinates that jump at the seam** (longitude, period 360): built,
+  4e, below.
 - **Tripolar grids in longitude and latitude** can't be planar meshes:
   the geographic pole is inside an ocean cell. An ORCA grid is given as a
   mesh in a polar projection. North polar Lambert azimuthal equal-area
@@ -268,8 +267,9 @@ What stage 4 still needs:
   (4c, below). One north-polar projection doesn't hold the whole globe, though
   (4b, below): near 80 S its cells are flattened 500 to 1 or more, and
   the bend of their long sides exceeds their width.
-- The southern rows of a global ORCA grid (a second mesh in another
-  projection, or longitude with a declared period).
+- The southern rows of a global ORCA grid: longitude with a declared
+  period (4e, below) holds them; a whole ORCA file is still two meshes
+  (the north in a polar projection), not built as one.
 - A mesh as the target of weights (the reverse map, onto a tripolar
   grid): the same overlaps as a mesh source's, normalised by the mesh
   cell's area. Not built.
@@ -499,12 +499,85 @@ the compiled-in CRS backend, and `with_backend` with caller-supplied
 
   `tests/esmf_tripolar.rs` now takes its weights from it, the same as
   the `cover_ring` assembly to 1e-13.
-- **Not built.**
-  - A mesh as the target of weights.
-  - A mesh in longitude whose coordinates jump at the seam.
-    `SourceCells::lon_wrap` would give the exact footprint that, as for
-    geolocation arrays (3b). `MeshTransformer` doesn't expose it yet; it
-    belongs with the declared period.
+- **Not built.** A mesh as the target of weights. (A mesh in longitude
+  whose coordinates jump at the seam came with the declared period, 4e.)
+
+### A declared period (built, 4e)
+
+Built (2026-11-17): `QuadMesh::with_period` and
+`Rectilinear::with_period` (`src/mesh/period.rs`), with `unwrap_grid` and
+`unwrap_bounds`. World x is periodic: a point and the same point a whole
+number of periods away are one place, and the seam's two walls, a period
+apart in the plane, are crossed by taking copies, not by gluing walls.
+
+- **Polygons.** `burn` and `cover_ring` take each polygon, holes and
+  all, at each whole period at which its exterior ring overlaps the
+  grid's x range (overlap with area; touching doesn't count), walk each
+  copy as it is, and burn the copies together as one geometry. Polygons
+  are planar: one across the antimeridian needs continuous longitudes,
+  and one round a pole is closed along it. No ring is unwrapped, since
+  a jump of 360 is a polygon the other way round. A ring that would be
+  taken at more than 16 periods is refused. `ring_to_index` takes its
+  ring as it is.
+- **Points.** `locate`, `locate_all`, `to_index` and `Rectilinear::cell`
+  try the point as it is, then at each whole period within the grid's x
+  range. `contains` and `local` are about one cell, in the plane; the
+  walk uses a planar `locate`.
+- **Mesh sources.** `QuadMesh::window` carries the period. The lattice
+  takes it from the window's mesh, as a `SourceWrap` of the period with
+  the poles a quarter period from y = 0 (latitude 90 and -90 in the
+  longitude's unit). Each outline is then unwrapped, closed along the
+  nearer pole if it goes round one, and walked at each whole turn, as
+  for geolocation arrays (3b). No trait change: `SourceCells::lon_wrap`
+  stays the geolocation switch.
+- **Checks.** `with_period` refuses a period that isn't finite and
+  positive, a cell half a period wide or more (a cell round a pole: the
+  cell over the North Pole of a tripolar grid in longitude and latitude
+  spans 180 to 290 degrees), and a cell that overlaps one a whole period
+  away (the mesh goes round more than once), found by the overlap probes
+  of 4b moved by whole periods. `find_overlap` includes the period once
+  declared.
+- **Unwrapping.** `unwrap_grid` moves each value of a point grid
+  (corners or centres) to within half a period of the one before it
+  along its row, and of the one above down the first column, as
+  geolocation arrays are unwrapped (3b). `unwrap_bounds` does it cell by
+  cell for CF bounds: each cell's first vertex to the previous cell's,
+  its other vertices to its first. `from_corners` and `from_cf_bounds`
+  name the helper when the corners they refuse look like longitudes that
+  jump: CF bounds in `[0, 360)` jump inside a cell, which shows only as a
+  fold.
+- **Tests.** `tests/mesh_period.rs`:
+  - generator 5: a 10 degree global grid with its columns rotated by 0,
+    1, 7, 18 and 35, as a `QuadMesh` and a `Rectilinear`, burns 61
+    polygons (random ones with holes, many across the seam and given at
+    other periods, and a cap round the south pole) to the same fractions
+    as controlledburn's regular burn over five periods, folded back:
+    bitwise at `f32`. Each polygon's covered area is its area to 4e-7
+    (the fractions are `f32`);
+  - a curved mesh covers the same, renumbered, wherever its seam is;
+  - polygons and points at other periods, and `burn_par`;
+  - `cover_ring` across the seam against `burn`;
+  - points at any whole period, and on the seam's far wall;
+  - corners, centres and CF bounds stored with a jump, and NEMO's cyclic
+    halo: dropped, the same mesh; left in, refused by `with_period`;
+  - what `with_period` refuses;
+  - `MeshTransformer` with a lon/lat destination from -180, from 0 and
+    offset (pixels across every rotated seam), and with a north-polar
+    LAEA destination whose centre pixel holds the pole: the weights of
+    every rotation are mesh 0's to 1e-14, the cells north of 50 N are
+    shared out to 4e-16, the pole's pixel takes all 36 top-row cells and
+    covers its closed outline's area to 1e-9, `warp()`'s `Average` is
+    `apply(FracArea)` bit for bit, and the CRS backend agrees with the
+    projection written out (1e-15 in weights, 1e-14 in areas).
+- **ORCA in longitude and latitude** (scratch, CMIP6's IPSL grids, with
+  `unwrap_bounds`, `Halo { cols: [1, 1] }` and the period): eORCA1 is one
+  sheet from 75 S (row 48; the ice-shelf rows south of it fold in
+  longitude too) to the row below the pole's cell, 360 x 282 cells and
+  99.9% of its ocean area. ORCA2 is one sheet up to 24 N, 180 x 93 cells
+  and 79% of its ocean area; a bow-tie stops it there, in the band whose
+  bounds were found corrupt in 4b. Weights from either to a 1 degree grid
+  (from -180 or from 0) share out every cell to 9e-16, in 0.2 s (ORCA2)
+  and 0.4 s (eORCA1) on one thread, release build.
 
 ### The exact footprint at the antimeridian
 
@@ -750,9 +823,9 @@ Each generator has an exact oracle:
    invariant `sum of area(Q) * fraction = area(P inside the mesh)`.
 4. **Steering.** Vertices on corners, sides, spokes and centres; segments
    through corners and centres; edges along sides.
-5. **Periodic.** A regular global grid declared periodic, columns rotated
-   by k, must match the regular burn shifted by k, for polygons crossing
-   the seam.
+5. **Periodic.** Built (4e, `tests/mesh_period.rs`): a regular global
+   grid declared periodic, columns rotated by k, matches the regular burn
+   shifted by k, for polygons crossing the seam.
 6. **Fold.** Built as the world clip on meshes with a fold
    (`tests/mesh_glued.rs`): a strip wrapped round one end of a slit, and
    a disk with a seam and a fold. The first plan, a regular grid stored
@@ -775,7 +848,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam; the southern rows of a global ORCA grid | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5 |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

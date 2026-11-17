@@ -3,7 +3,7 @@
 
 use vaster::inv_geotransform;
 
-use super::QuadMesh;
+use super::{Period, QuadMesh};
 use crate::crs::{crs_pair, CrsTransform};
 use crate::transform::{SourceCells, Transformer};
 
@@ -16,7 +16,8 @@ impl QuadMesh {
     /// Walls that meet in the world, such as a seam or a fold, still meet
     /// in the window only if both are in it. Each cell keeps its own
     /// equal-area split, so coverage of a cell in the window is its
-    /// coverage in the whole mesh, to rounding.
+    /// coverage in the whole mesh, to rounding. A declared period
+    /// ([`QuadMesh::with_period`]) carries over.
     ///
     /// Errors when the window is empty or reaches beyond the mesh.
     pub fn window(
@@ -42,7 +43,14 @@ impl QuadMesh {
             x.extend_from_slice(&self.x[k..=k + ncol]);
             y.extend_from_slice(&self.y[k..=k + ncol]);
         }
-        QuadMesh::from_corners(ncol, nrow, x, y, self.map)
+        let mut w = QuadMesh::from_corners(ncol, nrow, x, y, self.map)?;
+        // part of a mesh that doesn't overlap itself a period on doesn't
+        // either: no need to check again
+        w.period = self.period.map(|p| Period {
+            period: p.period,
+            range: w.x_range(),
+        });
+        Ok(w)
     }
 }
 
@@ -74,10 +82,18 @@ impl QuadMesh {
 ///   grid, Lambert azimuthal equal-area on the north pole.
 ///   `tests/esmf_tripolar.rs` measures the difference from ESMF's
 ///   great-circle cells.
+/// - **Longitude.** A mesh in longitude and latitude with a declared
+///   period ([`QuadMesh::with_period`], 360 in degrees) takes outlines
+///   that cross its seam, wherever it is, and outlines round a pole,
+///   closed along latitude 90 or -90. Areas are then planar in square
+///   degrees: a weight is the covered fraction of a cell's square
+///   degrees, which differs from its fraction of the cell's area on the
+///   sphere as the cosine of latitude varies across the cell.
 /// - **Point kernels** map a destination pixel into the mesh's index space
 ///   through the mesh's own [`CellMap`](crate::mesh::CellMap)
-///   ([`QuadMesh::to_index`]). They read neighbouring source pixels
-///   across the mesh's index space, not across a seam or fold.
+///   ([`QuadMesh::to_index`], at any whole period with a declared one).
+///   They read neighbouring source pixels across the mesh's index space,
+///   not across a seam or fold.
 ///
 /// ```
 /// use rwarp::mesh::{CellMap, MeshTransformer, QuadMesh};

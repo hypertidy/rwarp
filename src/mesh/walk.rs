@@ -48,7 +48,7 @@ use controlledburn::{
     Polygon,
 };
 
-use super::{orient, CellMap, QuadMesh, UNIT};
+use super::{orient, CellMap, Period, QuadMesh, UNIT};
 
 /// A multiplicative hash for cell numbers (as rustc's `FxHasher`): the
 /// flood's set of seen cells is small and hot, and needs no protection
@@ -521,7 +521,7 @@ impl QuadMesh {
         // the cell that owns `a`; failing that (`a` outside, or on a corner
         // whose owner by the low-index rule has no area, as next to a
         // tripolar grid's pivot) the cells near it
-        let start: Vec<(usize, usize)> = match self.locate(a, hint) {
+        let start: Vec<(usize, usize)> = match self.locate_planar(a, hint) {
             Some(s) => vec![s],
             None => self
                 .buckets()
@@ -748,6 +748,10 @@ impl QuadMesh {
     /// Index positions are under the equal-area map, whatever the mesh's
     /// [`CellMap`]: inside a cell they can differ from
     /// [`QuadMesh::to_index`] on a `Bilinear` mesh (never on a cell side).
+    ///
+    /// The ring is taken where it is in the plane, with a declared period
+    /// too ([`QuadMesh::with_period`]); [`QuadMesh::burn`] and
+    /// [`QuadMesh::cover_ring`] walk it at each whole period.
     pub fn ring_to_index(&self, ring: &[[f64; 2]]) -> Result<Vec<[f64; 2]>, String> {
         let mut pts: Vec<[f64; 2]> = ring.to_vec();
         while pts.len() > 1 && pts.first() == pts.last() {
@@ -762,7 +766,7 @@ impl QuadMesh {
         let mut vidx = Vec::with_capacity(n);
         let mut vcell = Vec::with_capacity(n);
         for &p in &pts {
-            let cell = self.locate(p, hint);
+            let cell = self.locate_planar(p, hint);
             if cell.is_some() {
                 hint = cell;
             }
@@ -941,7 +945,10 @@ impl QuadMesh {
     /// to world units). Coverage mode only.
     ///
     /// Polygon edges are straight in the mesh's world coordinates; for
-    /// polygons in another CRS, densify first (bigcurve).
+    /// polygons in another CRS, densify first (bigcurve). With a declared
+    /// period ([`QuadMesh::with_period`]), each polygon is burned at every
+    /// whole period at which it overlaps the mesh, and points are found at
+    /// any whole period.
     pub fn burn(
         &self,
         geoms: &[Geometry],
@@ -970,6 +977,7 @@ impl QuadMesh {
             geoms,
             opts.into(),
             threads,
+            self.period,
             &|r| self.ring_to_index(r),
             &|p, hint| self.locate(p, hint),
         )
@@ -980,20 +988,93 @@ impl QuadMesh {
     /// over the ring's cells and holds each one's covered fraction of its
     /// world area. Returns false (and leaves an empty window) when the
     /// ring misses the mesh.
+    ///
+    /// With a declared period ([`QuadMesh::with_period`]) the ring is
+    /// walked at each whole period at which it overlaps the mesh, and the
+    /// window spans all the pieces: across the seam, the mesh's full
+    /// width.
     pub fn cover_ring(&self, ring: &[[f64; 2]], win: &mut CoverageWindow) -> Result<bool, String> {
-        let ir = self.ring_to_index(ring)?;
-        if ir.len() < 3 {
+        let mut rings = Vec::new();
+        for s in turn_shifts(self.period, ring.iter().map(|p| p[0]))? {
+            let ir = if s == 0.0 {
+                self.ring_to_index(ring)?
+            } else {
+                let moved: Vec<[f64; 2]> = ring.iter().map(|p| [p[0] + s, p[1]]).collect();
+                self.ring_to_index(&moved)?
+            };
+            if ir.len() >= 3 {
+                rings.push(ir);
+            }
+        }
+        Ok(cover_rings(&rings, win))
+    }
+}
+
+/// The shifts in x, whole periods, at which a ring with x values `xs`
+/// overlaps the grid's x range: just 0 without a period, or for a ring
+/// with a coordinate that isn't finite. Errors for a ring that would be
+/// taken at more than 16 periods.
+pub(crate) fn turn_shifts(
+    period: Option<Period>,
+    xs: impl Iterator<Item = f64>,
+) -> Result<Vec<f64>, String> {
+    let Some(per) = period else {
+        return Ok(vec![0.0]);
+    };
+    let [lo, hi] = xs.fold([f64::INFINITY, f64::NEG_INFINITY], |[a, b], x| [a.min(x), b.max(x)]);
+    if !(lo.is_finite() && hi.is_finite()) {
+        return Ok(vec![0.0]);
+    }
+    let (k0, k1) = per.turns(lo, hi);
+    if k1.saturating_sub(k0) >= 16 {
+        return Err(format!(
+            "a ring from x = {lo} to {hi} would be taken at more than 16 periods of {}",
+            per.period
+        ));
+    }
+    Ok((k0..=k1).map(|k| k as f64 * per.period).collect())
+}
+
+/// The coverage of index rings `rings` (each with three points or more)
+/// in `win`, placed over the cells under all of them. False, with an
+/// empty window, when there are none or a point isn't finite.
+pub(crate) fn cover_rings(rings: &[Vec<[f64; 2]>], win: &mut CoverageWindow) -> bool {
+    let split = |r: &[[f64; 2]]| -> (Vec<f64>, Vec<f64>) { r.iter().map(|p| (p[0], p[1])).unzip() };
+    match rings {
+        [] => {
             win.reset(0, 0, 0, 0);
-            return Ok(false);
+            false
         }
-        let xs: Vec<f64> = ir.iter().map(|p| p[0]).collect();
-        let ys: Vec<f64> = ir.iter().map(|p| p[1]).collect();
-        if !win.reset_to_ring(&xs, &ys) {
-            return Ok(false);
+        [r] => {
+            let (xs, ys) = split(r);
+            if !win.reset_to_ring(&xs, &ys) {
+                return false;
+            }
+            win.add_ring(&xs, &ys, 1.0);
+            win.resolve();
+            true
         }
-        win.add_ring(&xs, &ys, 1.0);
-        win.resolve();
-        Ok(true)
+        _ => {
+            let (mut x0, mut x1, mut y0, mut y1) =
+                (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+            for p in rings.iter().flatten() {
+                (x0, x1, y0, y1) = (x0.min(p[0]), x1.max(p[0]), y0.min(p[1]), y1.max(p[1]));
+            }
+            if !(x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite()) {
+                win.reset(0, 0, 0, 0);
+                return false;
+            }
+            let (c0, r0) = (x0.floor() as i64, y0.floor() as i64);
+            let c1 = (x1.ceil() as i64).max(c0 + 1);
+            let r1 = (y1.ceil() as i64).max(r0 + 1);
+            win.reset(c0, r0, (c1 - c0) as usize, (r1 - r0) as usize);
+            for r in rings {
+                let (xs, ys) = split(r);
+                win.add_ring(&xs, &ys, 1.0);
+            }
+            win.resolve();
+            true
+        }
     }
 }
 
@@ -1006,18 +1087,22 @@ pub(crate) type CellFn<'a> =
 /// Map rings with `ring` (world ring to index ring `[col, row]`) and
 /// points with `cell`, then burn the index-space geometries with
 /// controlledburn on the `ncol` by `nrow` grid. Shared by the curvilinear
-/// and rectilinear front ends.
+/// and rectilinear front ends. With `period`, each polygon is mapped at
+/// every whole period at which its exterior ring overlaps the grid's x
+/// range, the copies burned together.
 ///
 /// With `threads` other than 1 (0 for all available), the geometries are
 /// mapped on several threads, in contiguous chunks of about equal vertex
 /// counts taken in turn, and burned with [`controlledburn::burn_par`]. The result is the
 /// same as with one thread, record for record.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn burn_with(
     ncol: usize,
     nrow: usize,
     geoms: &[Geometry],
     opts: BurnOptions,
     threads: usize,
+    period: Option<Period>,
     ring: &RingFn,
     cell: &CellFn,
 ) -> Result<BurnResult, String> {
@@ -1037,7 +1122,7 @@ pub(crate) fn burn_with(
         vertex_chunks(geoms, threads * 8)
     };
     let mapped: Vec<Result<Mapped, String>> = if chunks.len() <= 1 {
-        vec![map_geoms(geoms, 0, nrow, ring, cell)]
+        vec![map_geoms(geoms, 0, nrow, period, ring, cell)]
     } else {
         let next = AtomicUsize::new(0);
         let mut done: Vec<(usize, Result<Mapped, String>)> = std::thread::scope(|s| {
@@ -1050,7 +1135,7 @@ pub(crate) fn burn_with(
                             let Some(&(a, b)) = chunks.get(k) else {
                                 break out;
                             };
-                            out.push((k, map_geoms(&geoms[a..b], a, nrow, ring, cell)));
+                            out.push((k, map_geoms(&geoms[a..b], a, nrow, period, ring, cell)));
                         }
                     })
                 })
@@ -1116,17 +1201,25 @@ fn vertices(g: &Geometry) -> usize {
     }
 }
 
-/// Map `geoms` (whose first has id `id0`) into the index plane.
+/// Map `geoms` (whose first has id `id0`) into the index plane, each
+/// polygon at every whole period at which it overlaps the grid, with
+/// `period`.
 fn map_geoms(
     geoms: &[Geometry],
     id0: usize,
     nrow: usize,
+    period: Option<Period>,
     ring: &RingFn,
     cell: &CellFn,
 ) -> Result<Mapped, String> {
     let nr = nrow as f64;
-    let to_plane = |r: &[Coord]| -> Result<Vec<Coord>, String> {
-        let pts: Vec<[f64; 2]> = r.iter().map(|c| [c.x, c.y]).collect();
+    // a ring moved by `s` in x (0: as it is)
+    let to_plane = |r: &[Coord], s: f64| -> Result<Vec<Coord>, String> {
+        let pts: Vec<[f64; 2]> = if s == 0.0 {
+            r.iter().map(|c| [c.x, c.y]).collect()
+        } else {
+            r.iter().map(|c| [c.x + s, c.y]).collect()
+        };
         let mut out: Vec<Coord> = ring(&pts)?
             .into_iter()
             .map(|p| Coord {
@@ -1140,10 +1233,10 @@ fn map_geoms(
         }
         Ok(out)
     };
-    let polygon = |p: &Polygon| -> Result<Option<Polygon>, String> {
+    let shifted = |p: &Polygon, s: f64| -> Result<Option<Polygon>, String> {
         let mut rings = Vec::with_capacity(p.rings.len());
         for (k, r) in p.rings.iter().enumerate() {
-            let ir = to_plane(r)?;
+            let ir = to_plane(r, s)?;
             if ir.is_empty() {
                 if k == 0 {
                     return Ok(None);
@@ -1154,16 +1247,35 @@ fn map_geoms(
         }
         Ok(Some(Polygon { rings }))
     };
+    // the polygon at each whole period at which its exterior overlaps the
+    // grid, or as it is without a period
+    let polygon = |p: &Polygon, out: &mut Vec<Polygon>| -> Result<(), String> {
+        let Some(per) = period else {
+            out.extend(shifted(p, 0.0)?);
+            return Ok(());
+        };
+        let Some(outer) = p.rings.first() else {
+            return Ok(());
+        };
+        for s in turn_shifts(Some(per), outer.iter().map(|c| c.x))? {
+            out.extend(shifted(p, s)?);
+        }
+        Ok(())
+    };
     let mut plane = Vec::with_capacity(geoms.len());
     let mut points = Vec::new();
     for (k, g) in geoms.iter().enumerate() {
         let id = (id0 + k) as i32;
         let polys: Vec<Polygon> = match g {
-            Geometry::Polygon(p) => polygon(p)?.into_iter().collect(),
+            Geometry::Polygon(p) => {
+                let mut v = Vec::with_capacity(1);
+                polygon(p, &mut v)?;
+                v
+            }
             Geometry::MultiPolygon(ps) => {
                 let mut v = Vec::new();
                 for p in ps {
-                    v.extend(polygon(p)?);
+                    polygon(p, &mut v)?;
                 }
                 v
             }

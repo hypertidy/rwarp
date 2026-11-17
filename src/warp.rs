@@ -2950,9 +2950,12 @@ pub(crate) struct Lattice {
     pub(crate) ry: Vec<f64>,
     pub(crate) win: controlledburn::CoverageWindow,
     /// How the source wraps in longitude: [`Transformer::source_wrap`] in
-    /// source pixels, or in world coordinates (360, with the poles at
-    /// latitudes 90 and -90) when the cells have
-    /// [`SourceCells::lon_wrap`](crate::transform::SourceCells::lon_wrap).
+    /// source pixels, or in world coordinates: 360, with the poles at
+    /// latitudes 90 and -90, when the cells have
+    /// [`SourceCells::lon_wrap`](crate::transform::SourceCells::lon_wrap),
+    /// or the period declared on the cells' mesh
+    /// ([`QuadMesh::with_period`]), with the poles a quarter period from
+    /// y = 0.
     wrap: Option<SourceWrap>,
     /// Scratch: the outline moved by whole periods.
     sx: Vec<f64>,
@@ -3002,9 +3005,13 @@ impl Lattice {
     ) -> Self {
         let cells = transformer.source_cells();
         let mesh = cells.map(|cells| cells.mesh(src.0, src.1, src.2, src.3));
-        let wrap = match cells {
-            Some(cells) => cells.lon_wrap().then(|| SourceWrap::new(360.0, [90.0, -90.0])),
-            None => transformer.source_wrap(),
+        // longitude from the cells, or a period declared on their mesh
+        // (latitude 90 and -90 a quarter period from the equator)
+        let wrap = match (cells, &mesh) {
+            (Some(cells), _) if cells.lon_wrap() => Some(SourceWrap::new(360.0, [90.0, -90.0])),
+            (Some(_), Some(Ok(m))) => m.period().map(|p| SourceWrap::new(p, [p / 4.0, -p / 4.0])),
+            (Some(_), _) => None,
+            (None, _) => transformer.source_wrap(),
         };
         let mut mesh_x = [f64::INFINITY, f64::NEG_INFINITY];
         if let (Some(Ok(m)), Some(_)) = (&mesh, wrap) {
@@ -3208,10 +3215,11 @@ impl Lattice {
     /// replaces any part outside the window by an arc of its boundary),
     /// then covered in the mesh's index space, which is buffer pixels.
     ///
-    /// For cells in longitude that wraps, the outline is unwrapped first
-    /// (and closed along latitude 90 or -90 if it goes round a pole), then
-    /// walked at each whole turn at which it reaches the mesh's
-    /// longitudes, as [`Lattice::cover`] does in source pixels.
+    /// For cells in longitude that wraps, or on a mesh with a declared
+    /// period, the outline is unwrapped first (and closed along latitude
+    /// 90 or -90 if it goes round a pole), then walked at each whole turn
+    /// at which it reaches the mesh's longitudes, as [`Lattice::cover`]
+    /// does in source pixels.
     fn cover_world(&mut self, c: usize, (ncol, nrow): (i64, i64)) -> Cover {
         if !matches!(self.mesh, Some(Ok(_))) { return Cover::Failed; }
         if !self.ring(c, (0.0, 0.0)) { return Cover::Failed; }
@@ -3221,12 +3229,12 @@ impl Lattice {
                 if !self.unwrap(wrap, 0.0) { return Cover::Failed; }
                 let p = wrap.period;
                 let (lo, hi) = self.rx.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
-                let [m0, m1] = self.mesh_x;
-                (((m0 - hi) / p).floor() as i64 + 1, ((m1 - lo) / p).ceil() as i64 - 1, p)
+                let (k0, k1) = crate::mesh::Period { period: p, range: self.mesh_x }.turns(lo, hi);
+                (k0, k1, p)
             }
             None => (0, 0, 0.0),
         };
-        if k1 - k0 > 3 { return Cover::Failed; }
+        if k1.saturating_sub(k0) > 3 { return Cover::Failed; }
         let Some(Ok(mesh)) = &self.mesh else { return Cover::Failed };
         debug_assert_eq!((mesh.ncol() as i64, mesh.nrow() as i64), (ncol, nrow));
         let mut hit = None;

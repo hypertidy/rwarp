@@ -118,7 +118,8 @@ impl QuadMesh {
     /// Errors when the arrays have the wrong length or non-finite values,
     /// when the halo leaves no cells, when neighbours don't share corners
     /// in any vertex order (bounds of cells that don't tile, a halo row of
-    /// collapsed cells left in, or longitudes 360 apart across a seam),
+    /// collapsed cells left in, or longitudes 360 apart across a seam:
+    /// [`unwrap_bounds`](super::unwrap_bounds) them first),
     /// on any error of [`QuadMesh::from_corners`], and when two cells
     /// overlap ([`QuadMesh::find_overlap`]), as a halo left in does.
     pub fn from_cf_bounds(
@@ -203,8 +204,10 @@ impl QuadMesh {
                                     b[0],
                                     b[1],
                                     if period {
-                                        " are a period apart (longitudes across a seam?): give the \
-                                         bounds in a projection in which the grid is one sheet"
+                                        " are a period apart (longitudes across a seam?): unwrap \
+                                         them (`unwrap_bounds`) and declare the period \
+                                         (`QuadMesh::with_period`), or give the bounds in a \
+                                         projection in which the grid is one sheet"
                                     } else {
                                         ""
                                     }
@@ -284,7 +287,7 @@ impl QuadMesh {
                 y[hi] = 0.5 * (y[lo] + y[hi]);
             }
         }
-        let mesh = Self::from_corners(nc, nr, x, y, map)?;
+        let mesh = Self::from_corners_with_hint(nc, nr, x, y, map, "unwrap_bounds")?;
         if let Some([a, b]) = mesh.find_overlap() {
             let last = a.0 + 1 == nr && b.0 + 1 == nr;
             return Err(format!(
@@ -304,7 +307,8 @@ impl QuadMesh {
     }
 
     /// Two cells that overlap, if any: a point inside one that the other
-    /// owns too.
+    /// owns too, or, with a declared period ([`QuadMesh::with_period`]),
+    /// owns a whole number of periods away.
     ///
     /// [`QuadMesh::from_corners`] refuses cells of both orientations, which
     /// is how an overlapping swath scan shows; a copy that keeps the
@@ -314,40 +318,68 @@ impl QuadMesh {
     /// area is probed once, at the centroid of the larger triangle of the
     /// diagonal that lies inside it; an overlap that misses every probe
     /// (thinner than about half a cell) isn't found.
-    /// [`QuadMesh::from_cf_bounds`] runs this check.
+    /// [`QuadMesh::from_cf_bounds`] runs this check, and
+    /// [`QuadMesh::with_period`] its part across the period.
     pub fn find_overlap(&self) -> Option<[(usize, usize); 2]> {
-        let s = self.sign;
+        self.overlap(true)
+    }
+
+    /// [`QuadMesh::find_overlap`]: in the plane only with `planar`, and
+    /// across the declared period if there is one.
+    pub(crate) fn overlap(&self, planar: bool) -> Option<[(usize, usize); 2]> {
+        let at = |m: usize| (m / self.ncol, m % self.ncol);
         for (k, cell) in self.cells.iter().enumerate() {
             if cell.area2 == 0.0 {
                 continue;
             }
-            let (r, c) = (k / self.ncol, k % self.ncol);
-            let q = self.corners(r, c);
-            // the diagonal whose two triangles both turn the cell's way
-            let tri =
-                |a: usize, b: usize, d: usize| (s * orient(q[a], q[b], q[d]), [q[a], q[b], q[d]]);
-            let split = |a: usize| {
-                let (t, u) = (
-                    tri(a, (a + 1) % 4, (a + 2) % 4),
-                    tri(a, (a + 2) % 4, (a + 3) % 4),
-                );
-                (t.0 > 0.0 && u.0 > 0.0).then_some(if t.0 >= u.0 { t.1 } else { u.1 })
-            };
-            let Some(t) = split(0).or_else(|| split(1)) else {
+            let Some(p) = self.probe(k) else {
                 continue;
             };
-            let p = [
-                (t[0][0] + t[1][0] + t[2][0]) / 3.0,
-                (t[0][1] + t[1][1] + t[2][1]) / 3.0,
-            ];
-            if let Some(other) = self
-                .buckets()
-                .candidates(p)
-                .find(|&m| m != k && self.contains(m / self.ncol, m % self.ncol, p))
-            {
-                return Some([(r, c), (other / self.ncol, other % self.ncol)]);
+            if planar {
+                if let Some(other) = self
+                    .buckets()
+                    .candidates(p)
+                    .find(|&m| m != k && self.contains(m / self.ncol, m % self.ncol, p))
+                {
+                    return Some([at(k), at(other)]);
+                }
+            }
+            if let Some(per) = self.period {
+                // a cell may meet itself one period on, if it's that wide
+                for s in per.point_shifts(p[0]).skip(1) {
+                    let q = [p[0] + s, p[1]];
+                    if let Some(other) = self
+                        .buckets()
+                        .candidates(q)
+                        .find(|&m| self.contains(m / self.ncol, m % self.ncol, q))
+                    {
+                        return Some([at(k), at(other)]);
+                    }
+                }
             }
         }
         None
+    }
+
+    /// A point inside cell `k` (which has area), for the overlap check:
+    /// the centroid of the larger triangle of the diagonal that lies
+    /// inside it. `None` if neither diagonal does.
+    fn probe(&self, k: usize) -> Option<[f64; 2]> {
+        let s = self.sign;
+        let q = self.corners(k / self.ncol, k % self.ncol);
+        // the diagonal whose two triangles both turn the cell's way
+        let tri = |a: usize, b: usize, d: usize| (s * orient(q[a], q[b], q[d]), [q[a], q[b], q[d]]);
+        let split = |a: usize| {
+            let (t, u) = (
+                tri(a, (a + 1) % 4, (a + 2) % 4),
+                tri(a, (a + 2) % 4, (a + 3) % 4),
+            );
+            (t.0 > 0.0 && u.0 > 0.0).then_some(if t.0 >= u.0 { t.1 } else { u.1 })
+        };
+        let t = split(0).or_else(|| split(1))?;
+        Some([
+            (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+            (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+        ])
     }
 }

@@ -100,6 +100,29 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- A declared period for coordinates that jump at the seam, such as
+  longitude: `QuadMesh::with_period` and `Rectilinear::with_period`
+  (stage 4e of `design/curvilinear-frontend.md`, #37).
+  - Polygons: `burn`, `burn_par` and `cover_ring` take each polygon at
+    each whole period at which it overlaps the grid, so polygons from -180
+    to 180 burn onto a grid from 0 to 360, and across its seam.
+  - Points: `locate`, `locate_all`, `to_index` and `Rectilinear::cell`
+    find a point at any whole period.
+  - A mesh source: `MeshTransformer` over a mesh with a period takes
+    target pixels across its seam, and round a pole (closed along
+    latitude 90 or -90).
+  - `mesh::unwrap_grid` and `mesh::unwrap_bounds` make longitudes stored
+    with a jump (`[-180, 180)`, `[0, 360)`) continuous; `from_corners` and
+    `from_cf_bounds` name them when they refuse such corners.
+  - Refused: a cell half a period wide or more (round a pole, as at a
+    tripolar grid's north), and a mesh that goes round more than once.
+    `find_overlap` includes the period once it is declared.
+  - Checks (`tests/mesh_period.rs`): generator 5, a regular global grid
+    with its columns rotated, against controlledburn's regular burn
+    (bitwise at `f32`); the same weights wherever a mesh's seam is, for a
+    lon/lat destination and a polar one whose centre pixel holds the
+    pole; `warp()` against `Weights::apply`.
+  - Meshes without a period are unchanged bit for bit.
 - `mesh::MeshTransformer`: a `QuadMesh` as a warp source, for data with
   one value per cell on a curvilinear grid given by its corners, such as
   an ocean model's tripolar grid (stage 4d of

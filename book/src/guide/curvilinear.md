@@ -163,6 +163,9 @@ planar areas are true areas. It holds down to the Southern Ocean. Near
 80 S it flattens cells 500 to 1, and an ice-shelf row there can become a
 bow-tie, which is refused. A tripolar grid can't be a mesh in longitude
 and latitude, since the geographic pole is inside one of its cells.
+Coordinates that jump at the seam, such as longitudes, put its two walls
+in different places in the plane: declare the period
+([below](#longitude-a-declared-period)).
 Coordinates that jump at the seam (longitudes 360 apart) are not handled
 yet.
 
@@ -209,6 +212,47 @@ land:
 
 Drop such rows with the halo's `rows`, or repair the bounds, for now.
 
+### Longitude: a declared period
+
+A grid in longitude and latitude has its seam's two walls 360 degrees
+apart, so they don't meet in the plane. Declare the period with
+`with_period(360.0)`, on a `QuadMesh` or a `Rectilinear`:
+
+- `burn` takes each polygon at each whole period at which it overlaps
+  the grid, and adds up the pieces. Polygons given from -180 to 180 burn
+  onto a grid from 0 to 360, and one across the seam covers cells at both
+  ends. Polygons are taken as they are in the plane. Give one across the
+  antimeridian with continuous longitudes (170 to 190), and close one
+  round a pole along the pole, as Natural Earth's Antarctica is.
+- `locate`, `to_index` and `Rectilinear::cell` find a point at any whole
+  period.
+- `MeshTransformer` unwraps each target pixel's outline and walks it at
+  each whole period at which it reaches the mesh. An outline round a pole
+  is closed along latitude 90 or -90.
+
+Where the seam is makes no difference beyond rounding.
+
+The corners must be continuous. Longitudes stored with a jump, from
+`[-180, 180)` or `[0, 360)`, are refused with a hint. `unwrap_grid`
+(corners or centres) and `unwrap_bounds` (CF bounds, SCRIP corners)
+unwrap them:
+
+```rust,ignore
+use rwarp::mesh::{unwrap_bounds, CellMap, Halo, QuadMesh};
+
+// ORCA2's bounds as CMIP6 stores them, longitudes in [-180, 180): the
+// cyclic columns and the northern rows dropped
+unwrap_bounds(182, 149, &mut lon_bnds, 360.0)?;
+let halo = Halo { cols: [1, 1], rows: [1, 55], ..Halo::NONE };
+let mesh = QuadMesh::from_cf_bounds(182, 149, &lon_bnds, &lat_bnds, halo, CellMap::EqualArea)?
+    .with_period(360.0)?;
+```
+
+`with_period` refuses a cell half a period wide or more, which is a cell
+round a pole, such as the one over the North Pole on a tripolar grid.
+Give a tripolar grid's north in a polar projection, as above. Areas in longitude and latitude are planar in
+square degrees: a weight is the covered share of a cell's square degrees.
+
 ### Warping from a mesh
 
 `MeshTransformer` makes a mesh the source of a warp, with one value per
@@ -235,7 +279,9 @@ let sst: Vec<f32> = w.apply(&buf, Normalization::FracArea, &ApplyOptions::new())
 The buffer holds the mesh's cells row-major, so mesh cell `(row, col)` is
 source pixel `(col, row)`. Point kernels such as `Bilinear` map a target
 pixel into the mesh's index space through its cell map. They read
-neighbouring cells in index space, not across the seam or fold.
+neighbouring cells in index space, not across the seam or fold. A mesh
+in longitude and latitude with a declared period takes target pixels
+across its seam and round a pole, as above.
 
 Against ESMF, on an analytic tripolar cap with a seam and a fold
 (`tests/esmf_tripolar.rs`), with weights from `MeshTransformer`:
@@ -273,8 +319,7 @@ example, which checks the area each scan covers, is in the
 A row or column stored twice, such as an ocean model's halo, keeps its
 orientation, and `from_corners` doesn't check for it (the check costs
 about what building the mesh does). `QuadMesh::find_overlap` finds it,
-and `from_cf_bounds` refuses it. A declared period for longitudes is
-the rest of stage 4 ([#37](https://github.com/hypertidy/rwarp/issues/37)).
+and `from_cf_bounds` refuses it.
 
 `mesh` is public and unstable: it changes more often than the rest of
 the crate and may break at any 0.x minor release, though not at a patch
