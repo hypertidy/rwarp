@@ -15,11 +15,14 @@
 //! - `tripolar_lonlat`: 6 x 3 degree lon/lat cells from 54 N to the pole,
 //!   whose top row are triangles with a corner on the pole.
 //!
-//! Each destination cell's outline goes into the mesh's index space with
-//! [`QuadMesh::cover_ring`]; the coverage of a source cell is the fraction
-//! of its area the outline covers, and `S = coverage * source area /
-//! destination area` (ESMF's `destarea` normalisation). Planar areas in
-//! the plane are areas on the sphere, since the projection is equal-area.
+//! rwarp's weights are [`exact_weights`] through a [`MeshTransformer`]:
+//! each destination cell's outline goes to the plane and is walked onto
+//! the mesh, a weight is the fraction of a source cell's area the outline
+//! covers, and `S = frac * source area / destination area` (ESMF's
+//! `destarea`, [`Normalization::DestArea`]). Planar areas in the plane are
+//! areas on the sphere, since the projection is equal-area.
+//! `exact_weights_match_cover_ring` checks them against the same assembled
+//! by hand from [`QuadMesh::cover_ring`].
 //!
 //! `cargo test --test esmf_tripolar -- --nocapture` prints the measured
 //! differences. No CRS is involved: the projection is written out here.
@@ -28,7 +31,9 @@ mod esmf_common;
 
 use controlledburn::CoverageWindow;
 use esmf_common::{diff, fixture_path, read_fixture, smooth, Fixture, Ours};
-use rwarp::mesh::{CellMap, Halo, QuadMesh};
+use rwarp::mesh::{CellMap, Halo, MeshTransformer, QuadMesh};
+use rwarp::weights::{exact_weights, Normalization, WeightOptions};
+use rwarp::CrsTransform;
 
 /// The fixtures' sphere (NEMO's).
 const RADIUS: f64 = 6371229.0;
@@ -90,15 +95,67 @@ fn field(m: &QuadMesh) -> Vec<f64> {
     v
 }
 
+/// Whether the fixture's destination is lon/lat (else the plane).
+fn lonlat(fx: &Fixture) -> bool {
+    match fx.header("dst_kind") {
+        "lonlat" => true,
+        "laea" => false,
+        k => panic!("dst_kind {k}"),
+    }
+}
+
+/// Destination coordinates to the plane (`.0`: they are lon/lat).
+struct ToPlane(bool);
+
+impl CrsTransform for ToPlane {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let [a, b] = if self.0 { laea(x, y) } else { [x, y] };
+        Some((a, b))
+    }
+}
+
+/// The plane to destination coordinates.
+struct FromPlane(bool);
+
+impl CrsTransform for FromPlane {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        Some(if self.0 { laea_inv([x, y]) } else { (x, y) })
+    }
+}
+
+/// rwarp's map from the mesh to the fixture's destination, in ESMF's terms
+/// (areas in the plane's square metres): [`exact_weights`] through a
+/// [`MeshTransformer`].
+fn ours(m: &QuadMesh, fx: &Fixture, densify: usize) -> Ours {
+    let [dw, dh] = fx.nums::<2>("dst_size").map(|v| v as usize);
+    let ll = lonlat(fx);
+    let t = MeshTransformer::with_backend(
+        m.clone(),
+        fx.nums("dst_gt"),
+        Box::new(ToPlane(ll)),
+        Box::new(FromPlane(ll)),
+    )
+    .unwrap();
+    let w = exact_weights(&t, &t.source_window(), dw, dh, &WeightOptions::new(densify));
+    let s = w.normalised(Normalization::DestArea);
+    let (row, col) = w.esmf_row_col(dw, m.ncol());
+    let covered = w.dst_covered();
+    Ours {
+        s: row.into_iter().zip(col).zip(s).collect(),
+        frac_b: covered
+            .iter()
+            .zip(&w.dst_area)
+            .map(|(c, a)| c / a)
+            .collect(),
+        area_b: w.dst_area,
+    }
+}
+
 /// Destination cell `(row, col)`'s outline in the plane, counter-clockwise,
 /// each side in `densify` pieces joined straight in the destination grid's
 /// coordinates (lon/lat or the plane) and then taken to the plane.
 fn outline(fx: &Fixture, row: usize, col: usize, densify: usize) -> Vec<[f64; 2]> {
-    let lonlat = match fx.header("dst_kind") {
-        "lonlat" => true,
-        "laea" => false,
-        k => panic!("dst_kind {k}"),
-    };
+    let lonlat = lonlat(fx);
     let g: [f64; 6] = fx.nums("dst_gt");
     let (c, r) = (col as f64, row as f64);
     let corners = [[c, r], [c + 1.0, r], [c + 1.0, r + 1.0], [c, r + 1.0]];
@@ -127,9 +184,9 @@ fn shoelace(ring: &[[f64; 2]]) -> f64 {
         .sum::<f64>()
 }
 
-/// rwarp's map from the mesh to the fixture's destination, in ESMF's terms
-/// (areas in the plane's square metres).
-fn ours(m: &QuadMesh, fx: &Fixture, densify: usize) -> Ours {
+/// [`ours`] assembled by hand: each outline through
+/// [`QuadMesh::cover_ring`], coverage times cell area over the outline's.
+fn ours_by_cover_ring(m: &QuadMesh, fx: &Fixture, densify: usize) -> Ours {
     let [dw, dh] = fx.nums::<2>("dst_size").map(|v| v as usize);
     let mut win = CoverageWindow::default();
     let mut o = Ours {
@@ -197,6 +254,41 @@ fn max_rel(a: &[f64], b: &[f64], scale: f64) -> f64 {
 }
 
 const CASES: [&str; 2] = ["tripolar_laea", "tripolar_lonlat"];
+
+/// [`exact_weights`] through a [`MeshTransformer`] is the outlines through
+/// [`QuadMesh::cover_ring`], to rounding: the same entries, and S and areas
+/// to 1e-13 (the two sum each outline's area in a different order, at
+/// coordinates of millions of metres).
+#[test]
+fn exact_weights_match_cover_ring() {
+    let m = source();
+    for (name, densify) in [
+        ("tripolar_laea", 1),
+        ("tripolar_lonlat", 1),
+        ("tripolar_lonlat", 8),
+    ] {
+        let fx = read_fixture(&format!("{name}.cart.txt"));
+        let (a, b) = (ours(&m, &fx, densify), ours_by_cover_ring(&m, &fx, densify));
+        let mut keys: Vec<_> = a.s.keys().collect();
+        let mut other: Vec<_> = b.s.keys().collect();
+        keys.sort();
+        other.sort();
+        assert_eq!(keys, other, "{name} densify {densify}: different entries");
+        let ds =
+            a.s.iter()
+                .map(|(k, v)| (v - b.s[k]).abs())
+                .fold(0.0, f64::max);
+        let da = max_rel(&a.area_b, &b.area_b, 1.0);
+        eprintln!(
+            "{name:16} densify {densify}: {} entries, S {ds:.1e}, area {da:.1e}",
+            keys.len()
+        );
+        assert!(
+            ds < 1e-13 && da < 1e-13,
+            "{name} densify {densify}: S {ds:e}, area {da:e}"
+        );
+    }
+}
 
 /// Cartesian ESMF in the plane has rwarp's cells: source cells straight
 /// between their corners, destination cells too (densify 1). Weights,

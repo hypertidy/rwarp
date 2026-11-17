@@ -100,10 +100,26 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `mesh::MeshTransformer`: a `QuadMesh` as a warp source, for data with
+  one value per cell on a curvilinear grid given by its corners, such as
+  an ocean model's tripolar grid (stage 4d of
+  `design/curvilinear-frontend.md`, #37).
+  - Constructors: `new(mesh, mesh_crs, dst_gt, dst_crs)` with the CRS
+    backend, or `with_backend` with your own `CrsTransform`s.
+  - What it gives: it reports the mesh as the source's cells
+    (`Transformer::source_cells`). So `exact_weights` gives conservative
+    weights from the mesh, as fractions of each cell's world area across
+    the seam and fold, and `warp()` with `Footprint::Exact` regrids with
+    the area methods.
+  - Point kernels go through the mesh's cell map (`QuadMesh::to_index`).
+  - Checks: `warp()` with `Average` is `Weights::apply(FracArea)` bit for
+    bit, every cell's weights sum to 1, and source windows tile the
+    mesh (`tests/mesh_transformer.rs`).
+- `QuadMesh::window`: a window's cells as a mesh of their own.
 - ESMF on a tripolar grid (stage 4c of `design/curvilinear-frontend.md`,
-  #37; `tests/esmf_tripolar.rs`). The weights come from
-  `QuadMesh::cover_ring` on an analytic tripolar cap, with a seam into one
-  pole and an F-point fold. They are compared on two destinations: a grid
+  #37; `tests/esmf_tripolar.rs`). The weights come from `exact_weights`
+  through `MeshTransformer`, on an analytic tripolar cap with a seam into
+  one pole and an F-point fold. They are compared on two destinations: a grid
   in the cap's own plane, and lon/lat up to the pole.
   - Cartesian ESMF in the plane: the weights agree to rounding (3e-14).
   - Spherical ESMF: the differences are great-circle edges, recorded as
