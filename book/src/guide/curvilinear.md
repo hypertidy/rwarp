@@ -426,15 +426,21 @@ On the same files (scratch), at a tolerance of 1 m:
 |---|---|---|
 | A whole-world box | every cell kept covered in full | the same |
 | Five boxes on 1° lines (Arctic, Antarctic, across 180°, across 20 S), against `weights_onto` from a 1° indicator at densify 64 | 8e-6 | 6e-6 |
-| Natural Earth 10 m countries (258, 548k vertices) | 1.0 s | 3.1 s |
+| Natural Earth 10 m countries (258, 548k vertices) | 0.74 s | 1.1 s |
 
 The comparison is two separate walks: a polygon into the mesh's index
 space, and each cell's outline into the source's pixels. On a 30° wide
 land cell of ORCA2 the two differed by 1e-3 at densify 16, and the gap
-fell sixteenfold at densify 64, as the outlines' error should. Most of
-the time goes on one-row pieces round a whole latitude circle, which
-walk every polygon near their band. Antarctica lands only in the south
-band.
+fell sixteenfold at densify 64, as the outlines' error should.
+Antarctica lands only in the south band.
+
+Each piece walks only what can reach it. A one-row piece round most of
+a latitude circle has a box the size of its band's disk. A grid of tiles
+marks where its cells are, so polygons elsewhere are skipped, and long
+runs of edges away from it are cut short. That doesn't change the
+result: the walk sees the same crossings and the same winding round its
+interior point. What's left of the time is projecting the polygons and
+walking the edges that are near.
 
 ### Overlapping swaths
 

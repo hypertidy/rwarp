@@ -790,12 +790,61 @@ dependency, edges straight in longitude and latitude):
     densify 16 one 30 degree wide land cell of ORCA2 was 1e-3 out, and
     the gap fell sixteenfold at 64: the weights' outline error, not the
     burn's.
-  - Natural Earth 10 m countries (258 geometries, 548k vertices) burn
-    in 1.0 s onto eORCA1 and 3.1 s onto ORCA2. No cell sums past 1, and
-    Antarctica lands only in the south band.
-- **Not built.** A finer filter of which polygons each piece walks: a
-  one-row piece round most of a latitude circle has a box the size of
-  its band's disk, and walks nearly every polygon. `burn_par`.
+  - Natural Earth 10 m countries (258 geometries, 548k vertices) burned
+    in 1.0 s onto eORCA1 and 3.1 s onto ORCA2 as built in #85; with the
+    filter below, 0.74 s and 1.1 s. No cell sums past 1, and Antarctica
+    lands only in the south band.
+- **Not built.** `burn_par`.
+
+### Walking only what reaches a piece (built, 4h follow-up)
+
+Built (2026-11-17). In #85 each piece took every polygon whose box met
+its own. A one-row piece round most of a latitude circle (ORCA2 has
+dozens beside its garbled land near 26 N) has a box the size of its
+band's disk, so each walked nearly all of the band's vertices: 525k
+for a strip of 140 cells, 3.1 s in all for the countries.
+
+- **Tiles.** Each piece gets square tiles over its box in its world:
+  twice as many along the longer side as it has cells along its longer
+  one (4 to 512), and one more all round. Each cell's corners' box
+  marks its tiles, widened by one, and the marks are held as a
+  summed-area table. A box or segment that meets no marked tile can't
+  meet the piece, and is a tile or more from all of it.
+- **Parts.** A polygon whose outer box meets no marked tile is skipped.
+  It can't hold the piece, since then its box would hold the piece's
+  box.
+- **Runs.** In each ring, a run of segments apart from the piece is cut
+  short, greedily. Each shortcut runs as far as it can while it is apart
+  too, and closes a loop of winding 0 round the walk's interior point
+  `p0` with the stretch it replaces. Being apart from the piece, the
+  loop winds as often round all of it. Its crossings of `p0`'s row are a
+  tile or more from `p0`, so the walk's own floating-point winding test
+  counts them alike. A ring wholly apart is dropped if it winds round
+  nothing (an outer ring takes its polygon with it), and is stood in for
+  by a rectangle beyond the tiles if it winds round the piece.
+- **Why it's the same.** The walk uses a stretch outside the mesh only
+  through its crossings (none, apart) and through the winding of each
+  excursion, closed by a boundary arc, round `p0`. The vertices it
+  locates, the final locate hint and the ring's start are unchanged.
+  So the index rings, and the burn, are the same bit for bit.
+- **Tests.**
+  - Unit tests in `src/mesh/set.rs`: on a damaged global grid in two
+    polar LAEAs (with one-row pieces), 65 polygons (blobs with and
+    without holes, caps, an annulus round the pole, a box split at 180,
+    a sliver along a parallel, the whole world) burn the same with the
+    filter and without, record for record. A ring of 2000 vertices
+    across a strip keeps 14; one apart from it is dropped, and one round
+    it becomes the rectangle.
+  - On the CMIP6 files (scratch), the countries burn hashes the same as
+    #85's at 1 m and 0.01 m. Times on eORCA1: 1.0 s to 0.74 s (6.0 to
+    3.8 s at 0.01 m). On ORCA2: 3.0 s to 1.1 s (15.1 to 5.5 s).
+- **What's left** on ORCA2's north band at 1 m:
+  - projecting the polygons, 0.26 s;
+  - the filter's scans, 0.23 s, one tile test per segment per piece
+    near it (chunks of a ring with one box each could skip most);
+  - walking the edges near pieces, 0.53 s: about 1M vertices, against
+    546k projected, since neighbouring strips each walk the edges beside
+    them.
 
 ### The exact footprint at the antimeridian
 
