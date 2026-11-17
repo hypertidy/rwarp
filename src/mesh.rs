@@ -82,6 +82,62 @@
 //! assert!((back[0] - p[0]).abs() < 1e-12 && (back[1] - p[1]).abs() < 1e-12);
 //! ```
 //!
+//! # Seams and folds
+//!
+//! Outer walls that meet in the world are crossed like any side, with
+//! nothing to declare. That covers a periodic grid whose seam has no jump
+//! in its coordinates (column line `ncol` on column line 0) and a
+//! tripolar grid (ORCA and similar), whose last row line folds onto
+//! itself (corner `i` on corner `ncol - i`). Give such a grid its corners
+//! in a projection in which it is one sheet. For a global ocean grid,
+//! Lambert azimuthal equal-area on the north pole does this, and its
+//! planar areas are true areas. A ring that crosses the seam or the fold
+//! leaves through one wall and comes back through the other at the same
+//! world point, and each cell gets its coverage as anywhere else. The two
+//! walls need to agree only to rounding.
+//!
+//! Not covered: coordinates that jump at the seam, such as longitudes
+//! 360 degrees apart, where the seam's two walls are different places in
+//! the plane. A tripolar grid can't be given in longitude and latitude
+//! anyway, since the geographic pole is inside one of its cells.
+//!
+//! ```
+//! use controlledburn::{BurnOptions, Coord, Geometry, Polygon};
+//! use rwarp::mesh::{CellMap, QuadMesh};
+//!
+//! // a full annulus: column line 24 is column line 0, along the x axis
+//! let (ncol, nrow) = (24, 4);
+//! let (mut x, mut y) = (Vec::new(), Vec::new());
+//! for j in 0..=nrow {
+//!     for i in 0..=ncol {
+//!         let a = ((i % ncol) as f64 / ncol as f64) * std::f64::consts::TAU;
+//!         let r = 100.0 + 20.0 * j as f64;
+//!         x.push(r * a.cos());
+//!         y.push(r * a.sin());
+//!     }
+//! }
+//! let mesh = QuadMesh::from_corners(ncol, nrow, x, y, CellMap::EqualArea).unwrap();
+//!
+//! // a square of area 400 across the seam
+//! let sq = [[140.0, -10.0], [160.0, -10.0], [160.0, 10.0], [140.0, 10.0], [140.0, -10.0]];
+//! let ring = sq.iter().map(|p| Coord { x: p[0], y: p[1] }).collect();
+//! let res = mesh
+//!     .burn(&[Geometry::Polygon(Polygon { rings: vec![ring] })], BurnOptions::coverage())
+//!     .unwrap();
+//! let mut area = 0.0;
+//! for e in &res.edges {
+//!     area += e.fraction as f64 * mesh.cell_area(e.row as usize, e.col as usize);
+//! }
+//! for run in &res.runs {
+//!     for c in run.col_start..run.col_end {
+//!         area += mesh.cell_area(run.row as usize, c as usize);
+//!     }
+//! }
+//! assert!((area - 400.0).abs() < 1e-3, "{area}");
+//! // cells either side of the seam share it
+//! assert!(res.edges.iter().any(|e| e.col == 0) && res.edges.iter().any(|e| e.col == 23));
+//! ```
+//!
 //! # Overlapping swaths: one mesh per scan
 //!
 //! A mesh is one sheet: no two cells overlap (decision N3). A swath whose

@@ -78,6 +78,23 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `QuadMesh::ring_to_index`, and so `burn`, `burn_par` and `cover_ring`,
+  cross outer walls that meet in the world: a periodic grid's seam
+  (column line `ncol` on column line 0) and a tripolar grid's fold (the
+  last row line on itself, corner `i` on corner `ncol - i`), with
+  nothing declared (stage 4a of `design/curvilinear-frontend.md`, #37).
+  Give the grid's corners in a projection in which it is one sheet:
+  for a global ocean grid, Lambert azimuthal equal-area on the north
+  pole, whose planar areas are true areas. The walls need to agree only
+  to rounding.
+  - Before: a ring crossing a seam or fold was joined across the mesh in
+    index space, and cells along the crossing were off by up to a whole
+    cell.
+  - Bounded meshes: the same output bit for bit. Tested against the
+    per-cell world clip on an annulus, a fold and a tripolar disk
+    (`tests/mesh_glued.rs`).
+  - Not yet: coordinates that jump at the seam (longitudes 360 apart).
+
 - `Transformer::source_cells` and `transform::SourceCells`: a transformer
   reports a source whose pixels are cells in its own world coordinates.
   It provides the map from destination pixels to source world coordinates

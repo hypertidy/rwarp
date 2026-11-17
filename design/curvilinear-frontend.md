@@ -1,7 +1,9 @@
 # Curvilinear grids: the coverage front end
 
 Status: stages 1 and 2 implemented (`src/mesh.rs`, `src/mesh/walk.rs`,
-`src/mesh/rect.rs`; 2026-10-31 and 2026-11-01); later stages proposed.
+`src/mesh/rect.rs`; 2026-10-31 and 2026-11-01), stage 3 built (#36,
+#72), stage 4 started: walls that meet in the world (a seam, a fold) are
+walked across (4a, 2026-11-17; section 3). Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
@@ -16,9 +18,10 @@ validation (bow-ties and folds refused, zero-area cells allowed),
 for convex cells; for non-convex cells the balanced point in the kernel
 that keeps the four triangles furthest from degenerate), ownership by
 canonical side orientation, `locate` with a walking hint, `locate_all`,
-and CSR buckets built on first use. Not yet: `Topology` (only the bounded
-case exists, so there is no enum), `from_cf_bounds`, the boundary index
-(it belongs with the walk in stage 2). Decisions 1 to 5 below were taken
+and CSR buckets built on first use. Not yet: a declared period for
+coordinates that jump at the seam (section 3; there is no `Topology`
+enum), `from_cf_bounds`, the boundary index (it belongs with the walk in
+stage 2). Decisions 1 to 5 below were taken
 at their recommendations, provisionally; 1, 3 and 4 are now decided (N1,
 N3 and N4 in `decisions.md`). `mesh` is public and unstable: it may break
 at a 0.x minor release, not a patch.
@@ -196,34 +199,72 @@ Plain `f64` orientation tests with snapping first; adaptive-precision
 
 ## 3. Folds, poles, periodic grids, the antimeridian
 
-### Topology
+### Seams and folds: walls that meet in the world (built, 4a)
 
-```rust
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Topology {
-    #[default]
-    Bounded,
-    /// Global in longitude: column `ncol` is column 0 again.
-    PeriodicCols { period: f64 },
-    /// Periodic columns plus a fold on the last row: cell
-    /// `(nrow - 1, i)`'s far side joins `(nrow - 1, ncol - 1 - i)`'s.
-    Tripolar { period: f64 },
-}
-```
+Built (2026-11-17), differently from the first plan here. That plan was a
+`Topology` enum (`Bounded`, `PeriodicCols { period }`, `Tripolar { period }`)
+whose neighbour rules the walk would follow, keeping a local frame
+across the seam and burning an unwrapped index ring on a widened grid.
 
-- **Periodic.** The walk keeps a local frame: crossing the seam shifts it
-  by one period, so the segment and the cell stay continuous. Polygon
-  coordinates are taken literally (planar in the coordinates given; with
-  a periodic grid, 181 and -179 are the same place, and a segment from
-  179 to -179 goes the long way, as GEOS reads it). In index space the
-  ring is unwrapped (columns beyond `ncol` allowed), burned on a grid
-  widened to cover it, and columns folded back modulo `ncol` after. No
-  polygon splitting.
-- **Tripolar** (ORCA and friends): the walk crosses the fold like any
-  side, using the topology's neighbour. In index space the ring jumps at
-  the fold; close each part along the top boundary, as for "Off the
-  mesh". Oracle in section 7.
+Given its corners in a projection in which it is one sheet, a periodic
+grid's seam and a tripolar grid's fold are outer walls of the index
+rectangle that meet in the world. The walk already finds the cells on
+both sides, since a segment that leaves through an outer side is looked
+for again from the boundary sides it meets. What went wrong was the
+index ring: at the crossing it jumps from one wall to the other with no
+gap along the segment, and the walk joined the two positions with a
+straight index-space segment across the mesh (and, before, dropped the
+second one). Now the jump is taken as an exit and re-entry with nothing
+outside between. The boundary arc picked by the existing winding test
+then runs along the walls: round the fold and the seam, which go out and
+back in the world, not round the grid's real boundary, which winds round
+it. Nothing is declared. Three details:
+
+- A vertex on such a wall is placed in each piece's own cell, not only in
+  the cell that owns it.
+- The jump where the ring closes on itself (its first vertex on a seam)
+  is checked too.
+- Walls that agree only to rounding, with a sliver gap or overlap, are
+  handled the same way.
+
+Bounded meshes give the same output bit for bit: Natural Earth 10m land
+burned on the warped global mesh of `examples/mesh_burn_par.rs`, at 1 and
+0.25 degrees, gives the same hashes before and after.
+
+Tested in `tests/mesh_glued.rs`, against the per-cell world clip, on
+three meshes, each with its walls exact and to rounding:
+
+- an annulus (a seam);
+- a strip wrapped round one end of a slit (a fold, no seam);
+- a disk with a seam and a fold (a tripolar grid as a polar projection
+  shows it, with two poles, one where the seam meets the fold).
+
+The cases:
+
+- random polygons with holes, steered onto corners and centres;
+- rings round the hole, round the whole fold, and round each pole;
+- three and four seam crossings;
+- `cover_ring` against `burn`;
+- an ignored test of about 16,000 polygons.
+
+What stage 4 still needs:
+
+- **Coordinates that jump at the seam** (longitude, period 360). The two
+  walls are then different places in the plane and nothing meets. As for
+  the exact footprint (stage 3b), a ring would be walked at each whole
+  period at which it meets the mesh, and the pieces burned together. A
+  period declared on the mesh is the only remaining use of a topology.
+  Generator 5.
+- **Tripolar grids in longitude and latitude** can't be planar meshes:
+  the geographic pole is inside an ocean cell. An ORCA grid is given as a
+  mesh in a polar projection. North polar Lambert azimuthal equal-area
+  keeps planar areas true, with edges straight in that projection: not
+  great circles, not rhumb lines. The difference from ESMF's great
+  circles is second order in cell size, and the ESMF comparison measures
+  it.
+- CF bounds and SCRIP corners (`from_cf_bounds`), the halo layout, the
+  overlap check (N3), and the ESMF comparison.
+
 - **Poles.** Cells straight in degrees that touch latitude 90 are valid
   planar quadrilaterals (possibly triangles). A pole *inside* a cell is
   not meaningful in degrees; such grids should come with corners in a
@@ -232,9 +273,9 @@ pub enum Topology {
   cyclic columns, and at the north fold a row that mirrors one below it
   (T-pivot: the last row mirrors row `jpj - 2`; F-pivot: row `jpj - 1`).
   The copies keep orientation (a shift, a half-turn in index space), so
-  the sign test below doesn't see them. The tripolar constructor takes
-  the halo layout and drops the duplicates: the fold is the neighbour
-  rule, not data.
+  the sign test below doesn't see them. The constructor from CF bounds
+  takes the halo layout and drops the duplicates: the seam and fold are
+  walls that meet, not data.
 - **Other folds** (overlapping swath scan lines, MODIS bow-tie): cells
   overlap in world space, so location is ambiguous and a walk follows one
   sheet. Decided (N3, 2026-11-17): refused for coverage. Construction
@@ -487,9 +528,11 @@ Each generator has an exact oracle:
 5. **Periodic.** A regular global grid declared periodic, columns rotated
    by k, must match the regular burn shifted by k, for polygons crossing
    the seam.
-6. **Fold.** A regular 2N by M grid stored folded as N by 2M (the second
-   half reversed above the fold) must match the unfolded burn after the
-   index remap: tripolar logic, tested without an ocean model.
+6. **Fold.** Built as the world clip on meshes with a fold
+   (`tests/mesh_glued.rs`): a strip wrapped round one end of a slit, and
+   a disk with a seam and a fold. The first plan, a regular grid stored
+   folded, is not a mesh: its middle column line would be two different
+   lines in the world.
 7. **Degenerate.** Collapsed corners and triangles (no coverage, a note);
    bow-ties (construction error); non-convex cells where the equal-area
    line misses the kernel (a note, bounded error).
@@ -507,7 +550,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | `PeriodicCols`, `Tripolar` for the polygon front end; halo layout (duplicates dropped) and an overlap check for copies that keep orientation (N3) | generators 5 and 6; generator 6 with a halo row kept: refused without the layout, equal with it |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); a declared period for coordinates that jump at the seam; CF bounds and SCRIP corners; halo layout (duplicates dropped) and an overlap check for copies that keep orientation (N3); the ESMF comparison on a tripolar grid | the world clip on an annulus, a fold and a tripolar disk (built); generator 5; a tripolar mesh with a halo row kept: refused without the layout, equal with it |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

@@ -18,6 +18,14 @@
 //!    the arc together do not wind around the mesh. The arc lies on the
 //!    outer walls, so it changes no cell.
 //!
+//! Two outer walls that meet in the world (a seam, a fold) are crossed
+//! the same way. Where the ring passes from a cell on one to a cell on
+//! the other, its index position jumps between the walls at one world
+//! point. That is taken as an exit and a re-entry with nothing outside
+//! between, and the arc chosen runs along the walls. A vertex on such a
+//! wall is placed in each piece's own cell, not only in the cell that
+//! owns it.
+//!
 //! The walk uses the equal-area map whatever the mesh's [`CellMap`] (which
 //! is for its point methods): under `Bilinear` the preimage of a straight
 //! edge is curved, and mapping cut points alone would not be exact for
@@ -104,6 +112,15 @@ struct Scratch {
 /// Gaps in segment parameter smaller than this join two pieces (the two
 /// sides of a vertex the segment passes through can give `t` an ulp apart).
 const T_EPS: f64 = 1e-12;
+
+/// Index-space distance within which a point is on an outer wall, or in a
+/// cell's closure (a vertex placed by its barycentric map lands within
+/// rounding of the side it is on).
+const WALL_EPS: f64 = 1e-9;
+
+/// Index-space distance beyond which two positions of one world point are
+/// on different walls that meet in the world, not the same point.
+const JUMP_EPS: f64 = 1e-6;
 
 /// An edge of a cell's four-triangle split.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -380,13 +397,19 @@ impl QuadMesh {
                     };
                     touched = true;
                     if t1 > t0 {
+                        // a vertex's own position, unless it is owned on
+                        // the other side of a seam or fold from this cell
                         let p0 = match e0 {
                             Some(e) => self.crossing(e, a, b),
-                            None => ia.unwrap_or_else(|| self.tri_index(r, c, k, a)),
+                            None => ia
+                                .filter(|&q| Self::in_cell(q, r, c))
+                                .unwrap_or_else(|| self.tri_index(r, c, k, a)),
                         };
                         let p1 = match e1 {
                             Some(e) => self.crossing(e, a, b),
-                            None => ib.unwrap_or_else(|| self.tri_index(r, c, k, b)),
+                            None => ib
+                                .filter(|&q| Self::in_cell(q, r, c))
+                                .unwrap_or_else(|| self.tri_index(r, c, k, b)),
                         };
                         out.push(Piece { t0, t1, p0, p1 });
                     }
@@ -522,6 +545,32 @@ impl QuadMesh {
         out
     }
 
+    /// Whether two index points of one world point are on outer walls
+    /// that meet in the world (a seam, a fold): both on walls, and apart.
+    /// Elsewhere the two are the same point, bitwise or to rounding.
+    fn glued(&self, p: [f64; 2], q: [f64; 2]) -> bool {
+        let (nc, nr) = (self.ncol as f64, self.nrow as f64);
+        let on_wall = |p: [f64; 2]| {
+            p[0].abs() <= WALL_EPS
+                || p[1].abs() <= WALL_EPS
+                || (p[0] - nc).abs() <= WALL_EPS
+                || (p[1] - nr).abs() <= WALL_EPS
+        };
+        ((p[0] - q[0]).abs() > JUMP_EPS || (p[1] - q[1]).abs() > JUMP_EPS)
+            && on_wall(p)
+            && on_wall(q)
+    }
+
+    /// Whether index point `p` is in cell `(row, col)`'s closure, to
+    /// rounding.
+    fn in_cell(p: [f64; 2], row: usize, col: usize) -> bool {
+        let (c, r) = (col as f64, row as f64);
+        p[0] >= c - WALL_EPS
+            && p[0] <= c + 1.0 + WALL_EPS
+            && p[1] >= r - WALL_EPS
+            && p[1] <= r + 1.0 + WALL_EPS
+    }
+
     /// A point strictly inside the mesh, for winding tests.
     fn interior_point(&self) -> Option<[f64; 2]> {
         self.cells.iter().find(|c| c.area2 != 0.0).map(|c| c.centre)
@@ -565,6 +614,7 @@ impl QuadMesh {
         // walk
         let mut nodes: Vec<Node> = Vec::new();
         let mut scratch = Scratch::default();
+        let mut first = None;
         for k in 0..n {
             let k1 = (k + 1) % n;
             let (a, b) = (pts[k], pts[k1]);
@@ -574,8 +624,12 @@ impl QuadMesh {
                 if p.t1 <= cur + T_EPS {
                     continue;
                 }
-                if p.t0 > cur + T_EPS {
-                    // re-entry after a stretch outside (or a start outside)
+                let prev = nodes.last().and_then(|q| q.idx);
+                let glued = p.t0 <= cur + T_EPS && prev.is_some_and(|q| self.glued(q, p.p0));
+                if p.t0 > cur + T_EPS || glued {
+                    // re-entry after a stretch outside (or a start
+                    // outside), or across two outer walls that meet in
+                    // the world (a seam, a fold): closed along the walls
                     nodes.push(Node {
                         idx: Some(p.p0),
                         world: lerp(a, b, p.t0),
@@ -588,10 +642,19 @@ impl QuadMesh {
                         world: a,
                         out_before: false,
                     });
+                    if k == 0 {
+                        first = Some((p.p0, true));
+                    }
+                } else if k == 0 && cur == 0.0 {
+                    // the ring's start, left implicit: its last node
+                    first = Some((p.p0, false));
                 }
                 if p.t1 >= 1.0 - T_EPS {
+                    // the vertex's own position, unless it is on the other
+                    // side of a seam or fold from this piece
+                    let v = vidx[k1].filter(|&q| !self.glued(q, p.p1));
                     nodes.push(Node {
-                        idx: Some(vidx[k1].unwrap_or(p.p1)),
+                        idx: Some(v.unwrap_or(p.p1)),
                         world: b,
                         out_before: false,
                     });
@@ -610,6 +673,24 @@ impl QuadMesh {
                     world: b,
                     out_before: true,
                 });
+            }
+        }
+        // a ring that starts on a seam or fold and comes back to its start
+        // from the other side
+        if let (Some((q, pushed)), Some(l)) = (first, nodes.last().and_then(|q| q.idx)) {
+            if self.glued(l, q) {
+                if pushed {
+                    nodes[0].out_before = true;
+                } else {
+                    nodes.insert(
+                        0,
+                        Node {
+                            idx: Some(q),
+                            world: pts[0],
+                            out_before: true,
+                        },
+                    );
+                }
             }
         }
         if nodes.iter().all(|q| q.idx.is_none()) {
