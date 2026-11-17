@@ -1,6 +1,6 @@
 # Open decisions
 
-Status: 2026-11-05. The decisions the roadmap is waiting on, one section
+Status: 2026-11-05; N1 decided 2026-11-16, N3 and N4 2026-11-17. The decisions the roadmap is waiting on, one section
 each: what is being decided, the options with their costs, the
 recommendation, and what the code does today. Several are already
 implemented at their recommendation *provisionally*; for those the
@@ -20,8 +20,8 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 |---|---|---|---|
 | N1 | cell map default for coverage | coverage uses `EqualArea` on every mesh; `Bilinear` default for point methods | decided: A, `EqualArea` for coverage (2026-11-16) |
 | N2 | non-convex cells | equal-area split; fallback note never seen | keep, and test that it never fires |
-| N3 | folds other than tripolar | refused at construction | refuse for coverage |
-| N4 | `mesh` public or crate-private | public, documented unstable | public, unstable |
+| N3 | folds other than tripolar | folds that flip orientation refused at construction | decided: A, refuse; one mesh per scan for overlapping swaths; stage 4 adds overlaps that keep orientation (2026-11-17) |
+| N4 | `mesh` public or crate-private | public, documented unstable | decided: A, public; may break at a 0.x minor release, not a patch (2026-11-17) |
 | N5 | robust predicates | plain `f64`, no snapping yet | plain `f64`, snap first |
 | N6 | `f64` edge fractions in controlledburn | `f32` in `burn`, `f64` in `CoverageWindow` | decided: `f32`, documented (0.3.0) |
 | C1 | weight index types | `u32` per axis | settled; confirm |
@@ -90,7 +90,37 @@ the fallback dead code.
 A proof that the line always meets the kernel would settle it; the search
 is the cheap substitute.
 
-## N3. Folds other than tripolar
+## N3. Folds other than tripolar (decided)
+
+**Decided (2026-11-17): option A.** Coverage refuses cells that overlap.
+A swath whose scans overlap is used as one mesh per scan: each scan is
+one sheet, each source pixel gets its own coverage, and where scans
+cover the same ground, how to combine them (sum, mean, the first scan
+only) is the caller's choice. The `mesh` module docs show it
+("Overlapping swaths: one mesh per scan", a doctest).
+
+Stage 4 (#37) extends the refusal to overlaps that keep orientation,
+which today's test misses:
+
+- `QuadMesh::from_corners` refuses a mesh whose cells have both
+  orientations. That catches overlapping swath scans: towards the swath
+  edges the cells between two scans flip.
+- A copy that keeps orientation passes. NEMO's halos are that: the
+  cyclic columns repeat at a shift in index space, and the north-fold
+  row repeats rotated 180 degrees in index space (T-pivot: the last row
+  mirrors row `jpj - 2`; F-pivot: row `jpj - 1`). A shift and a
+  half-turn both keep orientation, so an ORCA mesh with its halos would
+  be accepted and those cells counted twice. (Worked out from the index
+  maps, not yet seen on an ORCA file.)
+- In stage 4 the tripolar constructor takes the halo layout and drops the
+  duplicates (the fold is a neighbour rule, not data), and the mesh is
+  checked for overlap: each cell's centre located with `locate_all`, the
+  mesh refused if any centre has two owners. That is one location per
+  cell; it catches copies of any kind, though not an overlap thinner
+  than half a cell.
+
+Until then the `from_corners` docs say to drop duplicated rows and
+columns first.
 
 ![Tripolar fold vs overlapping sheets](figures/folds.svg)
 
@@ -108,10 +138,20 @@ and a walk can follow only one sheet.
 | **A. Refuse for coverage in the first version** (recommended) | keeps the walk single-sheet and exact; the error is explicit | swath users must cut or deduplicate scan lines first |
 | B. Design for overlapping sheets now | serves raw swaths directly | location returns several cells and the walk branches; it isn't clear what "coverage" means where sheets overlap (sum, first, mean?); a lot of design for an unasked case |
 
-## N4. Is `mesh` public?
+## N4. Is `mesh` public? (decided)
 
-**Today:** `rwarp::mesh` is public and documented as unstable until a
-second consumer uses it.
+**Decided (2026-11-17): option A.** `mesh` stays public, and "unstable"
+says what it means: the module changes more often than the rest of the
+crate and may break at any 0.x minor release; patch releases keep it,
+as Cargo's semver rules expect. Since #71 `QuadMesh` is also in a public
+signature (`SourceCells::mesh`, reached from `Transformer::source_cells`),
+so B would have taken `SourceCells` private with it. The name stays
+`mesh`; wxylib's m33 names its warp (rendering) meshes `rwarp::view::mesh`.
+Stage 4 is expected to change `from_corners` (a topology), within that
+promise.
+
+**Before the decision:** `rwarp::mesh` was public and documented as
+unstable until a second consumer used it.
 
 | option | for | against |
 |---|---|---|

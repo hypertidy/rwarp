@@ -18,9 +18,10 @@ that keeps the four triangles furthest from degenerate), ownership by
 canonical side orientation, `locate` with a walking hint, `locate_all`,
 and CSR buckets built on first use. Not yet: `Topology` (only the bounded
 case exists, so there is no enum), `from_cf_bounds`, the boundary index
-(it belongs with the walk in stage 2). Decisions 1 to 5 below are taken
-at their recommendations, provisionally; `mesh` is public and documented
-as unstable until a second consumer uses it.
+(it belongs with the walk in stage 2). Decisions 1 to 5 below were taken
+at their recommendations, provisionally; 1, 3 and 4 are now decided (N1,
+N3 and N4 in `decisions.md`). `mesh` is public and unstable: it may break
+at a 0.x minor release, not a patch.
 
 Scope: how rwarp moves polygons (and its own
 destination pixel outlines) into the index space of a curvilinear grid so
@@ -227,11 +228,21 @@ pub enum Topology {
   planar quadrilaterals (possibly triangles). A pole *inside* a cell is
   not meaningful in degrees; such grids should come with corners in a
   polar projection.
+- **Halos.** Ocean-model files often keep duplicated cells: NEMO's
+  cyclic columns, and at the north fold a row that mirrors one below it
+  (T-pivot: the last row mirrors row `jpj - 2`; F-pivot: row `jpj - 1`).
+  The copies keep orientation (a shift, a half-turn in index space), so
+  the sign test below doesn't see them. The tripolar constructor takes
+  the halo layout and drops the duplicates: the fold is the neighbour
+  rule, not data.
 - **Other folds** (overlapping swath scan lines, MODIS bow-tie): cells
   overlap in world space, so location is ambiguous and a walk follows one
-  sheet. Detect at construction (cells whose signed area has the minority
-  sign, overlapping neighbours) and refuse for coverage in the first
-  version.
+  sheet. Decided (N3, 2026-11-17): refused for coverage. Construction
+  refuses cells of both orientations (built in stage 1); stage 4 adds an
+  overlap check for copies that keep orientation (each cell's centre
+  located with `locate_all`, refused with two owners). An overlapping
+  swath is used as one mesh per scan (the `mesh` module docs show it);
+  how overlapping scans combine is the caller's choice.
 
 ### The exact footprint at the antimeridian
 
@@ -496,11 +507,15 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | `PeriodicCols`, `Tripolar` for the polygon front end | generators 5 and 6 |
+| 4 | `PeriodicCols`, `Tripolar` for the polygon front end; halo layout (duplicates dropped) and an overlap check for copies that keep orientation (N3) | generators 5 and 6; generator 6 with a halo row kept: refused without the layout, equal with it |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
-| later | overlapping folds, swath gaps (mesh holes), approx (cell-centre) mode | |
+| later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 
 ## Decisions for the maintainer
+
+Decided since: 1 (N1, 2026-11-16, `EqualArea` for coverage), 3 (N3,
+2026-11-17, refuse), 4 (N4, 2026-11-17, public; may break at a 0.x minor
+release), 6 (N6, controlledburn 0.3.0, `f32`). See `decisions.md`.
 
 1. **`EqualArea` as the coverage default.** Recommended for coverage and
    area methods, with `Bilinear` kept for point kernels and

@@ -151,7 +151,37 @@ let res = mesh
 assert!(!res.edges.is_empty());
 ```
 
-The module is unstable until a second consumer uses it.
+### Overlapping swaths
+
+A mesh is one sheet: `from_corners` refuses cells of both orientations,
+which is what a swath whose scans overlap (the MODIS bow-tie) gives when
+its scans are stored as one array. Each scan alone is one sheet, so build
+one mesh per scan and offset its rows to the swath's:
+
+```rust,ignore
+let n = rows * ncol; // pixels per scan
+for s in 0..nscan {
+    let (sx, sy) = (&x[s * n..(s + 1) * n], &y[s * n..(s + 1) * n]);
+    let mesh = QuadMesh::from_centres(ncol, rows, sx, sy, CellMap::EqualArea).unwrap();
+    let res = mesh.burn(&geoms, BurnOptions::coverage()).unwrap();
+    // res holds the scan's rows: swath row = s * rows + row
+}
+```
+
+Each source pixel gets its own coverage. Where scans overlap, the ground
+is covered twice and each scan reports it in full; how to combine them
+there (sum, mean, the first scan only) is the caller's choice. The full
+example, which checks the area each scan covers, is in the
+[`mesh` module docs](../api/rwarp/mesh/index.html#overlapping-swaths-one-mesh-per-scan).
+
+A row or column stored twice, such as an ocean model's halo, keeps its
+orientation and isn't refused yet: drop duplicated rows and columns
+first. Grids that fold (tripolar) and halos are stage 4
+([#37](https://github.com/hypertidy/rwarp/issues/37)).
+
+`mesh` is public and unstable: it changes more often than the rest of
+the crate and may break at any 0.x minor release, though not at a patch
+release.
 
 ## Area methods from a swath
 

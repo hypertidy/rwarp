@@ -1,7 +1,9 @@
 //! Quadrilateral meshes: curvilinear grids as cells, for coverage.
 //!
-//! Stages 1 and 2 of `design/curvilinear-frontend.md`, and unstable: the
-//! API may change until a second consumer uses it. A [`QuadMesh`] holds the
+//! Stages 1 and 2 of `design/curvilinear-frontend.md`. Unstable: this
+//! module changes more often than the rest of the crate and may break at
+//! any 0.x minor release; patch releases keep it (decision N4,
+//! `design/decisions.md`). A [`QuadMesh`] holds the
 //! `(nrow + 1) x (ncol + 1)` corners of a curvilinear grid, validates
 //! them, and maps points between the grid's own coordinates ("world", in
 //! whatever CRS the corners are given in) and its index space: fractional
@@ -79,6 +81,68 @@
 //! let back = mesh.to_world(idx).unwrap();
 //! assert!((back[0] - p[0]).abs() < 1e-12 && (back[1] - p[1]).abs() < 1e-12);
 //! ```
+//!
+//! # Overlapping swaths: one mesh per scan
+//!
+//! A mesh is one sheet: no two cells overlap (decision N3). A swath whose
+//! scans overlap, as MODIS's do towards the swath edges (the bow-tie),
+//! folds over itself when its scans are stored as one array, and
+//! [`QuadMesh::from_corners`] refuses it. Each scan alone is one sheet, so
+//! build one mesh per scan and offset its rows to the swath's. Each
+//! source pixel then gets its own coverage. Where scans overlap the
+//! ground is covered twice, and each scan reports it in full; how to
+//! combine the scans there (sum, mean, the first scan only) is the
+//! caller's choice.
+//!
+//! ```
+//! use controlledburn::{BurnOptions, Coord, Geometry, Polygon};
+//! use rwarp::mesh::{CellMap, QuadMesh};
+//!
+//! // Two scans of 3 rows by 6 columns, given by pixel centres. Scan 1
+//! // starts over scan 0, by more rows towards the swath's edges.
+//! let (ncol, rows, nscan) = (6, 3, 2);
+//! let (mut x, mut y) = (Vec::new(), Vec::new());
+//! for s in 0..nscan {
+//!     for r in 0..rows {
+//!         for i in 0..ncol {
+//!             let overlap = s as f64 * (i as f64 - 2.5).abs();
+//!             x.push(i as f64);
+//!             y.push((s * rows + r) as f64 - overlap);
+//!         }
+//!     }
+//! }
+//! // Stored as one array of 6 rows, the swath folds over itself.
+//! let all = QuadMesh::from_centres(ncol, nscan * rows, &x, &y, CellMap::EqualArea);
+//! assert!(all.unwrap_err().contains("folds"));
+//!
+//! // A square over the ground both scans cover, near the swath's left edge.
+//! let ring = [[0.1, 1.0], [0.9, 1.0], [0.9, 1.8], [0.1, 1.8], [0.1, 1.0]];
+//! let ring = ring.iter().map(|p| Coord { x: p[0], y: p[1] }).collect();
+//! let geoms = [Geometry::Polygon(Polygon { rings: vec![ring] })];
+//!
+//! let n = rows * ncol;
+//! let mut cells = Vec::new(); // (swath row, col, fraction)
+//! for s in 0..nscan {
+//!     let (sx, sy) = (&x[s * n..(s + 1) * n], &y[s * n..(s + 1) * n]);
+//!     let mesh = QuadMesh::from_centres(ncol, rows, sx, sy, CellMap::EqualArea).unwrap();
+//!     let res = mesh.burn(&geoms, BurnOptions::coverage()).unwrap();
+//!     let row0 = (s * rows) as i32;
+//!     let mut area = 0.0;
+//!     for e in &res.edges {
+//!         cells.push((row0 + e.row, e.col, e.fraction as f64));
+//!         area += e.fraction as f64 * mesh.cell_area(e.row as usize, e.col as usize);
+//!     }
+//!     for run in &res.runs {
+//!         for col in run.col_start..run.col_end {
+//!             cells.push((row0 + run.row, col, 1.0));
+//!             area += mesh.cell_area(run.row as usize, col as usize);
+//!         }
+//!     }
+//!     // each scan covers the whole square
+//!     assert!((area - 0.64).abs() < 1e-6, "scan {s}: {area}");
+//! }
+//! assert!(cells.iter().any(|c| c.0 < 3) && cells.iter().any(|c| c.0 >= 3));
+//! ```
 
 use std::sync::OnceLock;
 
@@ -152,8 +216,14 @@ impl QuadMesh {
     /// when a cell is a bow-tie (two opposite sides cross), or when cells
     /// with area do not all have the same orientation (a fold: cells
     /// overlap, as on an overlapping swath scan, and location would be
-    /// ambiguous). Zero-area cells (collapsed corners) are allowed; they
-    /// contain no point.
+    /// ambiguous; build one mesh per scan instead, see the
+    /// [module docs](crate::mesh#overlapping-swaths-one-mesh-per-scan)). Zero-area
+    /// cells (collapsed corners) are allowed; they contain no point.
+    ///
+    /// Overlap that keeps orientation isn't detected yet: a row or column
+    /// stored twice, such as an ocean model's halo (NEMO's cyclic columns,
+    /// or the duplicated row at its north fold), passes, and its cells
+    /// would be counted twice. Drop duplicated rows and columns first.
     pub fn from_corners(
         ncol: usize,
         nrow: usize,
