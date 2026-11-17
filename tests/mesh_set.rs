@@ -571,6 +571,46 @@ fn burn_par_is_burn() {
     let one = s.burn(&geoms, &bands, 0.1, BurnMode::Coverage).unwrap();
     for threads in [0, 2, 5] {
         assert_eq!(one, s.burn_par(&geoms, &bands, 0.1, BurnMode::Coverage, threads).unwrap(), "{threads} threads");
+        // projected on the threads too, each through its own copy
+        let par = s.burn_par_with(&geoms, &bands, 0.1, BurnMode::Coverage, threads, |k| Ok(World(k, false)));
+        assert_eq!(one, par.unwrap(), "{threads} threads, projected on them");
+    }
+}
+
+/// With a CRS backend's transforms (libproj's can't be shared between
+/// threads), each thread building its own: `burn`'s records.
+#[cfg(any(feature = "proj", feature = "proj4rs"))]
+#[test]
+fn burn_par_with_a_backend() {
+    use rwarp::crs::crs_pair;
+    let lonlat = format!("+proj=longlat +R={R}");
+    let laea = [format!("+proj=laea +lat_0=-90 +R={R}"), format!("+proj=laea +lat_0=90 +R={R}")];
+    let to_world = |k: usize| crs_pair(&lonlat, &laea[k]).map(|(_, f)| f);
+    let (south, north) = (to_world(0).unwrap(), to_world(1).unwrap());
+    let bands = [Band { rows: 0..EQUATOR, to_world: &*south }, Band { rows: EQUATOR..NR, to_world: &*north }];
+    // the backend's world is the analytic one, to rounding
+    let (x, y) = north.convert(30.0, 45.0).unwrap();
+    let want = laea_n(30.0, 45.0);
+    assert!((x - want[0]).abs() < 1e-6 && (y - want[1]).abs() < 1e-6, "({x}, {y}) against {want:?}");
+    let land = land();
+    let (xb, yb) = bounds(&MOVED);
+    let s = MeshSet::from_cf_bounds(NC, NR, &xb, &yb, Halo::NONE, &bands, Some(&land)).unwrap();
+    let poly = |b| Geometry::Polygon(Polygon::new(vec![lonlat_box(b)]));
+    let geoms = vec![
+        poly([-180.0, 180.0, -90.0, 90.0]),
+        poly([-180.0, 180.0, 60.0, 90.0]),
+        poly([-127.5, 232.5, -90.0, -48.0]),
+        Geometry::MultiPolygon(vec![
+            Polygon::new(vec![lonlat_box([150.0, 180.0, -60.0, 30.0])]),
+            Polygon::new(vec![lonlat_box([-180.0, -150.0, -60.0, 30.0])]),
+        ]),
+    ];
+    let one = s.burn(&geoms, &bands, 0.1, BurnMode::Coverage).unwrap();
+    let whole: f64 = fractions(&one, 0).values().sum();
+    assert!(whole > 1000.0, "{whole}");
+    for threads in [0, 3] {
+        let par = s.burn_par_with(&geoms, &bands, 0.1, BurnMode::Coverage, threads, to_world);
+        assert_eq!(one, par.unwrap(), "{threads} threads");
     }
 }
 

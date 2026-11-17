@@ -13,7 +13,8 @@ for coordinates that jump at the seam (4e, 2026-11-17; section 3), and a
 mesh is a warp target, through `MeshTarget` (4f, 2026-11-17; section 3),
 and a whole ocean grid is a `MeshSet` of pieces in two polar projections
 with damaged land left out (4g, 2026-11-17; section 3), and polygons in
-longitude and latitude burn onto a set (4h, 2026-11-17; section 3).
+longitude and latitude burn onto a set, on several threads and
+projected there too (4h, 2026-11-17; section 3).
 Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
@@ -837,9 +838,69 @@ plus `threads`, projection on the calling thread):
   | eORCA1, 0.01 m | 4.00 s | 2.86 | 2.32 | 2.06 | 2.02 |
   | ORCA2, 1 m | 1.12 s | 0.73 | 0.54 | 0.44 | 0.40 |
   | ORCA2, 0.01 m | 5.59 s | 3.65 | 2.69 | 2.20 | 1.99 |
-- **Not built.** Projection in parallel. It would take a transform per
-  thread: a closure that builds one, as `weights_to` builds a
-  transformer per piece. The user chose to keep `burn`'s signature.
+- **Not built** here: projection in parallel. The user chose to keep
+  `burn`'s signature; `burn_par_with` below projects on the threads.
+
+### Projecting on the threads (built, 4h follow-up)
+
+Built (2026-11-17):
+`MeshSet::burn_par_with(geoms, bands, tolerance, opts, threads,
+to_world)`. `to_world: Fn(usize) -> Result<T, String> + Sync`, `T:
+CrsTransform`, builds band `k`'s transform, as `weights_onto`'s `inner`
+builds a transformer for each band. `burn_par` is it with projection on
+the calling thread.
+
+- **A transform per thread.** A `CrsTransform` needn't be `Send` or
+  `Sync` (libproj's handles are neither), so each thread that projects
+  into band `k` builds its own, once, before it takes a polygon. A
+  thread that starts after every polygon is taken builds none.
+  `to_world` must give what `bands[k].to_world` gives. With one thread,
+  or a band of one polygon, it isn't called, and the band projects on
+  the calling thread as in `burn`.
+- **The unit is a polygon**: each polygon of a multipolygon is cut,
+  densified and split on its own (as `project` did them in turn), those
+  with the most vertices first. A geometry's parts are put back in its
+  polygons' order, so each piece sees what it saw on one thread.
+- **Errors.** Every polygon of the band is projected, and the first that
+  failed, in order, gives `burn`'s message. A `to_world` error is
+  returned as `band k's transform: ...` once the other threads finish.
+- **New in `crs`:** `CrsTransform` for `Box<C>` and `&C`, so the boxed
+  transforms of `crs_pair` serve as `T`.
+- **Tests.**
+  - Unit (`src/mesh/set.rs`): on the damaged two-band grid, the 65
+    polygons and 50 points burn the same with per-thread copies on 0, 2,
+    3 and 8 threads (and unfiltered on 3). `to_world` is called at most
+    once a band a thread, and not at all on one thread. Its error comes
+    back. With a transform that refuses points north of 85 N, the first
+    failing polygon gives the same message as on one thread, though the
+    polygons with more vertices are projected first.
+  - `tests/mesh_set.rs`: the analytic grid's boxes and points on 0, 2
+    and 5 threads, and boxes through `crs_pair`'s transforms (libproj or
+    proj4rs) on 0 and 3 threads.
+- **On the CMIP6 files** (scratch, 32 cores, the machine shared):
+  Natural Earth 10 m countries, the same records on every count, with
+  `burn_par` / `burn_par_with` times. The bands' analytic polar LAEA:
+
+  | | 2 threads | 4 | 8 | 16 | 32 |
+  |---|---|---|---|---|---|
+  | eORCA1, 1 m | 0.54 / 0.40 s | 0.47 / 0.22 | 0.40 / 0.15 | 0.40 / 0.13 | 0.41 / 0.14 |
+  | eORCA1, 0.01 m | 2.76 / 2.03 s | 2.22 / 1.07 | 2.08 / 0.77 | 2.03 / 0.71 | 2.02 / 0.71 |
+  | ORCA2, 1 m | 0.73 / 0.58 s | 0.53 / 0.31 | 0.44 / 0.18 | 0.40 / 0.13 | 0.40 / 0.12 |
+  | ORCA2, 0.01 m | 3.63 / 2.84 s | 2.72 / 1.56 | 2.22 / 0.92 | 2.02 / 0.73 | 1.96 / 0.56 |
+
+  Through libproj (`crs_pair`), ORCA2 at 1 m: 0.25 s on 8 threads,
+  0.20 s on 16, 0.31 s on 32; at 0.01 m 1.01, 0.71 and 0.65 s.
+- **Building costs.** A libproj transform takes about 5 ms to build, and
+  libproj builds them more or less one at a time: 32 threads building at
+  once took 0.2 s. On a light burn the threads left building hold up
+  the end. Starting threads in a chain, each starting the next once its
+  transform was built, took 32 threads at 1 m to 0.28 s but 8 threads
+  to 0.31 s: transforms built one after another, about 5 ms each while
+  the other threads project, ramp up too slowly. Kept: all threads
+  started at once.
+- **Not built.** Cheaper libproj copies. PROJ's `proj_clone` copies a
+  transform into a new context without the database, but the `proj`
+  crate (0.31) doesn't offer it.
 
 ### Walking only what reaches a piece (built, 4h follow-up)
 
@@ -1160,7 +1221,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve (4h, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too (4h, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

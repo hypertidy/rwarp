@@ -641,7 +641,8 @@ impl MeshSet {
     /// - **Points** are found in the first piece (bands in order) whose
     ///   cell holds them, if any.
     ///
-    /// [`MeshSet::burn_par`] gives the same result on several threads.
+    /// [`MeshSet::burn_par`] gives the same result on several threads,
+    /// and [`MeshSet::burn_par_with`] projects there too.
     ///
     /// ```
     /// use rwarp::mesh::{Band, Halo, MeshSet};
@@ -687,7 +688,15 @@ impl MeshSet {
         tolerance: f64,
         opts: impl Into<BurnOptions>,
     ) -> Result<BurnResult, String> {
-        self.burn_with(geoms, bands, tolerance, opts.into(), true, 1)
+        self.burn_with(
+            geoms,
+            bands,
+            tolerance,
+            opts.into(),
+            true,
+            1,
+            None::<&Serial>,
+        )
     }
 
     /// [`MeshSet::burn`] on up to `threads` threads (0 for all available),
@@ -705,7 +714,8 @@ impl MeshSet {
     /// With `threads = 1` nothing is spawned, as on wasm, and this is
     /// [`MeshSet::burn`]. On ORCA2, Natural Earth's 10 m countries take
     /// about 0.3 s of projecting before any thread starts (1.6 s at a
-    /// tolerance of 0.01 m).
+    /// tolerance of 0.01 m); [`MeshSet::burn_par_with`] projects on the
+    /// threads.
     pub fn burn_par(
         &self,
         geoms: &[Geometry],
@@ -714,12 +724,116 @@ impl MeshSet {
         opts: impl Into<BurnOptions>,
         threads: usize,
     ) -> Result<BurnResult, String> {
-        self.burn_with(geoms, bands, tolerance, opts.into(), true, threads)
+        self.burn_with(
+            geoms,
+            bands,
+            tolerance,
+            opts.into(),
+            true,
+            threads,
+            None::<&Serial>,
+        )
     }
 
-    /// [`MeshSet::burn_par`], with each piece's polygons filtered and
-    /// their rings shortened by its [`Tiles`] (`trim`), or burned whole.
-    fn burn_with(
+    /// [`MeshSet::burn_par`], with the polygons projected on the threads
+    /// too, each thread through band `k`'s transform built by
+    /// `to_world(k)`: the same records as [`MeshSet::burn`].
+    ///
+    /// - **A transform per thread:** a [`CrsTransform`] needn't be
+    ///   thread-safe (libproj's handles aren't), so `to_world` builds one
+    ///   on each thread that projects into band `k`, the first time it
+    ///   does, as [`MeshSet::weights_onto`] builds a transformer for each
+    ///   band. It must give what `bands[k].to_world` gives:
+    ///   [`crs_pair`](crate::crs::crs_pair) with the same two CRSs, or a
+    ///   copy of a transform of your own.
+    /// - **On the threads:** each band's polygons, each polygon of a
+    ///   multipolygon on its own and those with the most vertices first,
+    ///   are cut to the band, densified into its world and split where
+    ///   they meet themselves. They are then filtered, walked and burned
+    ///   as [`MeshSet::burn_par`] does.
+    /// - **On the calling thread:** the points, through `bands`. With one
+    ///   thread, or a band of one polygon, the polygons too, and
+    ///   `to_world` isn't called.
+    /// - **Errors:** the first a band's polygons give, in their order, as
+    ///   [`MeshSet::burn`] gives it, or the first `to_world` returns.
+    ///
+    /// On ORCA2, in analytic polar LAEAs, Natural Earth's 10 m countries
+    /// take 0.18 s on 8 threads at a tolerance of 1 m (0.44 s with
+    /// [`MeshSet::burn_par`], 1.1 s on one), and 0.92 s at 0.01 m (2.2 s,
+    /// 5.6 s). Building a transform costs: libproj takes about 5 ms for
+    /// each, and slows when many threads build at once (32 took 0.2 s),
+    /// so on a light burn fewer threads can be faster. Through libproj,
+    /// ORCA2 at 1 m took 0.20 s on 16 threads and 0.31 s on 32.
+    ///
+    /// ```
+    /// use rwarp::mesh::{Band, Halo, MeshSet};
+    /// use rwarp::CrsTransform;
+    /// use controlledburn::{BurnMode, Coord, Geometry, Polygon};
+    ///
+    /// // north-polar LAEA on the unit sphere, over a global grid of 30
+    /// // degree cells north of the equator
+    /// struct Laea;
+    /// impl CrsTransform for Laea {
+    ///     fn convert(&self, lon: f64, lat: f64) -> Option<(f64, f64)> {
+    ///         let rho = 2.0 * ((90.0 - lat).to_radians() / 2.0).sin();
+    ///         let (s, c) = lon.to_radians().sin_cos();
+    ///         Some((rho * s, -rho * c))
+    ///     }
+    /// }
+    /// let (nc, nr) = (12, 3);
+    /// let (mut xb, mut yb) = (Vec::new(), Vec::new());
+    /// for j in 0..nr {
+    ///     for i in 0..nc {
+    ///         for (di, dj) in [(0, 0), (1, 0), (1, 1), (0, 1)] {
+    ///             xb.push(-180.0 + 30.0 * (i + di) as f64);
+    ///             yb.push(30.0 * (j + dj) as f64);
+    ///         }
+    ///     }
+    /// }
+    /// let bands = [Band { rows: 0..nr, to_world: &Laea }];
+    /// let set = MeshSet::from_cf_bounds(nc, nr, &xb, &yb, Halo::NONE, &bands, None).unwrap();
+    ///
+    /// // boxes 10 degrees on a side, one each 15 degrees of longitude
+    /// let boxes: Vec<Geometry> = (0..24)
+    ///     .map(|k| {
+    ///         let (x, y) = (-180.0 + 15.0 * k as f64, 40.0);
+    ///         let r = [(x, y), (x + 10.0, y), (x + 10.0, y + 10.0), (x, y + 10.0), (x, y)];
+    ///         Geometry::Polygon(Polygon::new(vec![r.iter().map(|&(x, y)| Coord { x, y }).collect()]))
+    ///     })
+    ///     .collect();
+    /// let one = set.burn(&boxes, &bands, 1e-6, BurnMode::Coverage).unwrap();
+    /// let par = set.burn_par_with(&boxes, &bands, 1e-6, BurnMode::Coverage, 4, |_| Ok(Laea)).unwrap();
+    /// assert_eq!(par, one);
+    /// ```
+    pub fn burn_par_with<F, T>(
+        &self,
+        geoms: &[Geometry],
+        bands: &[Band],
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+        threads: usize,
+        to_world: F,
+    ) -> Result<BurnResult, String>
+    where
+        F: Fn(usize) -> Result<T, String> + Sync,
+        T: CrsTransform,
+    {
+        self.burn_with(
+            geoms,
+            bands,
+            tolerance,
+            opts.into(),
+            true,
+            threads,
+            Some(&to_world),
+        )
+    }
+
+    /// [`MeshSet::burn_par_with`], with each piece's polygons filtered and
+    /// their rings shortened by its [`Tiles`] (`trim`), or burned whole;
+    /// with no `to_world`, projected on the calling thread.
+    #[allow(clippy::too_many_arguments)]
+    fn burn_with<F, T>(
         &self,
         geoms: &[Geometry],
         bands: &[Band],
@@ -727,7 +841,12 @@ impl MeshSet {
         opts: BurnOptions,
         trim: bool,
         threads: usize,
-    ) -> Result<BurnResult, String> {
+        to_world: Option<&F>,
+    ) -> Result<BurnResult, String>
+    where
+        F: Fn(usize) -> Result<T, String> + Sync,
+        T: CrsTransform,
+    {
         if opts.mode != BurnMode::Coverage {
             return Err("only coverage mode is defined for a grid front end".into());
         }
@@ -763,43 +882,27 @@ impl MeshSet {
             if pieces.is_empty() {
                 continue;
             }
-            let forward =
-                from_fn(|x: f64, y: f64| band.to_world.convert(x, y).map(|(a, b)| [a, b]));
-            let mut rs = Resampler::with_edge(forward, Planar::new(), &Options::new(tolerance));
             // the polygons in the band's world, with their positions and boxes
             let (mut world, mut ids, mut wbox) = (Vec::new(), Vec::new(), Vec::new());
-            for (id, g) in geoms.iter().enumerate() {
-                let ps = match g {
-                    Geometry::Polygon(p) => std::slice::from_ref(p),
-                    Geometry::MultiPolygon(ps) => ps.as_slice(),
-                    _ => continue,
-                };
-                let parts = project(ps, clip.y, clip.step, &mut rs).map_err(|v| {
-                    format!(
-                        "geometry {id}: the point ({}, {}) doesn't go to band {k}'s world",
-                        v[0], v[1]
-                    )
-                })?;
-                if !parts.is_empty() {
-                    wbox.push(parts.iter().fold(
+            for (id, parts) in project_band(geoms, k, band, clip, tolerance, threads, to_world)? {
+                wbox.push(parts.iter().fold(
+                    [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ],
+                    |a, p| {
                         [
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            f64::NEG_INFINITY,
-                            f64::NEG_INFINITY,
-                        ],
-                        |a, p| {
-                            [
-                                a[0].min(p.bx[0]),
-                                a[1].min(p.bx[1]),
-                                a[2].max(p.bx[2]),
-                                a[3].max(p.bx[3]),
-                            ]
-                        },
-                    ));
-                    world.push(parts);
-                    ids.push(id as i32);
-                }
+                            a[0].min(p.bx[0]),
+                            a[1].min(p.bx[1]),
+                            a[2].max(p.bx[2]),
+                            a[3].max(p.bx[3]),
+                        ]
+                    },
+                ));
+                world.push(parts);
+                ids.push(id as i32);
             }
             // each piece's polygons, filtered and shortened, the largest
             // pieces first
@@ -951,6 +1054,95 @@ impl MeshSet {
     }
 }
 
+/// The `to_world` of [`MeshSet::burn`] and [`MeshSet::burn_par`]: none,
+/// so each band projects on the calling thread.
+type Serial = fn(usize) -> Result<Box<dyn CrsTransform>, String>;
+
+/// Each geometry's polygons in band `k`'s world (`band`, `clip`), as
+/// [`project`] gives them, with the geometry's position: those with any
+/// parts, in order. On up to `threads` threads, each through its own
+/// transform from `to_world(k)`, built before its first polygon; with
+/// none, one thread or one polygon, on the calling thread through
+/// `band.to_world`. Err with the first polygon's (in order) that fails.
+fn project_band<F, T>(
+    geoms: &[Geometry],
+    k: usize,
+    band: &Band,
+    clip: &Clip,
+    tolerance: f64,
+    threads: usize,
+    to_world: Option<&F>,
+) -> Result<Vec<(usize, Vec<Part>)>, String>
+where
+    F: Fn(usize) -> Result<T, String> + Sync,
+    T: CrsTransform,
+{
+    let items: Vec<(usize, &Polygon)> = geoms
+        .iter()
+        .enumerate()
+        .flat_map(|(id, g)| {
+            let ps = match g {
+                Geometry::Polygon(p) => std::slice::from_ref(p),
+                Geometry::MultiPolygon(ps) => ps.as_slice(),
+                _ => &[],
+            };
+            ps.iter().map(move |p| (id, p))
+        })
+        .collect();
+    let options = Options::new(tolerance);
+    let projected: Result<Vec<Vec<Part>>, (usize, [f64; 2])> = match to_world {
+        Some(make) if threads > 1 && items.len() > 1 => {
+            // the most vertices first
+            let mut order: Vec<usize> = (0..items.len()).collect();
+            order.sort_by_key(|&i| {
+                std::cmp::Reverse(items[i].1.rings.iter().map(Vec::len).sum::<usize>())
+            });
+            let init = || {
+                let t = make(k).map_err(|e| format!("band {k}'s transform: {e}"))?;
+                let forward = from_fn(move |x: f64, y: f64| t.convert(x, y).map(|(a, b)| [a, b]));
+                Ok(Resampler::with_edge(forward, Planar::new(), &options))
+            };
+            let each = |rs: &mut Resampler<_, Planar>, i: usize| {
+                project(std::slice::from_ref(items[i].1), clip.y, clip.step, rs)
+            };
+            in_parallel_with(items.len(), &order, threads, init, each)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| r.map_err(|v| (i, v)))
+                .collect()
+        }
+        _ => {
+            let forward =
+                from_fn(|x: f64, y: f64| band.to_world.convert(x, y).map(|(a, b)| [a, b]));
+            let mut rs = Resampler::with_edge(forward, Planar::new(), &options);
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, (_, p))| {
+                    project(std::slice::from_ref(*p), clip.y, clip.step, &mut rs)
+                        .map_err(|v| (i, v))
+                })
+                .collect()
+        }
+    };
+    let projected = projected.map_err(|(i, v)| {
+        format!(
+            "geometry {}: the point ({}, {}) doesn't go to band {k}'s world",
+            items[i].0, v[0], v[1]
+        )
+    })?;
+    // each geometry's parts, its polygons' in order
+    let mut out: Vec<(usize, Vec<Part>)> = Vec::new();
+    for (&(id, _), parts) in items.iter().zip(projected) {
+        match out.last_mut() {
+            Some((last, all)) if *last == id => all.extend(parts),
+            _ => out.push((id, parts)),
+        }
+    }
+    out.retain(|(_, parts)| !parts.is_empty());
+    Ok(out)
+}
+
 /// `f` for each of `0..n` on up to `threads` threads, taking the items in
 /// turn in the order `order` (the costliest first, say): the results in
 /// item order. One thread, or one item, runs on the calling thread.
@@ -960,30 +1152,59 @@ fn in_parallel<T: Send>(
     threads: usize,
     f: impl Fn(usize) -> T + Sync,
 ) -> Result<Vec<T>, String> {
-    if threads <= 1 || n <= 1 {
-        return Ok((0..n).map(f).collect());
+    in_parallel_with(n, order, threads, || Ok(()), |_, i| f(i))
+}
+
+/// [`in_parallel`], each thread with state of its own, which needn't be
+/// [`Send`]: `init()` builds it on the thread, unless every item is taken
+/// by then, and `f(state, i)` does item `i`. A thread builds before it
+/// takes an item, so where building is slow the costliest items go to the
+/// threads that are ready. Err with an `init` error once the other
+/// threads have finished, or if a thread panicked.
+fn in_parallel_with<S, T: Send>(
+    n: usize,
+    order: &[usize],
+    threads: usize,
+    init: impl Fn() -> Result<S, String> + Sync,
+    f: impl Fn(&mut S, usize) -> T + Sync,
+) -> Result<Vec<T>, String> {
+    if n == 0 {
+        return Ok(Vec::new());
     }
-    let (next, f) = (AtomicUsize::new(0), &f);
+    if threads <= 1 || n == 1 {
+        let mut state = init()?;
+        return Ok((0..n).map(|i| f(&mut state, i)).collect());
+    }
+    let (next, init, f) = (AtomicUsize::new(0), &init, &f);
     let mut done: Vec<(usize, T)> = Vec::with_capacity(n);
+    let mut failed = None;
     let joined = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads.min(n))
             .map(|_| {
                 s.spawn(|| {
                     let mut out = Vec::new();
+                    if next.load(Ordering::Relaxed) >= n {
+                        return Ok(out);
+                    }
+                    let mut state = init()?;
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&i) = order.get(k) else {
-                            break out;
+                            break Ok(out);
                         };
-                        out.push((i, f(i)));
+                        out.push((i, f(&mut state, i)));
                     }
                 })
             })
             .collect();
         // every thread joined, so the scope has none left to panic over
         hs.into_iter().fold(true, |ok, h| match h.join() {
-            Ok(v) => {
+            Ok(Ok(v)) => {
                 done.extend(v);
+                ok
+            }
+            Ok(Err(e)) => {
+                failed.get_or_insert(e);
                 ok
             }
             Err(_) => false,
@@ -991,6 +1212,9 @@ fn in_parallel<T: Send>(
     });
     if !joined {
         return Err("a burn thread panicked".into());
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
     done.sort_by_key(|d| d.0);
     Ok(done.into_iter().map(|d| d.1).collect())
@@ -1793,8 +2017,13 @@ mod tests {
         ];
         let geoms = polygons();
         let opts = BurnOptions::coverage();
-        let whole = set.burn_with(&geoms, &bands, 1.0, opts, false, 1).unwrap();
-        let trimmed = set.burn_with(&geoms, &bands, 1.0, opts, true, 1).unwrap();
+        let serial = None::<&Serial>;
+        let whole = set
+            .burn_with(&geoms, &bands, 1.0, opts, false, 1, serial)
+            .unwrap();
+        let trimmed = set
+            .burn_with(&geoms, &bands, 1.0, opts, true, 1, serial)
+            .unwrap();
         assert!(whole.runs.len() + whole.edges.len() > 1000);
         assert_eq!(whole, trimmed);
     }
@@ -1834,8 +2063,9 @@ mod tests {
             (8, true),
             (3, false),
         ] {
+            let opts = BurnOptions::coverage();
             let par = set
-                .burn_with(&geoms, &bands, 1.0, BurnOptions::coverage(), trim, threads)
+                .burn_with(&geoms, &bands, 1.0, opts, trim, threads, None::<&Serial>)
                 .unwrap();
             assert_eq!(one, par, "{threads} threads, trim {trim}");
         }
@@ -1843,6 +2073,94 @@ mod tests {
         assert!(set
             .burn_par(&geoms, &bands, f64::NAN, BurnMode::Coverage, 4)
             .is_err());
+    }
+
+    /// Projected on the threads, each through a transform of its own, the
+    /// same burn record for record; the same first error; `to_world`
+    /// called once a band on each thread that projects, and not at all on
+    /// one thread.
+    #[test]
+    fn burn_par_with_is_burn() {
+        use std::sync::atomic::AtomicUsize;
+        let (set, south, north) = grid();
+        let bands = [
+            Band {
+                rows: 0..8,
+                to_world: &south,
+            },
+            Band {
+                rows: 8..16,
+                to_world: &north,
+            },
+        ];
+        let mut geoms = polygons();
+        geoms.push(Geometry::MultiPoint(
+            (0..50)
+                .map(|k| Coord {
+                    x: -175.0 + 7.0 * k as f64,
+                    y: -70.0 + 2.9 * k as f64,
+                })
+                .collect(),
+        ));
+        let one = set.burn(&geoms, &bands, 1.0, BurnMode::Coverage).unwrap();
+        let calls = AtomicUsize::new(0);
+        let laea = |k: usize| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Laea(if k == 0 { -1.0 } else { 1.0 }))
+        };
+        for (threads, trim) in [(0, true), (2, true), (3, true), (8, true), (3, false)] {
+            calls.store(0, Ordering::Relaxed);
+            let opts = BurnOptions::coverage();
+            let par = set
+                .burn_with(&geoms, &bands, 1.0, opts, trim, threads, Some(&laea))
+                .unwrap();
+            assert_eq!(one, par, "{threads} threads, trim {trim}");
+            let n = calls.load(Ordering::Relaxed);
+            if threads > 0 {
+                assert!(
+                    (2..=2 * threads).contains(&n),
+                    "{n} calls, {threads} threads"
+                );
+            }
+        }
+        // one thread: the bands' own transforms
+        let none = |_: usize| Err::<Laea, String>("not called".into());
+        let r = set.burn_par_with(&geoms, &bands, 1.0, BurnMode::Coverage, 1, none);
+        assert_eq!(r.unwrap(), one);
+        // an error from `to_world`
+        let r = set.burn_par_with(&geoms, &bands, 1.0, BurnMode::Coverage, 3, none);
+        assert_eq!(r.unwrap_err(), "band 0's transform: not called");
+        // points north of 85 N don't go to the north band: the first
+        // polygon to have one, as on one thread, though the polygons with
+        // the most vertices are projected first
+        struct Capped(Laea);
+        impl CrsTransform for Capped {
+            fn convert(&self, lon: f64, lat: f64) -> Option<(f64, f64)> {
+                (self.0 .0 < 0.0 || lat <= 85.0)
+                    .then(|| self.0.convert(lon, lat))
+                    .flatten()
+            }
+        }
+        let (south, north) = (Capped(Laea(-1.0)), Capped(Laea(1.0)));
+        let capped = [
+            Band {
+                rows: 0..8,
+                to_world: &south,
+            },
+            Band {
+                rows: 8..16,
+                to_world: &north,
+            },
+        ];
+        let geoms = &geoms[1..];
+        let serial = set.burn(geoms, &capped, 1.0, BurnMode::Coverage);
+        let e = serial.unwrap_err();
+        assert!(e.starts_with("geometry 1: "), "{e}");
+        for threads in [2, 8] {
+            let make = |k: usize| Ok(Capped(Laea(if k == 0 { -1.0 } else { 1.0 })));
+            let r = set.burn_par_with(geoms, &capped, 1.0, BurnMode::Coverage, threads, make);
+            assert_eq!(r.unwrap_err(), e, "{threads} threads");
+        }
     }
 
     /// Rings far from a strip lose their vertices there: one apart from it
