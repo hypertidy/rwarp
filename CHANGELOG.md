@@ -134,7 +134,11 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     - Checks: boxes on the analytic grid against closed-form areas, to
       8e-8. On eORCA1 and ORCA2 (scratch): a whole-world box covers
       every kept cell, and boxes agree with `weights_onto` to 8e-6.
-      Natural Earth's 10 m countries burn in 1 to 3 s.
+      Natural Earth's 10 m countries burn in 0.7 to 1.1 s.
+    - Each piece walks only what can reach it. Tiles mark where its cells
+      are, so polygons elsewhere are skipped and runs of edges away from
+      it cut short, with the same result bit for bit. On ORCA2 the
+      countries went from 3.0 s to 1.1 s.
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
 - `mesh::MeshTarget`: a `QuadMesh` as a warp target, for regridding onto

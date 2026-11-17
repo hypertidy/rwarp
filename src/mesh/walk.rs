@@ -732,8 +732,10 @@ impl QuadMesh {
             && p[1] <= r + 1.0 + WALL_EPS
     }
 
-    /// A point strictly inside the mesh, for winding tests.
-    fn interior_point(&self) -> Option<[f64; 2]> {
+    /// A point strictly inside the mesh, for winding tests (also
+    /// `MeshSet::burn`'s, which shortens rings without changing their
+    /// winding round it).
+    pub(super) fn interior_point(&self) -> Option<[f64; 2]> {
         self.cells.iter().find(|c| c.area2 != 0.0).map(|c| c.centre)
     }
 

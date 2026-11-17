@@ -11,7 +11,7 @@ use controlledburn::{
 
 use super::cf::{cf_corners, Halo};
 use super::period::range_of;
-use super::{bow_tie, shoelace2, CellMap, MeshTarget, MeshTransformer, QuadMesh};
+use super::{bow_tie, orient, shoelace2, CellMap, MeshTarget, MeshTransformer, QuadMesh};
 use crate::crs::CrsTransform;
 use crate::transform::Transformer;
 use crate::weights::{exact_weights, GridWindow, WeightOptions, Weights};
@@ -622,11 +622,20 @@ impl MeshSet {
     ///   it meets itself, within `1e-12` of its size, and the line taken
     ///   out before it is walked: a whole-world box becomes the circle of
     ///   its cut parallel, an Antarctica cut at one its coast and a hole.
-    /// - **Each piece** burns the polygons whose box in its world meets its
-    ///   own, as a [`QuadMesh`]; the pieces' records are merged, in
-    ///   controlledburn's order (by geometry, then row and column). Cells
-    ///   left out are never in them. Where bands meet, the gap between
-    ///   their cells (see the [type docs](MeshSet)) is burned onto no cell.
+    /// - **Each piece** burns, as a [`QuadMesh`], only what can reach it.
+    ///   A grid of tiles over its box in its world marks where its cells
+    ///   are, widened by a tile. A polygon whose box meets no marked tile is
+    ///   skipped. In the rest, each run of edges that can't reach the piece
+    ///   is cut short, and a ring that can't reach it at all is dropped or
+    ///   stood in for. The walk sees the same crossings and the same
+    ///   winding round its interior point, so the result is the same, bit
+    ///   for bit. A one-row piece round most of a latitude circle has a box
+    ///   the size of its band's disk, yet walks only the polygons' edges
+    ///   near it.
+    /// - **Merged.** The pieces' records are merged in controlledburn's
+    ///   order (by geometry, then row and column). Cells left out are never
+    ///   in them. Where bands meet, the gap between their cells (see the
+    ///   [type docs](MeshSet)) is burned onto no cell.
     /// - **Points** are found in the first piece (bands in order) whose
     ///   cell holds them, if any.
     ///
@@ -674,7 +683,19 @@ impl MeshSet {
         tolerance: f64,
         opts: impl Into<BurnOptions>,
     ) -> Result<BurnResult, String> {
-        let opts = opts.into();
+        self.burn_with(geoms, bands, tolerance, opts.into(), true)
+    }
+
+    /// [`MeshSet::burn`], with each piece's polygons filtered and their
+    /// rings shortened by its [`Tiles`] (`trim`), or burned whole.
+    fn burn_with(
+        &self,
+        geoms: &[Geometry],
+        bands: &[Band],
+        tolerance: f64,
+        opts: BurnOptions,
+        trim: bool,
+    ) -> Result<BurnResult, String> {
         if opts.mode != BurnMode::Coverage {
             return Err("only coverage mode is defined for a grid front end".into());
         }
@@ -717,27 +738,62 @@ impl MeshSet {
                     Geometry::MultiPolygon(ps) => ps.as_slice(),
                     _ => continue,
                 };
-                let (parts, bx) = project(ps, clip.y, clip.step, &mut rs).map_err(|v| {
+                let parts = project(ps, clip.y, clip.step, &mut rs).map_err(|v| {
                     format!(
                         "geometry {id}: the point ({}, {}) doesn't go to band {k}'s world",
                         v[0], v[1]
                     )
                 })?;
                 if !parts.is_empty() {
-                    world.push(Geometry::MultiPolygon(parts));
+                    wbox.push(parts.iter().fold(
+                        [
+                            f64::INFINITY,
+                            f64::INFINITY,
+                            f64::NEG_INFINITY,
+                            f64::NEG_INFINITY,
+                        ],
+                        |a, p| {
+                            [
+                                a[0].min(p.bx[0]),
+                                a[1].min(p.bx[1]),
+                                a[2].max(p.bx[2]),
+                                a[3].max(p.bx[3]),
+                            ]
+                        },
+                    ));
+                    world.push(parts);
                     ids.push(id as i32);
-                    wbox.push(bx);
                 }
             }
             for &i in &pieces {
                 let p = &self.pieces[i];
-                let sel: Vec<usize> = (0..world.len())
-                    .filter(|&g| meets(wbox[g], boxes[i]))
-                    .collect();
-                if sel.is_empty() {
+                // with no cell of any area, the walk has no point to wind round
+                let tiles = p
+                    .mesh
+                    .interior_point()
+                    .filter(|_| trim)
+                    .map(|p0| (Tiles::new(&p.mesh), p0));
+                let (mut sub, mut sel) = (Vec::new(), Vec::new());
+                for (g, parts) in world.iter().enumerate() {
+                    if !meets(wbox[g], boxes[i]) {
+                        continue;
+                    }
+                    let polys: Vec<Polygon> = match &tiles {
+                        None => parts.iter().map(Part::polygon).collect(),
+                        Some((t, p0)) => parts
+                            .iter()
+                            .filter(|q| meets(q.bx, boxes[i]) && t.meets(q.bx))
+                            .filter_map(|q| t.trim(q, *p0))
+                            .collect(),
+                    };
+                    if !polys.is_empty() {
+                        sub.push(Geometry::MultiPolygon(polys));
+                        sel.push(g);
+                    }
+                }
+                if sub.is_empty() {
                     continue;
                 }
-                let sub: Vec<Geometry> = sel.iter().map(|&g| world[g].clone()).collect();
                 let res = p.mesh.burn(&sub, opts)?;
                 let id = |j: i32| ids[sel[j as usize]];
                 let (dr, dc) = (p.row_off as i32, p.col_off as i32);
@@ -813,25 +869,42 @@ impl MeshSet {
     }
 }
 
+/// One polygon in a band's world: open rings, the outer first, and the
+/// box `[x0, y0, x1, y1]` of the outer ring.
+struct Part {
+    rings: Vec<Vec<[f64; 2]>>,
+    bx: [f64; 4],
+}
+
+impl Part {
+    /// The polygon whole, its rings closed as controlledburn takes them.
+    fn polygon(&self) -> Polygon {
+        Polygon {
+            rings: self.rings.iter().map(|r| close(r)).collect(),
+        }
+    }
+}
+
+/// Open ring `r` closed, as controlledburn's coordinates.
+fn close(r: &[[f64; 2]]) -> Vec<Coord> {
+    r.iter()
+        .chain(r.first())
+        .map(|p| Coord { x: p[0], y: p[1] })
+        .collect()
+}
+
 /// Polygons `ps` (in the bounds' coordinates) in a band's world: each
 /// ring cut to the band's y range `y`, densified (`step`, `rs`) and split
 /// where it meets itself; a part with its ring's turn keeps the ring's
-/// role (outer or hole), one with the other turn takes the other. With
-/// the box `[x0, y0, x1, y1]` of the outer rings. Err with a point that
-/// doesn't go to the world.
+/// role (outer or hole), one with the other turn takes the other. Err
+/// with a point that doesn't go to the world.
 fn project<T: ForwardBatch>(
     ps: &[Polygon],
     y: [f64; 2],
     step: f64,
     rs: &mut Resampler<T, Planar>,
-) -> Result<(Vec<Polygon>, [f64; 4]), [f64; 2]> {
+) -> Result<Vec<Part>, [f64; 2]> {
     let mut parts = Vec::with_capacity(ps.len());
-    let mut bx = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    ];
     for p in ps {
         let (mut outer, mut holes) = (Vec::new(), Vec::new());
         for (ri, r) in p.rings.iter().enumerate() {
@@ -852,17 +925,9 @@ fn project<T: ForwardBatch>(
                 }
             }
         }
-        for c in outer.iter().flat_map(|(r, _)| r) {
-            bx = [
-                bx[0].min(c[0]),
-                bx[1].min(c[1]),
-                bx[2].max(c[0]),
-                bx[3].max(c[1]),
-            ];
-        }
         parts.extend(assemble(outer, holes));
     }
-    Ok((parts, bx))
+    Ok(parts)
 }
 
 /// The box `[x0, y0, x1, y1]` of a mesh's corners.
@@ -1060,14 +1125,8 @@ fn split_touching(r: &[[f64; 2]]) -> Vec<(Vec<[f64; 2]>, f64)> {
 /// Polygons from outer rings (with their areas) and holes, each hole with
 /// the smallest outer ring round its first point; a hole round no outer
 /// ring is dropped. Rings closed, as controlledburn takes them.
-fn assemble(outer: Vec<(Vec<[f64; 2]>, f64)>, holes: Vec<Vec<[f64; 2]>>) -> Vec<Polygon> {
-    let close = |r: &[[f64; 2]]| -> Vec<Coord> {
-        r.iter()
-            .chain(r.first())
-            .map(|p| Coord { x: p[0], y: p[1] })
-            .collect()
-    };
-    let mut rings: Vec<Vec<Vec<Coord>>> = outer.iter().map(|(r, _)| vec![close(r)]).collect();
+fn assemble(outer: Vec<(Vec<[f64; 2]>, f64)>, holes: Vec<Vec<[f64; 2]>>) -> Vec<Part> {
+    let mut rings: Vec<Vec<Vec<[f64; 2]>>> = outer.iter().map(|(r, _)| vec![r.clone()]).collect();
     for h in holes {
         let at = if outer.len() == 1 {
             Some(0)
@@ -1077,10 +1136,238 @@ fn assemble(outer: Vec<(Vec<[f64; 2]>, f64)>, holes: Vec<Vec<[f64; 2]>>) -> Vec<
                 .min_by(|&i, &j| outer[i].1.total_cmp(&outer[j].1))
         };
         if let Some(i) = at {
-            rings[i].push(close(&h));
+            rings[i].push(h);
         }
     }
-    rings.into_iter().map(|rings| Polygon { rings }).collect()
+    rings
+        .into_iter()
+        .map(|rings| {
+            let bx = rings[0].iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |a, c| {
+                    [
+                        a[0].min(c[0]),
+                        a[1].min(c[1]),
+                        a[2].max(c[0]),
+                        a[3].max(c[1]),
+                    ]
+                },
+            );
+            Part { rings, bx }
+        })
+        .collect()
+}
+
+/// Tiles over a piece's box in its world, marking each tile that a cell's
+/// corners' box reaches, widened by a tile each way. A box or a segment
+/// that meets no marked tile can't meet the piece, and is a tile or more
+/// from every point of it. Held as a summed-area table.
+struct Tiles {
+    x0: f64,
+    y0: f64,
+    /// The tiles' side, in world units.
+    side: f64,
+    nx: usize,
+    ny: usize,
+    /// Marked tiles below and left of each tile corner, `(nx + 1) * (ny + 1)`.
+    sum: Vec<u32>,
+}
+
+impl Tiles {
+    /// Square tiles, twice as many along the box's longer side as the
+    /// piece has cells along its longer side (4 to 512), and one more all
+    /// round, so the widening fits.
+    fn new(m: &QuadMesh) -> Tiles {
+        let [x0, y0, x1, y1] = mesh_box(m);
+        let n = (2 * m.ncol().max(m.nrow())).clamp(4, 512);
+        let side = ((x1 - x0).max(y1 - y0) / n as f64).max(f64::MIN_POSITIVE);
+        let nx = (((x1 - x0) / side).ceil() as usize).clamp(1, n) + 2;
+        let ny = (((y1 - y0) / side).ceil() as usize).clamp(1, n) + 2;
+        let mut t = Tiles {
+            x0: x0 - side,
+            y0: y0 - side,
+            side,
+            nx,
+            ny,
+            sum: vec![0; (nx + 1) * (ny + 1)],
+        };
+        let mut mark = vec![false; nx * ny];
+        for r in 0..m.nrow() {
+            for c in 0..m.ncol() {
+                let q = m.corners(r, c);
+                let b = q.iter().fold(
+                    [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ],
+                    |a, p| {
+                        [
+                            a[0].min(p[0]),
+                            a[1].min(p[1]),
+                            a[2].max(p[0]),
+                            a[3].max(p[1]),
+                        ]
+                    },
+                );
+                let Some([i0, j0, i1, j1]) = t.range(b, 1) else {
+                    continue;
+                };
+                for j in j0..=j1 {
+                    mark[j * nx + i0..=j * nx + i1].fill(true);
+                }
+            }
+        }
+        let w = nx + 1;
+        for j in 0..ny {
+            for i in 0..nx {
+                t.sum[(j + 1) * w + i + 1] = t.sum[j * w + i + 1] + t.sum[(j + 1) * w + i]
+                    - t.sum[j * w + i]
+                    + mark[j * nx + i] as u32;
+            }
+        }
+        t
+    }
+
+    /// The tiles `[i0, j0, i1, j1]` (inclusive) that box `b` reaches,
+    /// widened by `grow` tiles each way, within the grid; `None` when it
+    /// misses the grid.
+    fn range(&self, b: [f64; 4], grow: i64) -> Option<[usize; 4]> {
+        let at = |v: f64, o: f64| ((v - o) / self.side).floor() as i64;
+        let (i0, i1) = (at(b[0], self.x0) - grow, at(b[2], self.x0) + grow);
+        let (j0, j1) = (at(b[1], self.y0) - grow, at(b[3], self.y0) + grow);
+        let (i0, i1) = (i0.max(0), i1.min(self.nx as i64 - 1));
+        let (j0, j1) = (j0.max(0), j1.min(self.ny as i64 - 1));
+        (i0 <= i1 && j0 <= j1).then_some([i0 as usize, j0 as usize, i1 as usize, j1 as usize])
+    }
+
+    /// Whether box `b` meets a marked tile.
+    fn meets(&self, b: [f64; 4]) -> bool {
+        let Some([i0, j0, i1, j1]) = self.range(b, 0) else {
+            return false;
+        };
+        let w = self.nx + 1;
+        let s = &self.sum;
+        s[(j1 + 1) * w + i1 + 1] + s[j0 * w + i0] > s[j0 * w + i1 + 1] + s[(j1 + 1) * w + i0]
+    }
+
+    /// Whether segment `a, b` can't meet the piece: its box meets no marked
+    /// tile.
+    fn apart(&self, a: [f64; 2], b: [f64; 2]) -> bool {
+        !self.meets([
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[0].max(b[0]),
+            a[1].max(b[1]),
+        ])
+    }
+
+    /// A ring round the whole grid, two tiles out: every side apart.
+    fn around(&self) -> Vec<[f64; 2]> {
+        let d = 2.0 * self.side;
+        let (x1, y1) = (
+            self.x0 + self.nx as f64 * self.side,
+            self.y0 + self.ny as f64 * self.side,
+        );
+        let (x0, y0) = (self.x0 - d, self.y0 - d);
+        let (x1, y1) = (x1 + d, y1 + d);
+        vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+
+    /// Part `q` as the piece's walk needs it, or `None` when its outer
+    /// ring is apart from the piece and doesn't hold it. Each ring's runs
+    /// of segments apart from the piece are shortened ([`Tiles::shorten`]);
+    /// a ring wholly apart is dropped if it doesn't wind round the piece
+    /// (a hole, then, that takes nothing) and is [`Tiles::around`] if it
+    /// does. The walk sees the same crossings and the same winding round
+    /// `p0`, its interior point, so it gives the same index rings.
+    fn trim(&self, q: &Part, p0: [f64; 2]) -> Option<Polygon> {
+        let mut rings = Vec::with_capacity(q.rings.len());
+        for (ri, r) in q.rings.iter().enumerate() {
+            let n = r.len();
+            let apart: Vec<bool> = (0..n).map(|k| self.apart(r[k], r[(k + 1) % n])).collect();
+            if apart.iter().all(|&a| a) {
+                let w: i64 = (0..n).map(|k| crossing(r[k], r[(k + 1) % n], p0)).sum();
+                if w != 0 {
+                    rings.push(close(&self.around()));
+                } else if ri == 0 {
+                    return None;
+                }
+                continue;
+            }
+            let mut keep = vec![true; n];
+            let mut k = 0;
+            while k < n {
+                if !apart[k] {
+                    k += 1;
+                    continue;
+                }
+                let a = k;
+                while k < n && apart[k] {
+                    k += 1;
+                }
+                // segments a..k, vertices a..=k (vertex n is vertex 0)
+                self.shorten(r, a, k, p0, &mut keep);
+            }
+            let kept: Vec<[f64; 2]> = r
+                .iter()
+                .zip(&keep)
+                .filter(|(_, &k)| k)
+                .map(|(p, _)| *p)
+                .collect();
+            rings.push(close(&kept));
+        }
+        Some(Polygon { rings })
+    }
+
+    /// Vertices `a..=b` of ring `r` (vertex `n` is vertex 0), joined by
+    /// segments apart from the piece: clear `keep` for those a shortcut
+    /// skips. Greedily, each shortcut runs as far as it can while it is
+    /// apart from the piece too, and closes a loop of winding 0 round
+    /// `p0` with the stretch it replaces. Being apart, the loop winds as
+    /// often round every point of the piece, and its crossings of `p0`'s
+    /// row are a tile or more from `p0`, so the walk's own winding test
+    /// counts them alike.
+    fn shorten(&self, r: &[[f64; 2]], a: usize, b: usize, p0: [f64; 2], keep: &mut [bool]) {
+        let n = r.len();
+        let v = |i: usize| r[i % n];
+        // crossings of the stretch from `a`, by its end vertex
+        let mut pre = vec![0i64; b - a + 1];
+        for i in a..b {
+            pre[i + 1 - a] = pre[i - a] + crossing(v(i), v(i + 1), p0);
+        }
+        let mut from = a;
+        let mut t = a + 2;
+        while t <= b {
+            let w = pre[t - a] - pre[from - a] + crossing(v(t), v(from), p0);
+            if w == 0 && self.apart(v(from), v(t)) {
+                t += 1;
+                continue;
+            }
+            // from -> t - 1 holds (as one segment it always does)
+            keep[from + 1..t - 1].fill(false);
+            from = t - 1;
+            t = from + 2;
+        }
+        keep[from + 1..b].fill(false);
+    }
+}
+
+/// Segment `a -> b`'s part in the winding number of a ring round `p`, as
+/// the walk counts it: an upward crossing of `p`'s row with `p` on its
+/// left is +1, a downward one with `p` on its right -1.
+fn crossing(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> i64 {
+    if a[1] <= p[1] {
+        i64::from(b[1] > p[1] && orient(a, b, p) > 0.0)
+    } else {
+        -i64::from(b[1] <= p[1] && orient(a, b, p) < 0.0)
+    }
 }
 
 /// Whether open ring `r` winds round point `p`.
@@ -1235,4 +1522,217 @@ fn overlaps(pieces: &[Piece]) -> Vec<((usize, usize), (usize, usize))> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const R: f64 = 6371229.0;
+
+    /// Longitude and latitude to polar LAEA: north for `1.0`, south for `-1.0`.
+    struct Laea(f64);
+    impl CrsTransform for Laea {
+        fn convert(&self, lon: f64, lat: f64) -> Option<(f64, f64)> {
+            let rho = 2.0 * R * ((90.0 - self.0 * lat).to_radians() / 2.0).sin();
+            let (s, c) = lon.to_radians().sin_cos();
+            Some((rho * s, -self.0 * rho * c))
+        }
+    }
+
+    /// A 36 x 16 grid of 10 degree cells from 80 S to 80 N, with one corner
+    /// moved well away inside a block of land: the cells round it are left
+    /// out, and the rows beside the hole are pieces of their own.
+    fn grid() -> (MeshSet, Laea, Laea) {
+        let (nc, nr) = (36, 16);
+        let corner = |j: usize, i: usize| {
+            let (x, y) = (10.0 * i as f64, -80.0 + 10.0 * j as f64);
+            if (j, i) == (12, 10) {
+                (x + 25.0, y + 3.0)
+            } else {
+                (x, y)
+            }
+        };
+        let (mut xb, mut yb) = (Vec::new(), Vec::new());
+        for j in 0..nr {
+            for i in 0..nc {
+                for (jj, ii) in [(j, i), (j, i + 1), (j + 1, i + 1), (j + 1, i)] {
+                    let (x, y) = corner(jj, ii);
+                    xb.push(x);
+                    yb.push(y);
+                }
+            }
+        }
+        let land: Vec<bool> = (0..nc * nr)
+            .map(|k| (10..14).contains(&(k / nc)) && (6..16).contains(&(k % nc)))
+            .collect();
+        let (south, north) = (Laea(-1.0), Laea(1.0));
+        let bands = [
+            Band {
+                rows: 0..8,
+                to_world: &south,
+            },
+            Band {
+                rows: 8..16,
+                to_world: &north,
+            },
+        ];
+        let set =
+            MeshSet::from_cf_bounds(nc, nr, &xb, &yb, Halo::NONE, &bands, Some(&land)).unwrap();
+        (set, south, north)
+    }
+
+    fn ring(pts: impl IntoIterator<Item = [f64; 2]>) -> Vec<Coord> {
+        let mut r: Vec<Coord> = pts
+            .into_iter()
+            .map(|p| Coord { x: p[0], y: p[1] })
+            .collect();
+        r.push(r[0]);
+        r
+    }
+
+    fn lonlat_box(x0: f64, x1: f64, y0: f64, y1: f64) -> Vec<Coord> {
+        ring([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+    }
+
+    /// A wobbly blob of `n` vertices round `(lon, lat)`, `r` degrees across,
+    /// anticlockwise (`dir` 1) or clockwise (-1).
+    fn blob(lon: f64, lat: f64, r: f64, n: usize, seed: f64, dir: f64) -> Vec<Coord> {
+        ring((0..n).map(|k| {
+            let a = dir * std::f64::consts::TAU * k as f64 / n as f64;
+            let rr = r * (1.0 + 0.3 * (5.0 * a + seed).sin() + 0.1 * (17.0 * a + 2.0 * seed).cos());
+            [
+                lon + rr * a.cos() / (lat.to_radians().cos().max(0.2)),
+                (lat + rr * a.sin()).clamp(-89.0, 89.0),
+            ]
+        }))
+    }
+
+    /// Polygons of every kind the trimming meets: blobs far from and across
+    /// the strips, with holes, round a pole, across 180, the whole world.
+    fn polygons() -> Vec<Geometry> {
+        let poly = |rings: Vec<Vec<Coord>>| Geometry::Polygon(Polygon::new(rings));
+        let mut g = vec![
+            poly(vec![lonlat_box(-180.0, 180.0, -90.0, 90.0)]),
+            poly(vec![lonlat_box(-180.0, 180.0, -90.0, -55.0)]),
+            poly(vec![
+                lonlat_box(-180.0, 180.0, 50.0, 90.0),
+                lonlat_box(-180.0, 180.0, 65.0, 90.0),
+            ]),
+            Geometry::MultiPolygon(vec![
+                Polygon::new(vec![lonlat_box(160.0, 180.0, -20.0, 45.0)]),
+                Polygon::new(vec![lonlat_box(-180.0, -150.0, -20.0, 45.0)]),
+            ]),
+            // a long thin sliver along a parallel, through the hole's rows
+            poly(vec![lonlat_box(-170.0, 170.0, 41.5, 43.5)]),
+        ];
+        let mut s = 1.0f64;
+        let mut next = || {
+            s = (s * 16807.0) % 2147483647.0;
+            s / 2147483647.0
+        };
+        for k in 0..60 {
+            let (lon, lat) = (-180.0 + 360.0 * next(), -75.0 + 150.0 * next());
+            let r = 2.0 + 35.0 * next() * next();
+            let n = 20 + (next() * 400.0) as usize;
+            let outer = blob(lon, lat, r, n, k as f64, 1.0);
+            g.push(if k % 3 == 0 {
+                poly(vec![
+                    outer,
+                    blob(lon, lat, 0.4 * r, n / 2 + 3, -(k as f64), -1.0),
+                ])
+            } else {
+                poly(vec![outer])
+            });
+        }
+        g
+    }
+
+    /// Filtering each piece's polygons and shortening their rings changes
+    /// nothing: the burn is the same, record for record and bit for bit.
+    #[test]
+    fn trimmed_burn_is_the_whole_burn() {
+        let (set, south, north) = grid();
+        assert!(set.pieces().iter().any(|p| p.mesh().nrow() == 1), "a strip");
+        let bands = [
+            Band {
+                rows: 0..8,
+                to_world: &south,
+            },
+            Band {
+                rows: 8..16,
+                to_world: &north,
+            },
+        ];
+        let geoms = polygons();
+        let opts = BurnOptions::coverage();
+        let whole = set.burn_with(&geoms, &bands, 1.0, opts, false).unwrap();
+        let trimmed = set.burn_with(&geoms, &bands, 1.0, opts, true).unwrap();
+        assert!(whole.runs.len() + whole.edges.len() > 1000);
+        assert_eq!(whole, trimmed);
+    }
+
+    /// Rings far from a strip lose their vertices there: one apart from it
+    /// is gone, one round it is the tiles' ring, and one across it keeps
+    /// only what is near it and a few shortcuts.
+    #[test]
+    fn trimming_drops_what_is_far() {
+        let (set, _south, north) = grid();
+        let p = set
+            .pieces()
+            .iter()
+            .filter(|p| p.world() == 1 && p.mesh().nrow() == 1)
+            .max_by_key(|p| p.mesh().ncol())
+            .unwrap();
+        let tiles = Tiles::new(&p.mesh);
+        let p0 = p.mesh.interior_point().unwrap();
+        let project = |r: &[Coord]| -> Vec<[f64; 2]> {
+            r[..r.len() - 1]
+                .iter()
+                .map(|c| {
+                    let (x, y) = north.convert(c.x, c.y).unwrap();
+                    [x, y]
+                })
+                .collect()
+        };
+        let part = |r: Vec<[f64; 2]>| {
+            let bx = r.iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |a, c| {
+                    [
+                        a[0].min(c[0]),
+                        a[1].min(c[1]),
+                        a[2].max(c[0]),
+                        a[3].max(c[1]),
+                    ]
+                },
+            );
+            Part { rings: vec![r], bx }
+        };
+        let lat = {
+            let [x, y] = p.mesh.corners(0, 0)[0];
+            90.0 - 2.0 * (x.hypot(y) / (2.0 * R)).asin().to_degrees()
+        };
+        // a dense circle well north of the strip: apart, and round nothing
+        let circle = |l: f64| project(&ring((0..2000).map(|k| [-180.0 + 0.18 * k as f64, l])));
+        assert!(tiles.trim(&part(circle(lat + 25.0)), p0).is_none());
+        // a dense circle well south of it: round it
+        let round = tiles.trim(&part(circle(lat - 25.0)), p0).unwrap();
+        assert_eq!(round.rings[0].len(), 5);
+        // a dense ring across it: most of its vertices are far
+        let across: Vec<[f64; 2]> = circle(lat + 25.0)
+            .into_iter()
+            .take(1000)
+            .chain(circle(lat - 25.0).into_iter().take(1000).rev())
+            .collect();
+        let n = across.len();
+        let t = tiles.trim(&part(across), p0).unwrap();
+        eprintln!("across the strip: {n} vertices, {} kept", t.rings[0].len());
+        assert!(t.rings[0].len() < n / 4, "{} of {n}", t.rings[0].len());
+    }
 }
