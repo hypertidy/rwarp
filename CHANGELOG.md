@@ -144,8 +144,16 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       their polygons in parallel. Projection stays on the calling
       thread, since a band's transform needn't be thread-safe. On 8
       threads ORCA2's countries take 0.44 s.
+    - `MeshSet::burn_par_with(geoms, bands, tolerance, opts, threads,
+      to_world)` projects on the threads too: each thread builds its
+      own copy of band `k`'s transform with `to_world(k)`. The records
+      are the same again. On 8 threads ORCA2's countries take 0.18 s at
+      1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `CrsTransform` for `Box<C>` and `&C` (`C: CrsTransform + ?Sized`), so
+  `crs_pair`'s boxed transforms go where a `T: CrsTransform` is asked
+  for, such as `MeshSet::burn_par_with`'s `to_world`.
 - `mesh::MeshTarget`: a `QuadMesh` as a warp target, for regridding onto
   a curvilinear grid given by its corners, such as an ocean model's
   tripolar grid (stage 4f of `design/curvilinear-frontend.md`, #37).

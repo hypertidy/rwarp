@@ -37,6 +37,20 @@ pub trait CrsTransform {
     fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)>;
 }
 
+/// A boxed transform, such as one from [`crs_pair`], is a transform.
+impl<C: CrsTransform + ?Sized> CrsTransform for Box<C> {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        (**self).convert(x, y)
+    }
+}
+
+/// A borrowed transform is a transform.
+impl<C: CrsTransform + ?Sized> CrsTransform for &C {
+    fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        (**self).convert(x, y)
+    }
+}
+
 /// Add `+type=crs` to a bare proj string so PROJ treats it as a CRS rather
 /// than an operation. Not needed for `proj4rs`, which ignores unknown keys.
 #[cfg_attr(not(feature = "proj"), allow(dead_code))]

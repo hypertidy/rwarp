@@ -428,6 +428,7 @@ On the same files (scratch), at a tolerance of 1 m:
 | Five boxes on 1° lines (Arctic, Antarctic, across 180°, across 20 S), against `weights_onto` from a 1° indicator at densify 64 | 8e-6 | 6e-6 |
 | Natural Earth 10 m countries (258, 548k vertices) | 0.74 s | 1.1 s |
 | The same with `burn_par` on 8 threads | 0.40 s | 0.44 s |
+| The same with `burn_par_with` on 8 threads | 0.15 s | 0.18 s |
 
 The comparison is two separate walks: a polygon into the mesh's index
 space, and each cell's outline into the source's pixels. On a 30° wide
@@ -449,6 +450,23 @@ polygons in parallel. Projecting into each band stays on the calling
 thread, since a libproj transform can't be shared between threads. That
 is the floor: about 0.3 s for the countries at 1 m, and 1.6 s at
 0.01 m, where 8 threads take ORCA2 from 5.6 s to 2.2 s.
+
+`MeshSet::burn_par_with(geoms, bands, tolerance, opts, threads,
+to_world)` projects on the threads too, each through a transform of its
+own. `to_world(k)` builds band `k`'s, the same as `bands[k].to_world`:
+
+```rust,ignore
+let lonlat = "+proj=longlat +R=6371229";
+let laea = ["+proj=laea +lat_0=-90 +R=6371229", "+proj=laea +lat_0=90 +R=6371229"];
+let to_world = |k: usize| rwarp::crs::crs_pair(lonlat, laea[k]).map(|(_, f)| f);
+let r = set.burn_par_with(&countries, &bands, 1.0, BurnMode::Coverage, 8, to_world)?;
+```
+
+The records are the same again. On 8 threads ORCA2 takes 0.92 s at
+0.01 m. A libproj transform takes about 5 ms to build, and many threads
+building at once slow each other down, so on a light burn the most
+threads isn't always fastest. For the countries at 1 m through libproj,
+16 threads took 0.20 s and 32 took 0.31 s.
 
 ### Overlapping swaths
 
