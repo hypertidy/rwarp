@@ -9,10 +9,11 @@
 //! each cell's world area. Parts outside the grid map outside it, where
 //! controlledburn ignores them, so no boundary closure is needed.
 
-use controlledburn::{BurnOptions, BurnResult, CoverageWindow, Geometry};
+use controlledburn::{BurnMode, BurnOptions, BurnResult, CoverageWindow, Geometry};
 
 use super::walk::{burn_with, cover_rings, turn_shifts};
-use super::Period;
+use super::{reproject, Period};
+use crate::crs::CrsTransform;
 
 /// A rectilinear grid by its edges: `x` has `ncol + 1` values, `y` has
 /// `nrow + 1`, row 0 between `y[0]` and `y[1]`.
@@ -205,6 +206,42 @@ impl Rectilinear {
             &|r| Ok(self.ring_to_index(r)),
             &|p, _| self.cell(p),
         )
+    }
+
+    /// [`Rectilinear::burn`] for polygons and points in another CRS, as
+    /// [`QuadMesh::burn_from`](super::QuadMesh::burn_from): `to_world`
+    /// takes them to the grid's world, `from_world` takes the grid's
+    /// vertices back, and edges straight in the geometries' CRS are
+    /// densified to `tolerance` in world units.
+    pub fn burn_from(
+        &self,
+        geoms: &[Geometry],
+        to_world: &dyn CrsTransform,
+        from_world: &dyn CrsTransform,
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+    ) -> Result<BurnResult, String> {
+        self.burn_from_par(geoms, to_world, from_world, tolerance, opts, 1)
+    }
+
+    /// [`Rectilinear::burn_from`] with the burn on up to `threads`
+    /// threads, as [`QuadMesh::burn_from_par`](super::QuadMesh::burn_from_par).
+    pub fn burn_from_par(
+        &self,
+        geoms: &[Geometry],
+        to_world: &dyn CrsTransform,
+        from_world: &dyn CrsTransform,
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+        threads: usize,
+    ) -> Result<BurnResult, String> {
+        let opts = opts.into();
+        if opts.mode != BurnMode::Coverage {
+            return Err("only coverage mode is defined for a grid front end".into());
+        }
+        let reach = reproject::reach(self.ncol(), self.nrow(), |j, i| [self.x[i], self.y[j]], from_world)?;
+        let world = reproject::to_world(geoms, to_world, reach, tolerance, self.period())?;
+        self.burn_par(&world, opts, threads)
     }
 
     /// Exact coverage of one small world ring through a reused

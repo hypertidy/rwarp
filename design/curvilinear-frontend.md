@@ -1261,7 +1261,9 @@ one space and used in another:
   (planar, or great circle for longitude and latitude), forward map = CRS
   transform then the grid's world-to-index, tolerance in cells (1e-3, a
   unit that is the same for every grid). Then walk the densified ring as
-  above. Exact to the tolerance.
+  above. Exact to the tolerance. Built as 5b, below, with planar edges
+  and the tolerance in world units, densifying into the world (where the
+  walk is exact) rather than into index space.
 - **The exact footprint.** Destination pixel edges, straight in
   destination pixel space, into source space: the hybrid in the bigcurve
   follow-up (transform the lattice at densify 1 as scanlines, refine only
@@ -1334,6 +1336,50 @@ built on it (`MeshSet::weights_to`, `weights_onto` and their threads), in
   come as a scanline, which `ApproxTransformer` interpolates, so
   refinement below its error follows the interpolation. The docs say to
   use the exact transformer or a tolerance above its error.
+
+### Polygons in another CRS (built, 5b)
+
+`QuadMesh::burn_from(geoms, to_world, from_world, tolerance, opts)` and
+`Rectilinear::burn_from` (and `_par`, the burn on threads), in
+`src/mesh/reproject.rs`. They take a band's path of `MeshSet::burn`
+(4h) for one grid:
+
+- **Where the grid is in the polygons' CRS.** `from_world` takes the
+  grid's vertices back. Their y range, widened by the tallest cell
+  each way, is the cut, and the tallest cell's height is the first
+  cut's step, as a band's `Clip` is built from its bounds. A set has
+  its cells' bounds in the polygons' coordinates already. A single
+  grid has only its world, so the inverse is asked for (`crs_pair(grid,
+  geoms)` gives both). Vertices that don't go back are left out of
+  the cut. A grid none of whose cells go back is refused.
+- **Then as a band:** each ring cut to that y range, its edges cut at
+  the step from their lexicographically smaller end, densified by
+  bigcurve (planar edges, tolerance in world units), and split where it
+  meets itself (`project`, shared with the set). Points are taken
+  directly. Those beyond the y range, or that don't go, are on no cell.
+- **A declared period** (a grid in longitude and latitude): `project`
+  now unwraps each densified ring by it, each point to within half a
+  period of the one before, before its turn is taken. A ring that then
+  doesn't close went round a pole of the world, and is refused. A set's
+  bands have no period, so they pass none.
+- **Edges are planar** in the polygons' CRS, as on a set. Great-circle
+  polygon edges would need the cut at a parallel to follow the great
+  circle (Sutherland and Hodgman interpolates linearly) and a first cut
+  along it. They are left for later.
+- **Measured** (`tests/burn_from.rs`, the tripolar cap in a polar LAEA
+  on the sphere, from longitude and latitude). The cap north of 70 N
+  is short of `2 pi R^2 (1 - sin 70)` by 0.21 to 0.58 of the tolerance
+  times its circle's length from 100 m to 1 cm. The chords' slivers
+  predict a sixth to two thirds. The points go from 1028 to 113804,
+  tolerance to the power -0.511. A circle bisects evenly, so they double
+  or quadruple from one tolerance to the next. A box at 1 cm gives what
+  its edges cut into 4096 pieces give, to 1.8e-7 (the fractions are
+  `f32`), and is within 1.7e-9 of its closed-form area. The whole world
+  covers every cell in full, and the south nothing. A box across 180 is
+  the box split at it, to 4e-8 of its area. On a 10 degree lon/lat grid
+  with a period, a LAEA polygon across the antimeridian burns as its
+  copy turned 180 degrees, 18 columns over, bit for bit. A `Rectilinear`
+  in LAEA is its `QuadMesh`.
 
 ## 6. Duality with the exact footprint
 
@@ -1491,7 +1537,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
 | 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too, the filter by chunk boxes (4h, built); a set as a warp source, `SetTransformer`, outlines walked onto pieces in several worlds (4i, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
-| 5 | adaptive footprint edges, `Footprint::Adaptive` and `WeightOptions::refine_tolerance` (5a, built); reprojected polygons onto a `QuadMesh` (5b) | the error follows the tolerance, the points grow as its inverse square root, a fine tolerance is a fine densify; affine adds nothing; tiles, threads, `warp()` = `apply`; the seam, the pole, a mesh source, a set (5a, built) |
+| 5 | adaptive footprint edges, `Footprint::Adaptive` and `WeightOptions::refine_tolerance` (5a, built); polygons in another CRS onto a `QuadMesh` or `Rectilinear`, `burn_from` (5b, built) | the error follows the tolerance, the points grow as its inverse square root, a fine tolerance is a fine densify; affine adds nothing; tiles, threads, `warp()` = `apply`; the seam, the pole, a mesh source, a set (5a, built); the cap's area against the closed form at the tolerance's rate, the points as its inverse square root, a fine tolerance = densify 4096; identity = `burn`; the far pole; 180; points; a period; `Rectilinear` = `QuadMesh` (5b, built) |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 
 ## Decisions for the maintainer

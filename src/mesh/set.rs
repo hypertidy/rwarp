@@ -1588,6 +1588,11 @@ where
         })
         .collect();
     let options = Options::new(tolerance);
+    // without a period, a ring always closes
+    let failed = |e: Project| match e {
+        Project::Failed(v) => v,
+        Project::Unclosed => [f64::NAN; 2],
+    };
     let projected: Result<Vec<Vec<Part>>, (usize, [f64; 2])> = match to_world {
         Some(make) if threads > 1 && items.len() > 1 => {
             // the most vertices first
@@ -1601,7 +1606,7 @@ where
                 Ok(Resampler::with_edge(forward, Planar::new(), &options))
             };
             let each = |rs: &mut Resampler<_, Planar>, i: usize| {
-                project(std::slice::from_ref(items[i].1), clip.y, clip.step, rs)
+                project(std::slice::from_ref(items[i].1), clip.y, clip.step, None, rs).map_err(failed)
             };
             in_parallel_with(items.len(), &order, threads, init, each)?
                 .into_iter()
@@ -1617,8 +1622,8 @@ where
                 .iter()
                 .enumerate()
                 .map(|(i, (_, p))| {
-                    project(std::slice::from_ref(*p), clip.y, clip.step, &mut rs)
-                        .map_err(|v| (i, v))
+                    project(std::slice::from_ref(*p), clip.y, clip.step, None, &mut rs)
+                        .map_err(|e| (i, failed(e)))
                 })
                 .collect()
         }
@@ -1720,7 +1725,7 @@ fn in_parallel_with<S, T: Send>(
 
 /// One polygon in a band's world: open rings, the outer first, the box
 /// `[x0, y0, x1, y1]` of the outer ring, and each ring's chunk boxes.
-struct Part {
+pub(super) struct Part {
     rings: Vec<Vec<[f64; 2]>>,
     bx: [f64; 4],
     /// For each ring, the box of each [`CHUNK`] segments' ends in turn
@@ -1772,7 +1777,7 @@ impl Part {
     }
 
     /// The polygon whole, its rings closed as controlledburn takes them.
-    fn polygon(&self) -> Polygon {
+    pub(super) fn polygon(&self) -> Polygon {
         Polygon {
             rings: self.rings.iter().map(|r| close(r)).collect(),
         }
@@ -1792,12 +1797,18 @@ fn close(r: &[[f64; 2]]) -> Vec<Coord> {
 /// where it meets itself; a part with its ring's turn keeps the ring's
 /// role (outer or hole), one with the other turn takes the other. Err
 /// with a point that doesn't go to the world.
-fn project<T: ForwardBatch>(
+///
+/// With a `period` of world x, each densified ring is unwrapped first:
+/// each point moved by whole periods to within half a period of the one
+/// before. [`Project::Unclosed`] for a ring that then doesn't close (it
+/// goes round a pole of the world).
+pub(super) fn project<T: ForwardBatch>(
     ps: &[Polygon],
     y: [f64; 2],
     step: f64,
+    period: Option<f64>,
     rs: &mut Resampler<T, Planar>,
-) -> Result<Vec<Part>, [f64; 2]> {
+) -> Result<Vec<Part>, Project> {
     let mut parts = Vec::with_capacity(ps.len());
     for p in ps {
         let (mut outer, mut holes) = (Vec::new(), Vec::new());
@@ -1809,7 +1820,10 @@ fn project<T: ForwardBatch>(
                 }
                 continue;
             }
-            let wr = densify(rs, &cut, step)?;
+            let mut wr = densify(rs, &cut, step).map_err(Project::Failed)?;
+            if let Some(p) = period {
+                unwrap_ring(&mut wr, p)?;
+            }
             let turn = signed_area(&wr);
             for (part, a) in split_touching(&wr) {
                 if (ri == 0) == ((a > 0.0) == (turn > 0.0)) {
@@ -1822,6 +1836,31 @@ fn project<T: ForwardBatch>(
         parts.extend(assemble(outer, holes));
     }
     Ok(parts)
+}
+
+/// Why [`project`] couldn't take a polygon to a world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Project {
+    /// This point (in the polygon's coordinates) doesn't go to the world.
+    Failed([f64; 2]),
+    /// A ring, unwrapped by the world's period, doesn't close.
+    Unclosed,
+}
+
+/// Open ring `r` unwrapped by `period`: each point moved by whole periods
+/// to within half a period of the one before. Err when the closing edge
+/// is then more than half a period long: the ring went round.
+fn unwrap_ring(r: &mut [[f64; 2]], period: f64) -> Result<(), Project> {
+    for k in 1..r.len() {
+        let d = r[k][0] - r[k - 1][0];
+        if d.abs() > 0.5 * period {
+            r[k][0] -= (d / period).round() * period;
+        }
+    }
+    match (r.first(), r.last()) {
+        (Some(a), Some(b)) if (a[0] - b[0]).abs() > 0.5 * period => Err(Project::Unclosed),
+        _ => Ok(()),
+    }
 }
 
 /// The box `[x0, y0, x1, y1]` of a mesh's corners.

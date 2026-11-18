@@ -19,6 +19,16 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   `Exact { densify }`'s bit for bit. Tiles, threads and `warp()` against
   `apply` agree bit for bit as before. `Footprint` is `non_exhaustive`,
   so the new variant is not breaking.
+- `QuadMesh::burn_from` and `Rectilinear::burn_from` (and `_par`):
+  polygons and points in another CRS, their edges straight there,
+  densified into the grid's world by bigcurve to a tolerance in world
+  units (curvilinear stage 5b, #38). Each edge is first cut at the grid's
+  tallest cell, and the polygons are cut to the grid's y range in their
+  CRS, as `MeshSet::burn` does for a band, so a polygon round the far pole
+  doesn't come out inside out. With a declared period, rings are
+  unwrapped across the seam, and one round a pole is refused. The area
+  burned converges on the closed form at the tolerance's rate, with the
+  points growing as its inverse square root.
 
 ### Fixed
 
