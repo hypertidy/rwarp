@@ -426,7 +426,7 @@ On the same files (scratch), at a tolerance of 1 m:
 |---|---|---|
 | A whole-world box | every cell kept covered in full | the same |
 | Five boxes on 1° lines (Arctic, Antarctic, across 180°, across 20 S), against `weights_onto` from a 1° indicator at densify 64 | 8e-6 | 6e-6 |
-| Natural Earth 10 m countries (258, 548k vertices) | 0.74 s | 1.1 s |
+| Natural Earth 10 m countries (258, 548k vertices) | 0.70 s | 0.96 s |
 | The same with `burn_par` on 8 threads | 0.40 s | 0.44 s |
 | The same with `burn_par_with` on 8 threads | 0.15 s | 0.18 s |
 
@@ -439,9 +439,10 @@ Antarctica lands only in the south band.
 Each piece walks only what can reach it. A one-row piece round most of
 a latitude circle has a box the size of its band's disk. A grid of tiles
 marks where its cells are, so polygons elsewhere are skipped, and long
-runs of edges away from it are cut short. That doesn't change the
-result: the walk sees the same crossings and the same winding round its
-interior point. What's left of the time is projecting the polygons and
+runs of edges away from it are cut short, 32 edges at a time where
+their box is away from it. That doesn't change the result: the walk
+sees the same crossings and the same winding round its interior
+point. What's left of the time is projecting the polygons and
 walking the edges that are near.
 
 `MeshSet::burn_par(geoms, bands, tolerance, opts, threads)` gives the

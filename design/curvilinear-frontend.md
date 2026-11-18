@@ -945,12 +945,52 @@ for a strip of 140 cells, 3.1 s in all for the countries.
     #85's at 1 m and 0.01 m. Times on eORCA1: 1.0 s to 0.74 s (6.0 to
     3.8 s at 0.01 m). On ORCA2: 3.0 s to 1.1 s (15.1 to 5.5 s).
 - **What's left** on ORCA2's north band at 1 m:
-  - projecting the polygons, 0.26 s;
+  - projecting the polygons, 0.26 s (on the threads since
+    `burn_par_with`);
   - the filter's scans, 0.23 s, one tile test per segment per piece
-    near it (chunks of a ring with one box each could skip most);
+    near it (0.05 s with chunk boxes, below);
   - walking the edges near pieces, 0.53 s: about 1M vertices, against
     546k projected, since neighbouring strips each walk the edges beside
     them.
+
+### Chunk boxes in the filter (built, 4h follow-up)
+
+Built (2026-11-18). The filter tested every segment of a part that
+reached a piece, and again every vertex of a far run for its shortcuts:
+0.23 s of ORCA2's north band at 1 m on one thread, 1.18 s at 0.01 m.
+
+- **Chunks.** Each ring, once projected, carries the box of each 32
+  segments in turn (`Part::chunks`, both ends of each segment in it),
+  shared by every piece of the band.
+- **Apart at once.** A chunk whose box meets no marked tile has every
+  segment apart: a segment's box lies in its chunk's, and a smaller box
+  reaches fewer tiles. Only the segments of chunks that meet a marked
+  tile are tested one by one, and a run is found by passing far chunks
+  whole.
+- **Shortcuts a chunk ahead.** In a run, a shortcut first tries a whole
+  chunk ahead, then one vertex at a time to that chunk's end if that
+  fails. A chunk's crossings of `p0`'s row are none when its box is all
+  above or all below the row (the walk counts a crossing only for a
+  segment whose ends' y straddle it), so the loop's winding costs a
+  test a chunk there. A ring wholly apart gets its winding the same way.
+  Each shortcut kept is still apart from the piece and closes a loop of
+  winding 0 round `p0`, so the walk's index rings are the same. Which
+  vertices are kept changes a little (ORCA2 at 1 m walks 995,430
+  vertices, 995,469 before).
+- **Chunk size.** 16 to 128 segments gave 0.044 to 0.050 s of filter on
+  ORCA2 at 1 m, and 8 gave 0.059 s. 32 is kept.
+- **Checks.** The unit test that the trimmed burn is the whole burn
+  (the 65 polygons on the damaged two-band grid) passes unchanged, and
+  the strip's 2000-vertex ring still keeps 14. The Natural Earth 10 m
+  countries hash the same as main's on eORCA1 and ORCA2, at 1 m and
+  0.01 m.
+- **On one thread** (scratch): the filter on ORCA2's north band 0.23 s to
+  0.05 s at 1 m and 1.18 to 0.16 s at 0.01 m; eORCA1's south band 0.39
+  to 0.03 s at 0.01 m. ORCA2's countries 1.1 s to 0.96 s at 1 m and 5.6
+  to 4.6 s at 0.01 m. On 8 threads with `burn_par_with`, 0.92 s to
+  0.79 s at 0.01 m.
+- **What's left** is the walk itself: neighbouring strips each walk the
+  edges near them, about 1M vertices at 1 m on ORCA2 for 546k projected.
 
 ### The exact footprint at the antimeridian
 
@@ -1221,7 +1261,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too (4h, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too, the filter by chunk boxes (4h, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 
