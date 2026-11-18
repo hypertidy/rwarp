@@ -26,8 +26,12 @@ use super::{orient, CellMap, QuadMesh};
 ///   ground in pairs. At an F-point pivot (ORCA1, eORCA1) the fold is the
 ///   top side of that row, and nothing more is needed.
 ///
-/// [`Halo::NEMO_F_PIVOT`] and [`Halo::NEMO_T_PIVOT`] say so. With either,
-/// cell `(row, col)` of the mesh is cell `(row + 1, col)` of the file.
+/// [`Halo::NEMO_F_PIVOT`] and [`Halo::NEMO_T_PIVOT`] say so for the T
+/// cells. The cells round the grid's other points ([`Stagger`]: U cells,
+/// whose corners are V points, V cells, whose corners are U points, and F
+/// cells, whose corners are T points) meet the fold elsewhere, and
+/// [`Halo::nemo`] gives each its halo. With any of them, cell `(row, col)`
+/// of the mesh is cell `(row + 1, col)` of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Halo {
     /// Columns dropped at the start (`cols[0]`) and at the end (`cols[1]`).
@@ -43,6 +47,31 @@ pub struct Halo {
     /// value to both (a halo-exchanged field has it in both already); its
     /// model area is the sum of the two mesh cells' areas.
     pub fold_through_centres: bool,
+    /// The NEMO grid the cells are of, if they are: for
+    /// [`MeshSet::fill_halo`](crate::mesh::MeshSet::fill_halo), and to
+    /// pair a fold row's halves by NEMO's mirror.
+    pub nemo: Option<Nemo>,
+}
+
+/// A NEMO ORCA grid's cells: the point the north fold pivots on, and the
+/// points the cells are round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nemo {
+    /// The point the fold pivots on.
+    pub pivot: Pivot,
+    /// The points the cells are round (T for the file's T cells).
+    pub cells: Stagger,
+}
+
+/// The point a NEMO ORCA grid's north fold pivots on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pivot {
+    /// A T point (ORCA2): the fold runs through T points, along the
+    /// second-to-last row of T cells.
+    T,
+    /// An F point (ORCA1, eORCA1, ORCA025): the fold runs through F
+    /// points, along the top side of the second-to-last row of T cells.
+    F,
 }
 
 impl Halo {
@@ -51,24 +80,46 @@ impl Halo {
         cols: [0, 0],
         rows: [0, 0],
         fold_through_centres: false,
+        nemo: None,
     };
 
-    /// A NEMO ORCA grid whose north fold pivots on an F point (eORCA1,
-    /// ORCA1): the last two columns, the first row, and the last row.
-    pub const NEMO_F_PIVOT: Halo = Halo {
-        cols: [0, 2],
-        rows: [1, 1],
-        fold_through_centres: false,
-    };
+    /// A NEMO ORCA grid's T cells, its north fold pivoting on an F point
+    /// (eORCA1, ORCA1): the last two columns, the first row, and the last
+    /// row. [`Halo::nemo`] with [`Pivot::F`] and [`Stagger::T`].
+    pub const NEMO_F_PIVOT: Halo = Halo::nemo(Pivot::F, Stagger::T);
 
-    /// A NEMO ORCA grid whose north fold pivots on a T point (ORCA2): as
-    /// [`Halo::NEMO_F_PIVOT`], and the fold runs through the centres of
-    /// the last row left.
-    pub const NEMO_T_PIVOT: Halo = Halo {
-        cols: [0, 2],
-        rows: [1, 1],
-        fold_through_centres: true,
-    };
+    /// A NEMO ORCA grid's T cells, its north fold pivoting on a T point
+    /// (ORCA2): as [`Halo::NEMO_F_PIVOT`], and the fold runs through the
+    /// centres of the last row left. [`Halo::nemo`] with [`Pivot::T`] and
+    /// [`Stagger::T`].
+    pub const NEMO_T_PIVOT: Halo = Halo::nemo(Pivot::T, Stagger::T);
+
+    /// The halo of a NEMO ORCA grid's cells round its `cells` points, its
+    /// north fold pivoting on `pivot`: the last two columns, the first
+    /// row, and the rows the fold copies,
+    ///
+    /// | cells | F-point pivot | T-point pivot |
+    /// |-------|---------------|---------------|
+    /// | T, U  | the last | the last, and the fold runs through the centres of the row below |
+    /// | V, F  | the last, and the fold runs through the centres of the row below | the last two |
+    ///
+    /// Where the fold runs through a row's centres, its cells pair with
+    /// NEMO's mirror (column `i` with `nx - i` for T cells, `nx - 1 - i`
+    /// for U and V cells, `nx - 2 - i` for F cells, `nx` the file's
+    /// columns, on the cyclic columns past either end).
+    pub const fn nemo(pivot: Pivot, cells: Stagger) -> Halo {
+        let two = matches!((pivot, cells), (Pivot::T, Stagger::V | Stagger::F));
+        let centres = matches!(
+            (pivot, cells),
+            (Pivot::T, Stagger::T | Stagger::U) | (Pivot::F, Stagger::V | Stagger::F)
+        );
+        Halo {
+            cols: [0, 2],
+            rows: [1, if two { 2 } else { 1 }],
+            fold_through_centres: centres,
+            nemo: Some(Nemo { pivot, cells }),
+        }
+    }
 }
 
 /// Where a field's values sit on NEMO's grid (an Arakawa C grid), for
@@ -161,7 +212,8 @@ impl QuadMesh {
                 b.0 + r0,
                 b.1 + c0,
                 if last && !halo.fold_through_centres {
-                    ": the last row mirrors itself, as at a T-point pivot (`fold_through_centres`)?"
+                    ": the last row mirrors itself, as T cells' at a T-point pivot (`fold_through_centres`; \
+                     `Halo::nemo` for the cells of NEMO's grids)?"
                 } else {
                     ": a row or column repeated, as in an ocean model's halo? Drop it with `Halo`"
                 }
@@ -410,17 +462,31 @@ pub(crate) fn cf_corners(
             if !hit {
                 return Err(format!(
                         "`fold_through_centres`, but row {} doesn't mirror itself: its top corner {i} \
-                         isn't one of its bottom corners (a fold along the row's top side, as at an \
-                         F-point pivot?)",
+                         isn't one of its bottom corners (a fold along the row's top side, as T cells' \
+                         at an F-point pivot? `Halo::nemo` for the cells of NEMO's grids)",
                         nr - 1 + r0
                     ));
             }
         }
-        // the last row cut at its column-line sides' midpoints
+        // the last row cut at its column-line sides' midpoints. NEMO's U
+        // cells at a T pivot and V cells at an F pivot have a side through
+        // each pivot (the file's corner columns 1 and `ncol / 2`), its own
+        // mirror, its ends one point: cut at its lower end (a midpoint off
+        // it by rounding can turn the cell inside out)
+        let through_pivots = matches!(
+            halo.nemo,
+            Some(Nemo { pivot: Pivot::T, cells: Stagger::U } | Nemo { pivot: Pivot::F, cells: Stagger::V })
+        );
+        let period = ncol.saturating_sub(2).max(1);
+        let on_pivot = |i: usize| through_pivots && [1 % period, ncol / 2 % period].contains(&((i + c0) % period));
         for i in 0..=nc {
             let (lo, hi) = ((nr - 1) * w + i, nr * w + i);
-            x[hi] = 0.5 * (x[lo] + x[hi]);
-            y[hi] = 0.5 * (y[lo] + y[hi]);
+            if on_pivot(i) {
+                (x[hi], y[hi]) = (x[lo], y[lo]);
+            } else {
+                x[hi] = 0.5 * (x[lo] + x[hi]);
+                y[hi] = 0.5 * (y[lo] + y[hi]);
+            }
         }
     }
     Ok(CfCorners {

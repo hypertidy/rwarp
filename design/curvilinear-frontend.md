@@ -1138,9 +1138,38 @@ with a pair of `CrsTransform`s a band. It borrows the set.
   points, come back exactly with the halo masked and filled. Tests:
   NEMO's `lbc_lnk` transcribed from the Fortran at every point, both
   pivots, both signs, cell for cell; the same geometric check on the
-  ORCA-like grids. Each of nine rules broken in turn fails both. Not
-  built: sets of U, V or F cells, whose halos differ from the T cells'
-  (`Halo` names the T cells').
+  ORCA-like grids. Each of nine rules broken in turn fails both.
+- **Sets of U, V and F cells** (2026-11-18): `Halo::nemo(pivot, cells)`
+  (`Pivot::T`/`F`, `Stagger`), the T cells' being `NEMO_F_PIVOT` and
+  `NEMO_T_PIVOT`. U cells' corners are V points, V cells' U points, F
+  cells' T points; at a T pivot V and F cells drop the last two rows
+  (the fold is the top side of row `ny - 3`), T and U cells the last
+  with the fold through row `ny - 2`'s centres; at an F pivot T and U
+  cells drop the last, V and F cells the last with the fold through row
+  `ny - 2`'s centres. `Halo` gains `nemo: Option<Nemo>` (the pivot and
+  the cells' point), as the shape alone doesn't say which grid it is (U
+  cells at a T pivot drop what T cells do, V cells at an F pivot too).
+  `MeshSet` takes the pivot for `fill_halo` from it, and `halves` NEMO's
+  mirror for the point (`k - c` on the cyclic columns: `k` 2 for T, 1
+  for U and V, 0 for F), a cell its own mirror (a pivot) with itself
+  before any other. U cells at a T pivot and V cells at an F pivot have a
+  side through each pivot (corner columns 1 and `nx / 2`), its own
+  mirror: `cf_corners` cuts it at its lower end, not its midpoint, which
+  rounding can put across the cell's bottom side and turn the cell
+  inside out (a tolerance on the side's length instead also moved the
+  cut on sides by ORCA2's T cells collapsed near the second pivot,
+  changing two cells' areas by 3e-4; by index, T cells are bit for bit
+  as before, ORCA2's weights hashes unchanged). Checked on both CMIP6
+  files with each point's cells from the T cells' bounds (V points the
+  T cells' north sides' midpoints, U points their east sides', T points
+  their centres; any cell droppable): every set builds, the cap north of
+  60 N is covered to 2e-7, centres come back to 2e-16 with the halo
+  filled at the cells' point, and every kept fold-row cell (eORCA1's V
+  and F, ORCA2's T and U) pairs with NEMO's mirror. Tests: each point's
+  cells on the ORCA-like grids tile the disk once at both pivots, and
+  every other halo of that shape is refused or leaves it short; sets of
+  each go to the file and back; a fold row collapsed to one point pairs
+  by the mirror for each point; a pivot's side apart by rounding.
 
 ### The exact footprint at the antimeridian
 

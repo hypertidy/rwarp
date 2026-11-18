@@ -247,7 +247,8 @@
 //! halo) or that hold no cells, which are dropped before the mesh is built.
 //! A halo left in overlaps the cells it copies and is refused, rather than
 //! counted twice. [`Halo::NEMO_F_PIVOT`] and [`Halo::NEMO_T_PIVOT`] are
-//! NEMO's ORCA layouts.
+//! NEMO's ORCA layouts for its T cells, and [`Halo::nemo`] gives the
+//! layout of the cells round its U, V and F points too.
 //!
 //! ```
 //! use rwarp::mesh::{CellMap, Halo, QuadMesh};
@@ -350,7 +351,7 @@ mod source;
 mod target;
 mod walk;
 
-pub use cf::{Halo, Stagger};
+pub use cf::{Halo, Nemo, Pivot, Stagger};
 pub use period::{unwrap_bounds, unwrap_grid};
 pub(crate) use period::Period;
 pub use rect::Rectilinear;

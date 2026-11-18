@@ -10,7 +10,7 @@ use controlledburn::{
     BurnMode, BurnOptions, BurnResult, Coord, Geometry, GridEdge, GridPoint, GridRun, Note, Polygon,
 };
 
-use super::cf::{cf_corners, Halo, Stagger};
+use super::cf::{cf_corners, Halo, Pivot, Stagger};
 use super::period::range_of;
 use super::walk::{burn_plane, map_geoms, vertex_chunks, vertices};
 use super::{bow_tie, orient, shoelace2, CellMap, MeshTarget, MeshTransformer, QuadMesh};
@@ -90,7 +90,7 @@ impl Piece {
 ///   world.
 /// - **The file's layout.** Fields go between the file's grid (halo and
 ///   all) and the set's numbering with [`MeshSet::from_file_layout`] and
-///   [`MeshSet::to_file_layout`] (a T-point pivot's halves made one cell
+///   [`MeshSet::to_file_layout`] (a fold row's halves made one cell
 ///   again), and [`MeshSet::fill_halo`] puts NEMO's halo back.
 /// - **Warping.** [`SetTransformer`](crate::mesh::SetTransformer) is the
 ///   set as the source of [`warp`](crate::warp::warp), for every method:
@@ -221,8 +221,8 @@ impl MeshSet {
     ///   bands' rows are in that numbering, and must tile it in order.
     /// - Each band's bounds go to its world (`to_world`), and its corners
     ///   are found there as [`QuadMesh::from_cf_bounds`] finds them: vertex
-    ///   order, shared corners, and a T pivot's halved last row in the
-    ///   last band.
+    ///   order, shared corners, and a last row halved by the fold (as T
+    ///   cells' at a T pivot) in the last band.
     /// - `droppable`, one value per cell of the file (`ncol * nrow`,
     ///   row-major; for an ocean grid, its land), says which cells may be
     ///   left out. A cell is left out if it's a bow-tie in its band's world,
@@ -311,9 +311,9 @@ impl MeshSet {
                 }
             }
             let band_halo = Halo {
-                cols: halo.cols,
                 rows: [0, 0],
                 fold_through_centres: halo.fold_through_centres && re == nr,
+                ..halo
             };
             let cs = cf_corners(ncol, re - rs, &bx, &by, band_halo).map_err(|e| {
                 format!("band {k} (rows {rs}..{re}, file rows counted from the band's first): {e}")
@@ -476,8 +476,10 @@ impl MeshSet {
     /// halo's rows and columns dropped, as a source buffer for
     /// [`SetTransformer`](crate::mesh::SetTransformer) takes it. The set's
     /// cell `(row, col)` is the file's `(row + halo.rows[0], col +
-    /// halo.cols[0])`. At a T-point pivot each cell of the last row kept
-    /// is two of the set's cells, each with the file's value there; a
+    /// halo.cols[0])`. Where the fold runs through the last row's centres
+    /// (T and U cells at a T pivot, V and F cells at an F pivot, as
+    /// [`Halo::nemo`] has it), each cell of that row is two of the set's
+    /// cells, each with the file's value there; a
     /// halo-exchanged field has the model's value in both. A component of
     /// a vector in the grid's directions needs nothing more: each half has
     /// its own copy's value, in that copy's directions, which are its own.
@@ -505,8 +507,9 @@ impl MeshSet {
     /// cells `fill` (as CMIP6 files mask them; [`MeshSet::fill_halo`] puts
     /// NEMO's copies there).
     ///
-    /// At a T-point pivot the two cells of the set that halve one model
-    /// cell (found by the fold side they share) give it their mean by
+    /// Where the fold runs through the last row's centres (as T cells' at
+    /// a T pivot), the two cells of the set that halve one model cell
+    /// (found by the fold side they share) give it their mean by
     /// area, in both of the file's copies of it, leaving out a half that
     /// is `fill`, NaN or a cell left out. That is the model cell's value
     /// for what [`Weights::apply`] and [`MeshSet::burn`] give: means and
@@ -525,15 +528,16 @@ impl MeshSet {
 
     /// [`MeshSet::to_file_layout`] for components of a vector in the grid's
     /// own directions (along its rows or its columns, as NEMO's velocities
-    /// are), every band a component, on the set's cells (T points). The
-    /// grid turns half round across the north fold. So at a T-point pivot,
-    /// where the two halves of a model cell are the lower halves of its two
-    /// copies, each half's value is in its own copy's directions, opposite
-    /// to the other's. The mean by area takes the other half's value with
-    /// its sign changed, and the second copy has the mean with its sign
-    /// changed, as NEMO's halo has it. A pivot's own cell, its own mirror,
-    /// keeps its value (see [`MeshSet::fill_halo_vector`]). Elsewhere this
-    /// is [`MeshSet::to_file_layout`].
+    /// are), every band a component, on the set's cells. The grid turns
+    /// half round across the north fold. So where the fold runs through the
+    /// last row's centres (as T cells' at a T pivot), the two halves of a
+    /// model cell are the lower halves of its two copies, and each half's
+    /// value is in its own copy's directions, opposite to the other's. The
+    /// mean by area takes the other half's value with its sign changed,
+    /// and the second copy has the mean with its sign changed, as NEMO's
+    /// halo has it. A pivot's own cell, its own mirror, keeps its value
+    /// (see [`MeshSet::fill_halo_vector`]). Elsewhere this is
+    /// [`MeshSet::to_file_layout`].
     ///
     /// Errors when `data` isn't the set's size.
     pub fn to_file_layout_vector<T: crate::warp::Sample + Neg<Output = T>>(
@@ -546,7 +550,8 @@ impl MeshSet {
     }
 
     /// [`MeshSet::to_file_layout`] with `turn` taking a value from one copy
-    /// of a T pivot's cell to the other: the identity, or a change of sign.
+    /// of a fold row's cell to the other: the identity, or a change of
+    /// sign.
     fn to_file<T: crate::warp::Sample>(
         &self,
         data: &[T],
@@ -609,11 +614,13 @@ impl MeshSet {
     }
 
     /// The pairs `(c, m)` of the set's last row's cells that halve one
-    /// model cell at a T-point pivot: `c`'s top side is `m`'s reversed (the
-    /// fold between them), to a thousandth of the row's largest cell. Of
-    /// the cells that match, NEMO's mirror `(ncol + 2 - c) % ncol` first
-    /// (cells collapsed to one point all match), then the nearest; a cell
-    /// that matches none but itself, as at a pivot, pairs with itself.
+    /// model cell where the fold runs through the row's centres: `c`'s top
+    /// side is `m`'s reversed (the fold between them), to a thousandth of
+    /// the row's largest cell. Of the cells that match, NEMO's mirror first
+    /// (cells collapsed to one point all match; see [`Halo::nemo`], T cells
+    /// when the halo isn't NEMO's), itself if it is its own mirror (a
+    /// pivot), then the nearest; a cell that matches none but itself pairs
+    /// with itself.
     fn halves(&self) -> Vec<(usize, usize)> {
         let (r, nc) = (self.nrow - 1, self.ncol);
         let top: Vec<Option<[[f64; 2]; 2]>> = (0..nc)
@@ -640,15 +647,24 @@ impl MeshSet {
             (Some([a, b]), Some([p, q])) => Some(d(a, q).max(d(b, p))).filter(|&g| g <= tol),
             _ => None,
         };
+        // NEMO's mirror of file column `i` is `k - i` on the cyclic
+        // columns, `nc` of them: `k` is `nx` (T), `nx - 1` (U, V) or
+        // `nx - 2` (F), `nx` being `nc + 2`
+        let k = match self.halo.nemo.map_or(Stagger::T, |g| g.cells) {
+            Stagger::T => 2,
+            Stagger::U | Stagger::V => 1,
+            Stagger::F => 0,
+        };
+        let c0 = self.halo.cols[0] % nc;
         let mut pairs = Vec::new();
         let mut taken = vec![false; nc];
         for c in 0..nc {
             if taken[c] || top[c].is_none() {
                 continue;
             }
-            let mirror = (nc + 2 - c) % nc;
+            let mirror = (k + 3 * nc - 2 * c0 - c) % nc;
             let free = |m: usize| m != c && !taken[m];
-            let m = if free(mirror) && gap(c, mirror).is_some() {
+            let m = if (mirror == c || free(mirror)) && gap(c, mirror).is_some() {
                 Some(mirror)
             } else {
                 (0..nc)
@@ -667,10 +683,10 @@ impl MeshSet {
         pairs
     }
 
-    /// NEMO's halo exchange on a field on the file's grid at `point`s (at
-    /// T points as [`MeshSet::to_file_layout`] gives it, or at U, V or F
-    /// points of the same grid), for a set built with
-    /// [`Halo::NEMO_F_PIVOT`] or [`Halo::NEMO_T_PIVOT`], as NEMO 4.0's
+    /// NEMO's halo exchange on a field on the file's grid at `point`s (the
+    /// set's own cells' points, as [`MeshSet::to_file_layout`] gives it, or
+    /// any other of the same grid), for a set built with a NEMO halo
+    /// ([`Halo::nemo`], which gives the pivot), as NEMO 4.0's
     /// `lbc_nfd_generic.h90` writes it on one process. Columns `nx - 2`
     /// and `nx - 1` repeat columns 0 and 1 (`nx` by `ny` the file's size),
     /// and the north fold's rows repeat rows below them, mirrored, column
@@ -737,10 +753,9 @@ impl MeshSet {
         point: Stagger,
         turn: impl Fn(T) -> T,
     ) -> Result<(), String> {
-        let t_pivot = match self.halo {
-            h if h == Halo::NEMO_F_PIVOT => false,
-            h if h == Halo::NEMO_T_PIVOT => true,
-            h => return Err(format!("only NEMO's halos are filled, not {h:?}")),
+        let t_pivot = match self.halo.nemo {
+            Some(g) => g.pivot == Pivot::T,
+            None => return Err(format!("only NEMO's halos are filled, not {:?}", self.halo)),
         };
         let [nx, ny] = self.file;
         if file.len() != nx * ny * nbands || nx < 4 || ny < 4 {
