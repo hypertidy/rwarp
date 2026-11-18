@@ -241,6 +241,16 @@
 //! pixel's cells from every piece and band it reaches, and point kernels
 //! read across pieces in the set's numbering.
 //!
+//! # Meshes of polygons: [`PolyMesh`]
+//!
+//! An unstructured mesh, ICON's triangles, MPAS's hexagons, a UGRID or
+//! ESMF mesh, is a [`PolyMesh`]: its nodes and, for each face, its nodes in
+//! order round it. [`PolyMesh::weights_onto`] and [`PolyMesh::weights_to`]
+//! give conservative weights between it and a grid, both ways, from one
+//! table of overlaps: each face measured against the grid's cells as
+//! [`exact_weights`](crate::weights::exact_weights) measures a destination
+//! pixel (conservative stage 5, `design/conservative.md` section 7).
+//!
 //! # CF bounds, SCRIP corners and halos
 //!
 //! [`QuadMesh::from_cf_bounds`] takes each cell's own four vertices (CF's
@@ -346,6 +356,7 @@ use std::sync::OnceLock;
 
 mod cf;
 mod period;
+mod poly;
 mod rect;
 mod reproject;
 mod set;
@@ -356,6 +367,7 @@ mod walk;
 
 pub use cf::{Halo, Nemo, Pivot, Stagger};
 pub use period::{unwrap_bounds, unwrap_grid};
+pub use poly::PolyMesh;
 pub(crate) use period::Period;
 pub use rect::Rectilinear;
 pub use set::{Band, MeshSet, Piece};

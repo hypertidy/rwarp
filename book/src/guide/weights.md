@@ -30,7 +30,7 @@ pixel), so anything rwarp can warp it can make weights for.
 | `src_row`, `src_col` | entry | source cell, full-grid indices |
 | `frac` | entry | area of the overlap as a fraction of the source cell, unrounded `f64` |
 | `dst_area` | target cell | area of the target cell's outline, in source cells (in world units for a geolocation or mesh source); `NaN` if it failed to transform |
-| `src_cell_area` | entry | for a geolocation or mesh source, the source cell's world area; empty otherwise |
+| `src_cell_area` | entry | for a geolocation or mesh source, the source cell's world area; from `PolyMesh::weights_to`, the face's area; empty otherwise |
 | `dst_off`, `dst_size` | | the target window the weights are for |
 
 Areas are measured in source pixel space, where a source cell has area 1.
@@ -99,6 +99,55 @@ outer boundary:
 | regular to rotated (0.3 rad, 2.3:1), densify 1 / 4 | 2.8e-14 / 1.2e-14 | 7.5e-15 / 5.2e-15 | 1.6e-15 / 1.8e-15 |
 | lon/lat 0.5° to EPSG:3031 at 25 km, densify 1 / 4 | 6.0e-14 / 1.6e-14 | 3.3e-14 / 1.2e-14 | 3.8e-15 / 3.1e-15 |
 | lon/lat 0.5° to LAEA at 20 km, densify 1 / 4 | 2.1e-15 / 4.4e-16 | 3.3e-16 / 3.3e-16 | 1.9e-15 / 2.4e-15 |
+
+## Meshes of polygons
+
+An unstructured mesh, ICON's triangles, MPAS's hexagons, a UGRID or ESMF
+mesh, is a `PolyMesh` (in `rwarp::mesh`): its nodes' coordinates and, for
+each face, its nodes in order round it. `weights_onto` gives the weights
+from a grid onto the mesh, and `weights_to` from the mesh to the grid:
+
+```rust,ignore
+use rwarp::mesh::{PolyMesh, WORLD_GT};
+use rwarp::transform::GenImgProjTransformer;
+use rwarp::weights::{lonlat_measure, GridWindow, WeightOptions};
+
+// faces as UGRID's face_node_connectivity: up to 6 nodes a face, 0-based,
+// padded with -1; edges the shorter way round in longitude
+let mesh = PolyMesh::from_padded(lon, lat, &face_nodes, 6, 0)?.with_period(360.0)?;
+
+// from the mesh's coordinates to the grid's pixels
+let t = GenImgProjTransformer::new("EPSG:4326", grid_gt, "EPSG:4326", WORLD_GT)?
+    .with_source_size([ncol, nrow]);
+let grid = GridWindow::new(ncol, nrow);
+let opts = WeightOptions::new(4).with_measure(lonlat_measure(grid_gt).unwrap());
+let onto = mesh.weights_onto(&t, &grid, &opts)?; // grid to mesh
+let to = mesh.weights_to(&t, &grid, &opts)?; // mesh to grid
+```
+
+Each face is measured as a target pixel is. Its edges are cut into
+`densify` pieces in the mesh's coordinates (or refined to
+`refine_tolerance`), go through the transformer to the grid's pixels, and
+are measured there under the grid's measure, across the seam and round a
+pole as above. Both directions come from the same overlaps, one turned
+round, so the pair is consistent. Faces that share an edge get bitwise
+the same points on it, so they tile the grid: where the mesh covers a
+grid cell, its `frac` sums to 1 over the faces, as in
+[Conservation](#conservation).
+
+- **Onto the mesh**, face `f` is target cell `(0, f)`: `dst_size` is
+  `[nface, 1]`, `dst_area` the faces' areas, and `apply` takes the grid's
+  values and gives one per face.
+- **From the mesh**, `src_col` is the face, `src_cell_area` its area, and
+  `apply` takes the faces' values as a buffer `nface` wide and 1 high.
+
+Against ESMF (Cartesian, a mesh of hexagons and triangles over part of a
+grid, `tests/esmf_mesh.rs`) the weights agree to 6e-14 both ways. Edges
+are straight in the mesh's coordinates. Great-circle edges, as ICON's and
+MPAS's are, aren't built yet: a face with straight edges in longitude and
+latitude differs from its great-circle version by its edges' bow, which
+shrinks as the square of the face's size. Neither is a grid with world
+cells (geolocation, a `QuadMesh`) on the other side.
 
 ## Densify
 

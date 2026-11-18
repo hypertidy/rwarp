@@ -26,7 +26,12 @@
 //!   there, and source cells are the quadrilaterals through their corners'
 //!   world positions. A mesh target
 //!   ([`MeshTarget`](crate::mesh::MeshTarget)) makes destination cells the
-//!   mesh's: edges straight in the mesh's world coordinates.
+//!   mesh's: edges straight in the mesh's world coordinates. A mesh of
+//!   polygons ([`PolyMesh`](crate::mesh::PolyMesh)) has its faces measured
+//!   the same way, as destination cells onto it
+//!   ([`PolyMesh::weights_onto`](crate::mesh::PolyMesh::weights_onto)) or,
+//!   the same overlaps turned round, as source cells from it
+//!   ([`PolyMesh::weights_to`](crate::mesh::PolyMesh::weights_to)).
 //! - **Measure.** By default areas are planar in source pixel space: for a
 //!   source whose pixel-to-world map is affine (any regular grid in its own
 //!   CRS) that is world area in the source CRS, up to one constant. With
@@ -177,7 +182,7 @@ pub fn lonlat_measure(src_gt: [f64; 6]) -> Option<Measure> {
 }
 
 /// `measure` with its row 0 moved to row `rows` of the grid it was given for.
-fn shift_rows(measure: Measure, rows: f64) -> Measure {
+pub(crate) fn shift_rows(measure: Measure, rows: f64) -> Measure {
     match measure {
         Measure::CosLatitude { phi0, dphi } => Measure::cos_latitude(phi0 + dphi * rows, dphi),
         m => m,
@@ -287,7 +292,7 @@ impl WeightOptions {
 
     /// The stored weight for a raw coverage `f`, or `None` to drop it.
     #[inline]
-    fn weight(&self, f: f64) -> Option<f64> {
+    pub(crate) fn weight(&self, f: f64) -> Option<f64> {
         if self.snap_tolerance > 0.0 && f >= 1.0 - self.snap_tolerance {
             return Some(1.0);
         }
@@ -358,8 +363,10 @@ pub struct Weights {
     /// The measure over the full source grid ([`WeightOptions::measure`]).
     pub measure: Measure,
     /// For a source with world cells ([`Transformer::source_cells`]):
-    /// each entry's source cell area in world coordinates. Empty
-    /// otherwise, when cell measures follow from `measure`.
+    /// each entry's source cell area in world coordinates. From
+    /// [`PolyMesh::weights_to`](crate::mesh::PolyMesh::weights_to): each
+    /// entry's face's measure in the grid's pixels. Empty otherwise, when
+    /// cell measures follow from `measure`.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub src_cell_area: Vec<f64>,
 }
@@ -414,7 +421,7 @@ impl From<&WarpOptions> for ApplyOptions {
     }
 }
 
-fn to_u32(v: usize, what: &str) -> u32 {
+pub(crate) fn to_u32(v: usize, what: &str) -> u32 {
     u32::try_from(v).unwrap_or_else(|_| panic!("{what} {v} does not fit in u32"))
 }
 
