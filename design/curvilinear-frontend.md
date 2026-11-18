@@ -1265,7 +1265,8 @@ one space and used in another:
 - **The exact footprint.** Destination pixel edges, straight in
   destination pixel space, into source space: the hybrid in the bigcurve
   follow-up (transform the lattice at densify 1 as scanlines, refine only
-  edges failing a sagitta tolerance in source-pixel units).
+  edges failing a sagitta tolerance in source-pixel units). Built as 5a,
+  below.
 - **Bilinear cells**, for anyone who wants the GDAL model's measure.
 
 bigcurve's open question on kinks (a curvilinear map is only piecewise
@@ -1284,6 +1285,55 @@ requests for bigcurve stage 2:
   bitwise those of d3-geo's depth-first recursion;
 - carry a hint per point (the parent's cell) through to the forward map,
   so rwarp's locate stays O(1) per point.
+
+### Adaptive footprint edges (built, 5a)
+
+`Footprint::Adaptive { densify, tolerance }` in `warp()`, and
+`WeightOptions::refine_tolerance` for `exact_weights` and everything
+built on it (`MeshSet::weights_to`, `weights_onto` and their threads), in
+`src/warp.rs` (`Lattice`).
+
+- **On top of the fixed lattice.** The lattice is built as before:
+  `densify` points a pixel along each row line, one scanline, and each
+  interior level of the column lines its own scanline. Then every segment
+  between two consecutive lattice points goes to bigcurve's `Resampler`
+  with `Planar` edges in destination pixel space: a row line's segments in
+  one run when it is the band's bottom line, the column lines' segments of
+  a row in another. Each run is one forward call per level. A segment's
+  new points depend only on its two ends, so the top and bottom pixels on
+  a line share them, and the runs are made up the same whether a band
+  starts at a row or reaches it, which keeps tiles and threads bit for bit
+  the whole window's.
+- **The forward map** is the lattice's: to source pixels, or to world `k`
+  of the source's cells (`dst_to_world_in`), so a mesh or a set refines in
+  its own world and each world on its own. The tolerance is in those
+  units. A tolerance in cells for world sources was considered (a scale
+  per world, from its cells' sizes) and left out: a source window's cells
+  change with the chunk, and the scale with them, so tiles would no longer
+  agree.
+- **Failures.** bigcurve stops a branch at a midpoint the map cannot
+  take, and says nothing. The forward map records the destination
+  position of each failure, and its segment is marked failed (a row
+  line's by its x, a column line's by its column and level), which fails
+  the pixels that use it, as a failed lattice point does.
+- **Measured** (`tests/adaptive.rs`; a polar source, 12 by 12 pixels):
+  error 1.0e-2, 8.9e-4, 8.0e-5, 9.2e-6, 8.6e-7 at tolerances 1e-2 to
+  1e-6 against densify 4096, the points growing as the tolerance to the
+  power -0.507. A fixed densify converges at the same rate (its error
+  falls as `densify^-2`, the points as `densify`), so the gain is only in
+  where the points go: 48 by 4 pixels bending at one end reach densify
+  64's error at 1e-4 with 13313 points against 27713. An arc of a circle
+  bisects evenly, so on a mesh source in LAEA from longitude and latitude
+  the worst overlap at 1 m is densify 64's bit for bit. Across the seam
+  and round the pole (`tests/antimeridian.rs`) the pole pixel's cap is
+  0.88, 0.22, 0.014 pixels over at 1e-2, 1e-3, 1e-4, within the tolerance
+  times the outline's 360 pixel length. On the analytic set
+  (`tests/mesh_set.rs`) 10 m is 1.6e-5 from densify 64, densify 4 6.3e-5,
+  both worst in the small cells round the pole.
+- **Approximate transformers.** A row line's new points at one level
+  come as a scanline, which `ApproxTransformer` interpolates, so
+  refinement below its error follows the interpolation. The docs say to
+  use the exact transformer or a tolerance above its error.
 
 ## 6. Duality with the exact footprint
 
@@ -1441,7 +1491,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
 | 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too, the filter by chunk boxes (4h, built); a set as a warp source, `SetTransformer`, outlines walked onto pieces in several worlds (4i, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
-| 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
+| 5 | adaptive footprint edges, `Footprint::Adaptive` and `WeightOptions::refine_tolerance` (5a, built); reprojected polygons onto a `QuadMesh` (5b) | the error follows the tolerance, the points grow as its inverse square root, a fine tolerance is a fine densify; affine adds nothing; tiles, threads, `warp()` = `apply`; the seam, the pole, a mesh source, a set (5a, built) |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 
 ## Decisions for the maintainer

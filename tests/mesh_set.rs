@@ -993,6 +993,47 @@ fn exact_weights_par_from_the_set() {
     }
 }
 
+/// `Footprint::Adaptive`'s refinement from the set, each world refining
+/// its own outlines with the tolerance in its metres. `exact_weights`
+/// through the set's transformer are still `weights_to`'s; at 10 m they
+/// are 1.6e-5 from densify 64's, where densify 4 is 6.3e-5 (both worst
+/// in the cap's small cells round the pole, which get a tolerance in
+/// metres as a larger fraction of themselves: 2.5e-4 at 100 m); on
+/// threads bit for bit; and `warp()` is `apply` of them, on threads too.
+#[test]
+fn adaptive_edges_from_the_set() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let t = set_transformer(&s, GT);
+    let src = t.source_window();
+    let opts = WeightOptions::new(1).with_refine_tolerance(10.0);
+    let w = exact_weights(&t, &src, GW, GH, &opts);
+    let want = s
+        .weights_to(|w, mesh| MeshTransformer::with_backend(mesh, GT, Box::new(World(w, false)), Box::new(World(w, true))), GW, GH, &opts)
+        .unwrap();
+    let d = max_diff(&entries(&w), &entries(&want));
+    let fine = entries(&exact_weights(&t, &src, GW, GH, &WeightOptions::new(64)));
+    let (e, e4) = (max_diff(&entries(&w), &fine), max_diff(&entries(&exact_weights(&t, &src, GW, GH, &WeightOptions::new(4))), &fine));
+    eprintln!("10 m: weights_to's to {d:.1e}; densify 64's to {e:.1e} (densify 4 to {e4:.1e})");
+    assert!(d < 1e-12, "{d:e}");
+    assert!(e < 3e-5 && e4 > 3e-5, "{e:e} {e4:e}");
+    for threads in [0, 3] {
+        let par = exact_weights_par(|| Ok(set_transformer(&s, GT)), &src, GW, GH, &opts, threads).unwrap();
+        assert!(same_weights(&w, &par), "{threads} threads");
+    }
+    let data: Vec<f64> = (0..NC * NR).map(|k| 10.0 + ((k % NC) as f64 * 0.4).sin() * ((k / NC) as f64 * 0.3).cos()).collect();
+    let buf = SourceBuffer { data: &data, ncol: NC, nrow: NR, nbands: 1, col_off: 0, row_off: 0 };
+    let wopts = WarpOptions::new(ResampleAlg::Average).with_footprint(Footprint::Adaptive { densify: 1, tolerance: 10.0 });
+    let warped = warp_to::<f64, f64>(&t, &buf, GW, GH, &wopts);
+    let applied: Vec<f64> = exact_weights(&t, &GridWindow::from(&buf), GW, GH, &WeightOptions::warp_compatible(1).with_refine_tolerance(10.0))
+        .apply(&buf, Normalization::FracArea, &ApplyOptions::from(&wopts));
+    let computed = warped.iter().filter(|v| (5.0..15.0).contains(*v)).count();
+    assert!(computed > GW * GH * 9 / 10, "{computed}");
+    assert!(warped.iter().zip(&applied).all(|(a, b)| a.to_bits() == b.to_bits()));
+    let par = warp_to_par::<f64, f64, _>(|| Ok(set_transformer(&s, GT)), &buf, GW, GH, &wopts, 3).unwrap();
+    assert!(warped.iter().zip(&par).all(|(a, b)| a.to_bits() == b.to_bits()));
+}
+
 /// The same table bit for bit, NaN areas included.
 fn same_weights(a: &Weights, b: &Weights) -> bool {
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -1032,3 +1073,4 @@ fn set_weights_on_threads() {
     assert_eq!(s.weights_to(fails, GW, GH, &WeightOptions::new(1)).unwrap_err(), "band 1");
     assert_eq!(s.weights_to_par(fails, GW, GH, &WeightOptions::new(1), 3).unwrap_err(), "band 1");
 }
+

@@ -36,7 +36,12 @@ type Table = HashMap<(u32, u32, u32, u32), f64>;
 /// Weights keyed by (dst row, dst col, src row, src col), with source
 /// columns moved by `col_shift` (mod 360), and each destination cell's area.
 fn table(t: &impl Transformer, densify: usize, col_shift: u32) -> (Table, Vec<f64>) {
-    let w = exact_weights(t, &GridWindow::new(360, 180), DST_N, DST_N, &WeightOptions::new(densify));
+    table_with(t, &WeightOptions::new(densify), col_shift)
+}
+
+/// [`table`] with any options.
+fn table_with(t: &impl Transformer, opts: &WeightOptions, col_shift: u32) -> (Table, Vec<f64>) {
+    let w = exact_weights(t, &GridWindow::new(360, 180), DST_N, DST_N, opts);
     let mut m = HashMap::new();
     for k in 0..w.len() {
         let key = (w.dst_row[k], w.dst_col[k], w.src_row[k], (w.src_col[k] + col_shift) % 360);
@@ -119,36 +124,7 @@ fn the_pole_pixel_covers_the_polar_cap() {
     // it, and in source pixels its footprint is the cap between the
     // outline and the pole's row, 360 columns wide
     let t = source(-180.0);
-    // the outline, very finely, to source pixels: the cap's area is the
-    // integral of (pole row - y) dx along it, unwrapped
-    let n = 400_000;
-    let (mut x, mut y) = (Vec::with_capacity(n), Vec::with_capacity(n));
-    for k in 0..n {
-        let s = 4.0 * k as f64 / n as f64;
-        let (e, f) = match s as usize {
-            0 => (s, 0.0),
-            1 => (1.0, s - 1.0),
-            2 => (3.0 - s, 1.0),
-            _ => (0.0, 4.0 - s),
-        };
-        x.push(20.0 + e);
-        y.push(20.0 + f);
-    }
-    assert!(t.transform(true, &mut x, &mut y).iter().all(|&ok| ok));
-    let mut cap = 0.0;
-    let mut prev = x[0];
-    let mut ux = x[0];
-    for k in 0..n {
-        let k1 = (k + 1) % n;
-        let d = x[k1] - prev;
-        let d = d - (d / 360.0).round() * 360.0;
-        prev = x[k1];
-        let ux1 = ux + d;
-        cap += 0.5 * ((180.0 - y[k]) + (180.0 - y[k1])) * (ux1 - ux);
-        ux = ux1;
-    }
-    let cap = cap.abs();
-    assert!((ux - x[0]).abs() > 359.0, "the outline goes round the pole");
+    let (cap, _) = polar_cap(&t);
 
     // the densified outline is straight between its points in source
     // pixels, so it converges to the cap at second order: the error falls
@@ -205,4 +181,79 @@ fn average_across_the_seam_and_at_the_pole() {
     }
     eprintln!("average: max relative difference {worst:.1e}");
     assert!(worst < 2e-6, "{worst}");
+}
+
+
+/// The polar cap under the pole pixel (20, 20)'s outline, in source
+/// pixels, and the outline's length there, unwrapped.
+fn polar_cap(t: &impl Transformer) -> (f64, f64) {
+    // the outline, very finely, to source pixels: the cap's area is the
+    // integral of (pole row - y) dx along it, unwrapped
+    let n = 400_000;
+    let (mut x, mut y) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for k in 0..n {
+        let s = 4.0 * k as f64 / n as f64;
+        let (e, f) = match s as usize {
+            0 => (s, 0.0),
+            1 => (1.0, s - 1.0),
+            2 => (3.0 - s, 1.0),
+            _ => (0.0, 4.0 - s),
+        };
+        x.push(20.0 + e);
+        y.push(20.0 + f);
+    }
+    assert!(t.transform(true, &mut x, &mut y).iter().all(|&ok| ok));
+    let (mut cap, mut length) = (0.0, 0.0);
+    let mut prev = x[0];
+    let mut ux = x[0];
+    for k in 0..n {
+        let k1 = (k + 1) % n;
+        let d = x[k1] - prev;
+        let d = d - (d / 360.0).round() * 360.0;
+        prev = x[k1];
+        let ux1 = ux + d;
+        cap += 0.5 * ((180.0 - y[k]) + (180.0 - y[k1])) * (ux1 - ux);
+        length += d.hypot(y[k1] - y[k]);
+        ux = ux1;
+    }
+    let cap = cap.abs();
+    assert!((ux - x[0]).abs() > 359.0, "the outline goes round the pole");
+    (cap, length)
+}
+
+/// `Footprint::Adaptive`'s refinement across the seam and round the pole.
+/// The two seams agree to the tolerance, not bit for bit: their points
+/// are measured in source pixels 180 apart, which round differently. Each
+/// pixel's weights still sum to its outline's area, and the pole pixel's
+/// cap is approached from outside within the tolerance times the
+/// outline's length (0.88, 0.22, 0.014 pixels at 1e-2, 1e-3, 1e-4; the
+/// outline is 360 pixels long).
+#[test]
+fn adaptive_edges_across_the_seam_and_round_the_pole() {
+    let t = source(-180.0);
+    let (cap, length) = polar_cap(&t);
+    for tol in [1e-2, 1e-3, 1e-4] {
+        let o = WeightOptions::new(1).with_refine_tolerance(tol);
+        let (a, area) = table_with(&t, &o, 0);
+        let (b, _) = table_with(&source(0.0), &o, 180);
+        let mut worst: f64 = 0.0;
+        for (key, fa) in &a {
+            worst = worst.max((fa - b.get(key).copied().unwrap_or(0.0)).abs());
+        }
+        for (key, fb) in &b {
+            if !a.contains_key(key) {
+                worst = worst.max(fb.abs());
+            }
+        }
+        let mut sum = vec![0.0; DST_N * DST_N];
+        for (&(r, c, _, _), &f) in &a {
+            sum[r as usize * DST_N + c as usize] += f;
+        }
+        let sums = sum.iter().zip(&area).map(|(s, a)| (s - a).abs() / a.max(1.0)).fold(0.0, f64::max);
+        let pole: f64 = a.iter().filter(|(k, _)| (k.0, k.1) == (20, 20)).map(|(_, f)| f).sum();
+        eprintln!("tolerance {tol:.0e}: seams agree to {worst:.1e}, sums to {sums:.1e}, pole {:.4} over the cap ({length:.0} long)", pole - cap);
+        assert!(worst < 1.5 * tol, "tolerance {tol:e}: seams {worst:e}");
+        assert!(sums < 1e-12, "{sums:e}");
+        assert!(pole > cap && pole - cap < tol * length, "{pole} vs {cap}");
+    }
 }

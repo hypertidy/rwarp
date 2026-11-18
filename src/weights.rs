@@ -15,7 +15,9 @@
 //!
 //! - **Cells.** Destination cells have edges straight in destination pixel
 //!   space, each split into `densify` segments whose end points go through
-//!   the transformer exactly. Source cells are unit squares in source pixel
+//!   the transformer exactly; with [`WeightOptions::refine_tolerance`] each
+//!   segment is then bisected where the transform bends it, until it is
+//!   within the tolerance of the curve. Source cells are unit squares in source pixel
 //!   space, joined to the end points by straight lines there. For a source
 //!   whose transformer reports its cells ([`Transformer::source_cells`]: a
 //!   geolocation source, or a mesh through
@@ -127,7 +129,7 @@
 pub use controlledburn::Measure;
 
 use crate::transform::Transformer;
-use crate::warp::{AreaMean, AreaReducer, BandNodata, Cover, DstNodata, Interleaved, Lattice, Nodata, Output, Res, Sample, SourceBuffer, WarpOptions};
+use crate::warp::{AreaMean, AreaReducer, BandNodata, Cover, DstNodata, Edges, Interleaved, Lattice, Nodata, Output, Res, Sample, SourceBuffer, WarpOptions};
 
 /// A window of a grid, with no data: `ncol` by `nrow` cells at
 /// `(col_off, row_off)` in the full grid. The source side of
@@ -190,6 +192,15 @@ pub struct WeightOptions {
     /// Segments per destination pixel edge (at least 1), as in
     /// [`Footprint::Exact`](crate::warp::Footprint::Exact).
     pub densify: usize,
+    /// Refine each segment where the transform bends it, to this
+    /// tolerance, as
+    /// [`Footprint::Adaptive`](crate::warp::Footprint::Adaptive) does
+    /// (source pixels, or the source's world coordinates when its
+    /// transformer reports cells). Default `None`: the segments stay
+    /// straight.
+    ///
+    /// Must be positive: [`exact_weights`] panics otherwise.
+    pub refine_tolerance: Option<f64>,
     /// Offset of the destination window in the full destination grid.
     pub dst_col_off: usize,
     pub dst_row_off: usize,
@@ -217,7 +228,7 @@ impl WeightOptions {
     /// Unrounded weights with `densify` segments per edge, nothing dropped.
     pub fn new(densify: usize) -> Self {
         WeightOptions {
-            densify, dst_col_off: 0, dst_row_off: 0,
+            densify, refine_tolerance: None, dst_col_off: 0, dst_row_off: 0,
             drop_tolerance: 0.0, snap_tolerance: 0.0, round_to_f32: false,
             measure: Measure::Planar,
         }
@@ -225,13 +236,22 @@ impl WeightOptions {
 
     /// The weights [`warp`](crate::warp::warp) uses for
     /// `Footprint::Exact { densify }`: within 1e-6 of 1 is 1, at or below
-    /// 1e-6 is dropped, the rest rounded to `f32`.
+    /// 1e-6 is dropped, the rest rounded to `f32`. With
+    /// [`WeightOptions::with_refine_tolerance`], those of
+    /// `Footprint::Adaptive`.
     pub fn warp_compatible(densify: usize) -> Self {
         WeightOptions { drop_tolerance: 1e-6, snap_tolerance: 1e-6, round_to_f32: true, ..WeightOptions::new(densify) }
     }
 
     pub fn with_densify(mut self, densify: usize) -> Self {
         self.densify = densify;
+        self
+    }
+
+    /// Refine each segment to `tolerance`; see
+    /// [`WeightOptions::refine_tolerance`].
+    pub fn with_refine_tolerance(mut self, tolerance: f64) -> Self {
+        self.refine_tolerance = Some(tolerance);
         self
     }
 
@@ -458,7 +478,7 @@ fn weights_rows(
         }
         None => {
             let mut l = Lattice::new(
-                transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off + band.start),
+                transformer, dst_ncol, Edges::new(opts.densify, opts.refine_tolerance), (opts.dst_col_off, opts.dst_row_off + band.start),
                 (src.col_off, src.row_off, src.ncol, src.nrow), (opts.dst_row_off, dst_nrow),
             );
             assert!(!l.in_world() || opts.measure == Measure::Planar, "{WORLD_MEASURE}");

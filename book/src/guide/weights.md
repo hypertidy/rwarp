@@ -112,6 +112,21 @@ rounding (4e-14). For lon/lat to LAEA at 20 km, `frac` differs by up to
 grows with `densify` (the transform dominates): 4 is about 4 times 1 when
 target cells are smaller than source cells.
 
+`WeightOptions::with_refine_tolerance(t)` (and `Footprint::Adaptive {
+densify, tolerance }` in `warp()`) refines instead of guessing a count.
+Each segment is bisected while its transformed midpoint strays more than
+`t` from the chord, d3-geo's adaptive resampling through bigcurve, one
+transformer call per level. `t` is in source pixels, or in world units
+for a geolocation or mesh source, where it is one length for every cell.
+The error in `frac` follows `t` about one to one, and the points grow as
+`t` to the power -1/2. That is the rate a fixed `densify` has too, so the
+gain is in where the points go: only to the edges that bend. On a test
+map that bends at one end (`tests/adaptive.rs`), tolerance 1e-4 matches
+densify 64's error with under half its points. Where the transform is
+affine nothing is added, and the weights are `densify`'s bit for bit.
+Tiles and threads still give the whole grid's weights, since a segment's
+points depend only on its ends.
+
 ## Same numbers as `warp()`
 
 `warp()` with `Footprint::Exact` and `ResampleAlg::Average` uses the same

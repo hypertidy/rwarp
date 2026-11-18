@@ -4,6 +4,22 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ## 0.5.1 (unreleased)
 
+### Added
+
+- `Footprint::Adaptive { densify, tolerance }` and
+  `WeightOptions::refine_tolerance` (`with_refine_tolerance`): the exact
+  footprint with each segment of the outline bisected where the
+  transform bends it, until it is within the tolerance of the true curve
+  (curvilinear stage 5a, #38). It is d3-geo's adaptive resampling through
+  bigcurve, one transformer call per level. The tolerance is in source
+  pixels, or in world units for a source with cells (geolocation, mesh,
+  `SetTransformer`). The error follows the tolerance, and the points grow
+  as its inverse square root, as a fixed `densify`'s do, but they go only
+  where edges bend. Where the transform is affine the weights are
+  `Exact { densify }`'s bit for bit. Tiles, threads and `warp()` against
+  `apply` agree bit for bit as before. `Footprint` is `non_exhaustive`,
+  so the new variant is not breaking.
+
 ### Fixed
 
 - `ChunkOptions::split_antimeridian` with the fill ratio split
