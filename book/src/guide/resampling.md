@@ -54,7 +54,8 @@ transformer can't be shared between threads. A `Sync` one can serve them
 all as `|| Ok(&t)`. What a warp works out once is still worked out once:
 the cutline's density over the source, and the kernel scale over the
 whole target. So every row comes from the same steps as on one thread.
-With one thread nothing is spawned.
+With one thread nothing is spawned. A whole plan of chunks runs on
+threads with `warp_chunks_par` ([Planning reads](planning.md)).
 
 A 0.1° global grid to 2000 by 2000 pixels of south polar stereographic,
 through libproj and the approximate transformer, on a 32-core machine:

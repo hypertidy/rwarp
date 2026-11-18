@@ -68,6 +68,30 @@ size matters only for a tiled target (`OPTIMIZE_SIZE`).
 
 [`warp_chunks`](../api/rwarp/plan/fn.warp_chunks.html) runs a whole plan
 from a source buffer in memory, which is how the parity tests use it.
+`warp_chunks_par` runs it on several threads, with the same values bit
+for bit. As for `warp_par` ([Resampling](resampling.md#threads)), it
+takes a closure that builds a transformer for each thread:
+
+```rust,ignore
+let out: Vec<f32> = warp_chunks_par(make, &plan, &src, &opts, 8)?;
+```
+
+Each chunk's rows are cut into bands, about four a thread over the plan.
+So a plan of one chunk runs on every thread, and one of many chunks
+warps several at once. Each band is warped as `warp_chunks` warps those
+rows. A chunk's source window is copied when its first band starts
+(borrowed if it is whole rows of the buffer) and dropped when its last
+is done. Bands go into the target in the plan's order, so the two chunks
+of an antimeridian gap, which share a target window, land as they do on
+one thread. A 0.1° global grid to 4000 by 4000 pixels of south polar
+stereographic, through libproj, in 8 chunks of a 16 MB memory limit:
+
+| | 1 thread | 8 | 32 |
+|---|---|---|---|
+| Bilinear | 1.48 s | 0.26 s | 0.18 s |
+| Cubic | 3.09 s | 0.46 s | 0.23 s |
+| Average | 2.38 s | 0.38 s | 0.19 s |
+| Bilinear, one chunk | 0.94 s | 0.19 s | 0.11 s |
 
 ### At the antimeridian
 

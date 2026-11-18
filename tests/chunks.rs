@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rwarp::plan::{plan_chunks, warp_chunks, ChunkOptions, ScaleOrigin, WarpPlan};
+use rwarp::plan::{plan_chunks, warp_chunks, warp_chunks_par, ChunkOptions, ScaleOrigin, WarpPlan};
 use rwarp::warp::{warp, DataType, KernelScaling, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::Transformer;
 
@@ -183,7 +183,14 @@ mod gdal {
         let data = source(c);
         let [w, h] = c.src_size;
         let buf = SourceBuffer { data: &data, ncol: w, nrow: h, nbands: 1, col_off: 0, row_off: 0 };
-        warp_chunks(&t, plan, &buf, &warp_opts(c))
+        let one: Vec<f64> = warp_chunks(&t, plan, &buf, &warp_opts(c));
+        // on threads, a transformer each: the same values, bit for bit
+        for threads in [0, 3] {
+            let par: Vec<f64> = warp_chunks_par(|| Ok(transformer(c)), plan, &buf, &warp_opts(c), threads).unwrap();
+            let differ = one.iter().zip(&par).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(differ, 0, "{}: {threads} threads", c.name);
+        }
+        one
     }
 
     /// (pixels differing beyond 1e-6 relative, max absolute difference)
@@ -401,8 +408,12 @@ fn plan_tiles_target_and_warps_like_one_pass() {
     let buf = SourceBuffer { data: &data, ncol: 200, nrow: 160, nbands: 1, col_off: 0, row_off: 0 };
     let wo = WarpOptions::new(ResampleAlg::Bilinear);
     let chunked: Vec<f64> = warp_chunks(&t, &plan, &buf, &wo);
-    let whole: Vec<f64> = warp(&t, &buf, 100, 80, &wo.with_scaling(KernelScaling::Fixed { x: 0.5, y: 0.5 }));
+    let whole: Vec<f64> = warp(&t, &buf, 100, 80, &wo.clone().with_scaling(KernelScaling::Fixed { x: 0.5, y: 0.5 }));
     assert_eq!(chunked, whole);
+    for threads in [2, 5, 16] {
+        let par: Vec<f64> = warp_chunks_par(|| Ok(&t), &plan, &buf, &wo, threads).unwrap();
+        assert_eq!(chunked, par, "{threads} threads");
+    }
     assert_eq!(plan.src_region(), Some(([0, 0], [200, 160])));
 }
 
@@ -427,6 +438,8 @@ fn empty_chunks_get_the_fill() {
     let o = WarpOptions::new(ResampleAlg::Cubic).with_dst_nodata(rwarp::warp::DstNodata::Value(-1.0));
     let out: Vec<f32> = warp_chunks(&Away, &plan, &buf, &o);
     assert_eq!(out, vec![-1.0; 48]);
+    let par: Vec<f32> = warp_chunks_par(|| Ok(Away), &plan, &buf, &o, 4).unwrap();
+    assert_eq!(par, out);
 }
 
 /// A low fill ratio splits a large target (GDAL's fill ratio heuristic):
@@ -507,5 +520,84 @@ fn split_antimeridian_reads_compact_windows() {
         let a: Vec<f64> = warp_chunks(&Wrap, &g, &buf, &wo);
         let b: Vec<f64> = warp_chunks(&Wrap, &s, &buf, &wo);
         assert_eq!(a, b, "{alg:?}");
+        // on threads, the gap's two chunks placed in the plan's order
+        for threads in [2, 7] {
+            let p: Vec<f64> = warp_chunks_par(|| Ok(Wrap), &s, &buf, &wo, threads).unwrap();
+            assert_eq!(p, b, "{alg:?}, {threads} threads");
+        }
     }
+}
+
+/// Many chunks on threads: every area method and kernel, the exact
+/// footprint, a cutline, two bands, a source buffer that starts inside
+/// the source, and a target window at an offset; `warp_chunks`' values bit
+/// for bit. `transformer()` is called once a thread at most; its error
+/// comes back.
+#[test]
+fn warp_chunks_par_is_warp_chunks() {
+    use rwarp::cutline::Cutline;
+    use rwarp::warp::Footprint;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // a rotation and scale, so chunks' windows overlap
+    struct Turn;
+    impl Transformer for Turn {
+        fn transform(&self, dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+            let (s, c) = 0.3f64.sin_cos();
+            for (x, y) in x.iter_mut().zip(y.iter_mut()) {
+                let (u, v) = (*x, *y);
+                (*x, *y) = if dst_to_src {
+                    (20.0 + 1.6 * (u * c - v * s), 60.0 + 1.6 * (u * s + v * c))
+                } else {
+                    let (u, v) = ((u - 20.0) / 1.6, (v - 60.0) / 1.6);
+                    (u * c + v * s, -u * s + v * c)
+                };
+            }
+            vec![true; x.len()]
+        }
+    }
+    let (sw, sh) = (260, 240);
+    let data: Vec<f64> = (0..sw * sh).flat_map(|i| [value(i % sw, i / sw), ((i * 31) % 17) as f64]).collect();
+    let cut = Cutline::new(vec![vec![vec![[10.0, 20.0], [250.0, 30.0], [230.0, 230.0], [30.0, 200.0], [10.0, 20.0]]]]);
+    for alg in [ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::Average, ResampleAlg::Mode, ResampleAlg::Max] {
+        for exact in [false, true] {
+            if exact && !alg.is_area() {
+                continue;
+            }
+            let o = ChunkOptions::new(alg).with_memory_limit(60_000.0).with_pixel_cost(DataType::Float64, 2, false, false);
+            let planner = rwarp::plan::ChunkPlanner::new(&Turn, [sw, sh], [150, 130], o);
+            let plan = planner.plan_window([5, 3], [120, 110]);
+            assert!(plan.live().count() >= 6, "{} chunks", plan.live().count());
+            // the buffer: the plan's source region, at its offset
+            let (lo, size) = plan.src_region().unwrap();
+            assert!(lo[1] > 0, "{lo:?} {size:?}");
+            let sub: Vec<f64> = (lo[1]..lo[1] + size[1])
+                .flat_map(|r| (lo[0]..lo[0] + size[0]).flat_map(move |c| [0, 1].map(|b| (r * sw + c) * 2 + b)))
+                .map(|k| data[k])
+                .collect();
+            let buf = SourceBuffer { data: &sub, ncol: size[0], nrow: size[1], nbands: 2, col_off: lo[0], row_off: lo[1] };
+            let mut wo = WarpOptions::new(alg).with_cutline(cut.clone()).with_dst_nodata(rwarp::warp::DstNodata::Value(-1.0));
+            if exact {
+                wo = wo.with_footprint(Footprint::Exact { densify: 2 });
+            }
+            let one: Vec<f64> = warp_chunks(&Turn, &plan, &buf, &wo);
+            assert!(one.iter().filter(|&&v| v != -1.0).count() > 120 * 110, "{alg:?}");
+            for threads in [0, 2, 3, 9] {
+                let calls = AtomicUsize::new(0);
+                let make = || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Turn)
+                };
+                let par: Vec<f64> = warp_chunks_par(make, &plan, &buf, &wo, threads).unwrap();
+                let differ = one.iter().zip(&par).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                assert_eq!(differ, 0, "{alg:?}, exact {exact}, {threads} threads");
+                let n = calls.load(Ordering::Relaxed);
+                assert!(n >= 1 && (threads == 0 || n <= threads), "{n} calls on {threads} threads");
+            }
+        }
+    }
+    let o = ChunkOptions::new(ResampleAlg::Bilinear).with_memory_limit(60_000.0);
+    let plan = plan_chunks(&Turn, [sw, sh], [150, 130], &o);
+    let full = SourceBuffer { data: &data, ncol: sw, nrow: sh, nbands: 2, col_off: 0, row_off: 0 };
+    let r = warp_chunks_par::<f64, f64, Turn>(|| Err("no transformer".into()), &plan, &full, &WarpOptions::new(ResampleAlg::Bilinear), 4);
+    assert_eq!(r.unwrap_err(), "no transformer");
 }

@@ -1860,17 +1860,17 @@ pub fn warp_to_par<S: Sample + Sync, D: Sample + Send + Sync, X: Transformer>(
 /// and the cutline's density over the source buffer (GDAL's
 /// pafUnifiedSrcDensity). A buffer entirely inside needs none, as in
 /// GDAL; one entirely outside (`outside`) gives no values.
-struct Prep<D> {
-    out_spec: Output<D>,
+pub(crate) struct Prep<D> {
+    pub(crate) out_spec: Output<D>,
     density: Vec<f32>,
     /// With a cutline the buffer is partly inside: whether its rule is
     /// [`CutlineRule::Exact`].
     cut: Option<bool>,
-    outside: bool,
+    pub(crate) outside: bool,
 }
 
 impl<D: Sample> Prep<D> {
-    fn new<S: Sample>(src: &SourceBuffer<'_, S>, opts: &WarpOptions) -> Self {
+    pub(crate) fn new<S: Sample>(src: &SourceBuffer<'_, S>, opts: &WarpOptions) -> Self {
         let nbands = src.nbands;
         assert_eq!(src.data.len(), src.ncol * src.nrow * nbands, "source buffer size mismatch");
         assert!(opts.mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
@@ -1889,7 +1889,7 @@ impl<D: Sample> Prep<D> {
     }
 
     /// The source buffer as the kernels read it.
-    fn img<'a, S: Sample>(&'a self, src: &SourceBuffer<'a, S>, opts: &WarpOptions) -> Interleaved<'a, S> {
+    pub(crate) fn img<'a, S: Sample>(&'a self, src: &SourceBuffer<'a, S>, opts: &WarpOptions) -> Interleaved<'a, S> {
         Interleaved {
             src: src.data, ncol: src.ncol, nrow: src.nrow, nb: src.nbands,
             mask: opts.mask_band, nodata: self.out_spec.src_nodata::<S>(), rule: opts.band_nodata,
@@ -1900,7 +1900,7 @@ impl<D: Sample> Prep<D> {
 
 /// The kernel scale `(sx, sy)` of a warp of the whole destination window
 /// ([`WarpOptions::scaling`]).
-fn kernel_scale(transformer: &impl Transformer, dst_ncol: usize, dst_nrow: usize, opts: &WarpOptions) -> (f64, f64) {
+pub(crate) fn kernel_scale(transformer: &impl Transformer, dst_ncol: usize, dst_nrow: usize, opts: &WarpOptions) -> (f64, f64) {
     match opts.scaling {
         KernelScaling::Point => (1.0, 1.0),
         KernelScaling::WidenWhenDownsampling => {
@@ -1913,17 +1913,17 @@ fn kernel_scale(transformer: &impl Transformer, dst_ncol: usize, dst_nrow: usize
 /// The whole destination window a band of rows is part of: its size, and
 /// the kernel scale worked out over it.
 #[derive(Clone, Copy)]
-struct Rows {
-    ncol: usize,
-    nrow: usize,
-    scale: (f64, f64),
+pub(crate) struct Rows {
+    pub(crate) ncol: usize,
+    pub(crate) nrow: usize,
+    pub(crate) scale: (f64, f64),
 }
 
 /// Rows `band` of the destination window `rows` (at the offset in
 /// `opts`), into `out`, those rows of the output, filled. The exact
 /// footprint's lattice is kept in `lat` for the thread's next band.
 #[allow(clippy::too_many_arguments)]
-fn warp_rows<S: Sample, D: Sample>(
+pub(crate) fn warp_rows<S: Sample, D: Sample>(
     transformer: &impl Transformer,
     src: &SourceBuffer<'_, S>,
     img: &Interleaved<'_, S>,
@@ -2084,8 +2084,7 @@ impl<D: Sample> Output<D> {
     }
 
     pub(crate) fn filled(&self, npix: usize) -> Vec<D> {
-        let nb = self.fill.len();
-        (0..npix * nb).map(|i| self.fill[i % nb]).collect()
+        self.fill.repeat(npix)
     }
 
     #[inline]

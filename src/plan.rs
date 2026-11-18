@@ -21,7 +21,7 @@
 //! feature. It does no I/O; read each chunk's source window however suits
 //! (a COG, Zarr, an array in memory) and warp it with
 //! [`Chunk::warp_options`], or hand a source buffer covering the plan to
-//! [`warp_chunks`].
+//! [`warp_chunks`], or to [`warp_chunks_par`] for several threads.
 //!
 //! ```
 //! use rwarp::plan::{plan_chunks, ChunkOptions};
@@ -70,11 +70,18 @@
 //! GDAL's shortcut for a translation by whole pixels (no kernel padding,
 //! nearest neighbour).
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::source_window::{find_discontinuity_range, SourceWindow};
 use crate::transform::Transformer;
-use crate::warp::{estimate_scale, warp_to, DataType, KernelScaling, ResampleAlg, Sample, SourceBuffer, WarpOptions};
+use crate::warp::{
+    estimate_scale, kernel_scale, warp_rows, warp_to, DataType, KernelScaling, Prep, ResampleAlg, Rows, Sample,
+    SourceBuffer, WarpOptions,
+};
 
 /// GDAL's default warp memory limit, 64 MiB (`dfWarpMemoryLimit`).
 pub const DEFAULT_MEMORY_LIMIT: f64 = 64.0 * 1024.0 * 1024.0;
@@ -1007,10 +1014,7 @@ pub fn warp_chunks<S: Sample, D: Sample>(
     let empty: SourceBuffer<'_, S> = SourceBuffer { data: &[], ncol: 0, nrow: 0, nbands: nb, col_off: 0, row_off: 0 };
     let o = WarpOptions { alg: ResampleAlg::NearestNeighbour, scaling: KernelScaling::Point, ..opts.clone() };
     let fill: Vec<D> = warp_to(transformer, &empty, 1, 1, &o);
-    let mut out: Vec<D> = Vec::with_capacity(w * h * nb);
-    for _ in 0..w * h {
-        out.extend_from_slice(&fill);
-    }
+    let mut out: Vec<D> = fill.repeat(w * h);
     let mut data: Vec<S> = Vec::new();
     for c in plan.live() {
         let [sw, sh] = c.src_size;
@@ -1029,6 +1033,219 @@ pub fn warp_chunks<S: Sample, D: Sample>(
         merge_tile(&mut out, &tile, &fill, w, [dx, dy], cw, nb);
     }
     out
+}
+
+/// [`warp_chunks`] on up to `threads` threads (0 for all available), with
+/// the same values, bit for bit.
+///
+/// - **A transformer per thread.** `transformer()` builds one on each
+///   thread (the calling thread's first), as for
+///   [`warp_to_par`](crate::warp::warp_to_par): one over libproj isn't
+///   `Sync`. A thread keeps its transformer for every chunk it warps.
+/// - **Bands of rows of each chunk.** The work is cut into bands of each
+///   chunk's rows, about four bands a thread over the whole plan, so a
+///   plan of one chunk runs on every thread and one of many chunks warps
+///   several at once. The threads take them in turn, chunk by chunk. Each
+///   band is warped as [`warp_to`] warps those rows of its chunk: the
+///   chunk's kernel scale is fixed by the plan, and its cutline density is
+///   worked out once.
+/// - **Memory.** A chunk's source window is copied when its first band is
+///   taken (unless it is whole rows of `src`, which it then borrows) and
+///   dropped when its last is done, so about as many windows are held as
+///   there are threads.
+/// - **The plan's order.** Chunks are placed into the target in the plan's
+///   order, as [`warp_chunks`] places them (two chunks of an antimeridian
+///   gap share a target window): a band goes in as soon as it is done if
+///   every chunk before its own is in, and waits otherwise.
+///
+/// With `threads = 1` nothing is spawned, and this is [`warp_chunks`]
+/// through one `transformer()`. Errors with the first `transformer()`
+/// error, or if a thread panicked.
+///
+/// # Panics
+///
+/// If `src` does not cover a live chunk's source window.
+pub fn warp_chunks_par<S, D, X>(
+    transformer: impl Fn() -> Result<X, String> + Sync,
+    plan: &WarpPlan,
+    src: &SourceBuffer<'_, S>,
+    opts: &WarpOptions,
+    threads: usize,
+) -> Result<Vec<D>, String>
+where
+    S: Sample + Send + Sync,
+    D: Sample + Send + Sync,
+    X: Transformer,
+{
+    let threads = match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+    let first = transformer()?;
+    let live: Vec<&Chunk> = plan.live().collect();
+    if threads <= 1 || live.is_empty() {
+        return Ok(warp_chunks(&first, plan, src, opts));
+    }
+    let nb = src.nbands;
+    let [w, h] = plan.dst_size;
+    let empty: SourceBuffer<'_, S> = SourceBuffer { data: &[], ncol: 0, nrow: 0, nbands: nb, col_off: 0, row_off: 0 };
+    let o = WarpOptions { alg: ResampleAlg::NearestNeighbour, scaling: KernelScaling::Point, ..opts.clone() };
+    let fill: Vec<D> = warp_to(&first, &empty, 1, 1, &o);
+    for c in &live {
+        let (rx, ry) = (c.src_off[0].checked_sub(src.col_off), c.src_off[1].checked_sub(src.row_off));
+        let (Some(rx), Some(ry)) = (rx, ry) else { panic!("source buffer does not cover chunk {c:?}") };
+        assert!(rx + c.src_size[0] <= src.ncol && ry + c.src_size[1] <= src.nrow, "source buffer does not cover chunk {c:?}");
+    }
+    // bands of each chunk's rows, chunk by chunk
+    let per_chunk = (threads * 4).div_ceil(live.len()).max(1);
+    let mut jobs: Vec<(usize, Range<usize>)> = Vec::new();
+    for (i, c) in live.iter().enumerate() {
+        let ch = c.dst_size[1];
+        let per = ch.div_ceil(per_chunk).max(1);
+        jobs.extend((0..ch).step_by(per).map(|r| (i, r..(r + per).min(ch))));
+    }
+    let left: Vec<usize> = (0..live.len()).map(|i| jobs.iter().filter(|j| j.0 == i).count()).collect();
+    let states: Vec<Slot<ChunkWork<S, D>>> = live.iter().map(|_| Mutex::new(None)).collect();
+    let out: Vec<D> = fill.repeat(w * h);
+    let waiting = live.iter().map(|_| Vec::new()).collect();
+    let placed = Mutex::new(Placed { out, next: 0, left, waiting });
+    // band `tile` of rows from `r0` of chunk `k` into the target
+    let place = |out: &mut [D], k: usize, r0: usize, tile: &[D]| {
+        let c = live[k];
+        let [dx, dy] = [c.dst_off[0] - plan.dst_off[0], c.dst_off[1] - plan.dst_off[1]];
+        merge_tile(out, tile, &fill, w, [dx, dy + r0], c.dst_size[0], nb);
+    };
+    let next = AtomicUsize::new(0);
+    let work = |t: &X| {
+        let mut lat = None;
+        let mut current = usize::MAX;
+        while let Some((i, rows)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)).cloned() {
+            let c = live[i];
+            let st = {
+                let mut g = lock(&states[i]);
+                g.get_or_insert_with(|| Arc::new(ChunkWork::new(c, src, opts))).clone()
+            };
+            if current != i {
+                (current, lat) = (i, None);
+            }
+            let [cw, ch] = c.dst_size;
+            let mut tile = st.prep.out_spec.filled(cw * rows.len());
+            if !st.prep.outside {
+                let buf = SourceBuffer { data: &st.data, ncol: c.src_size[0], nrow: c.src_size[1], nbands: nb, col_off: c.src_off[0], row_off: c.src_off[1] };
+                let img = st.prep.img(&buf, &st.opts);
+                let whole = Rows { ncol: cw, nrow: ch, scale: kernel_scale(t, cw, ch, &st.opts) };
+                warp_rows(t, &buf, &img, &st.prep.out_spec, whole, rows.clone(), &st.opts, &mut tile, &mut lat);
+            }
+            drop(st);
+            let finished = {
+                let mut p = lock(&placed);
+                let p = &mut *p;
+                // the bands of the first chunk not yet in go in as they come;
+                // a later chunk's wait for it
+                if p.next == i {
+                    place(&mut p.out, i, rows.start, &tile);
+                } else {
+                    p.waiting[i].push((rows.start, tile));
+                }
+                p.left[i] -= 1;
+                while p.next < live.len() && p.left[p.next] == 0 {
+                    p.next += 1;
+                    if p.next < live.len() {
+                        for (r0, tile) in std::mem::take(&mut p.waiting[p.next]) {
+                            place(&mut p.out, p.next, r0, &tile);
+                        }
+                    }
+                }
+                p.left[i] == 0
+            };
+            if finished {
+                // the chunk's source window is no longer needed
+                *lock(&states[i]) = None;
+            }
+        }
+    };
+    let (failed, panicked) = std::thread::scope(|s| {
+        let hs: Vec<_> = (1..threads.min(jobs.len()))
+            .map(|_| {
+                s.spawn(|| -> Result<(), String> {
+                    let t = transformer()?;
+                    work(&t);
+                    Ok(())
+                })
+            })
+            .collect();
+        // the calling thread works too; every thread is joined, so the
+        // scope has none left to panic over
+        let mut panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&first))).is_err();
+        let mut failed = None;
+        for h in hs {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failed.get_or_insert(e);
+                }
+                Err(_) => panicked = true,
+            }
+        }
+        (failed, panicked)
+    });
+    if panicked {
+        return Err("a warp thread panicked".into());
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let p = placed.into_inner().unwrap_or_else(|e| e.into_inner());
+    debug_assert_eq!(p.next, live.len());
+    Ok(p.out)
+}
+
+/// A live chunk while its bands are warped: its source window (whole rows
+/// of the plan's buffer borrowed, otherwise copied out), what its warp
+/// works out once, and its options ([`Chunk::warp_options`]).
+struct ChunkWork<'a, S: Clone, D> {
+    data: Cow<'a, [S]>,
+    prep: Prep<D>,
+    opts: WarpOptions,
+}
+
+impl<'a, S: Sample, D: Sample> ChunkWork<'a, S, D> {
+    fn new(c: &Chunk, src: &SourceBuffer<'a, S>, opts: &WarpOptions) -> Self {
+        let (nb, [sw, sh]) = (src.nbands, c.src_size);
+        let (rx, ry) = (c.src_off[0] - src.col_off, c.src_off[1] - src.row_off);
+        let data: Cow<'a, [S]> = if rx == 0 && sw == src.ncol {
+            Cow::Borrowed(&src.data[ry * sw * nb..(ry + sh) * sw * nb])
+        } else {
+            let mut v = Vec::with_capacity(sw * sh * nb);
+            for row in 0..sh {
+                let start = ((ry + row) * src.ncol + rx) * nb;
+                v.extend_from_slice(&src.data[start..start + sw * nb]);
+            }
+            Cow::Owned(v)
+        };
+        let opts = c.warp_options(opts);
+        let buf = SourceBuffer { data: &data, ncol: sw, nrow: sh, nbands: nb, col_off: c.src_off[0], row_off: c.src_off[1] };
+        let prep = Prep::new(&buf, &opts);
+        ChunkWork { data, prep, opts }
+    }
+}
+
+/// A chunk's work while it is under way, shared by the threads warping it.
+type Slot<T> = Mutex<Option<Arc<T>>>;
+
+/// The target of [`warp_chunks_par`]: the first chunk not all in it yet
+/// (`next`), the bands each chunk has left to warp, and the bands done of
+/// chunks after `next`, waiting to go in.
+struct Placed<D> {
+    out: Vec<D>,
+    next: usize,
+    left: Vec<usize>,
+    waiting: Vec<Vec<(usize, Vec<D>)>>,
+}
+
+/// A lock, through a thread that panicked holding it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Place a chunk's warped `tile` (`cw` pixels wide, `nb` bands
