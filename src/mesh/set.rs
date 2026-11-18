@@ -629,11 +629,12 @@ impl MeshSet {
     ///   are, widened by a tile. A polygon whose box meets no marked tile is
     ///   skipped. In the rest, each run of edges that can't reach the piece
     ///   is cut short, and a ring that can't reach it at all is dropped or
-    ///   stood in for. The walk sees the same crossings and the same
-    ///   winding round its interior point, so the result is the same, bit
-    ///   for bit. A one-row piece round most of a latitude circle has a box
-    ///   the size of its band's disk, yet walks only the polygons' edges
-    ///   near it.
+    ///   stood in for. Edges are tested 32 at a time by their box first,
+    ///   one by one only near the piece. The walk sees the same crossings
+    ///   and the same winding round its interior point, so the result is
+    ///   the same, bit for bit. A one-row piece round most of a latitude
+    ///   circle has a box the size of its band's disk, yet walks only the
+    ///   polygons' edges near it.
     /// - **Merged.** The pieces' records are merged in controlledburn's
     ///   order (by geometry, then row and column). Cells left out are never
     ///   in them. Where bands meet, the gap between their cells (see the
@@ -1220,14 +1221,59 @@ fn in_parallel_with<S, T: Send>(
     Ok(done.into_iter().map(|d| d.1).collect())
 }
 
-/// One polygon in a band's world: open rings, the outer first, and the
-/// box `[x0, y0, x1, y1]` of the outer ring.
+/// One polygon in a band's world: open rings, the outer first, the box
+/// `[x0, y0, x1, y1]` of the outer ring, and each ring's chunk boxes.
 struct Part {
     rings: Vec<Vec<[f64; 2]>>,
     bx: [f64; 4],
+    /// For each ring, the box of each [`CHUNK`] segments' ends in turn
+    /// (the last chunk shorter): chunk `c` holds segments `c * CHUNK` up to
+    /// `(c + 1) * CHUNK`, and its box their vertices, both ends.
+    chunks: Vec<Vec<[f64; 4]>>,
+}
+
+/// Segments in a ring's chunk, tested against a piece's tiles at once.
+const CHUNK: usize = 32;
+
+/// The box `[x0, y0, x1, y1]` of points `ps` (inverted when empty).
+fn points_box<'a>(ps: impl IntoIterator<Item = &'a [f64; 2]>) -> [f64; 4] {
+    ps.into_iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |a, c| {
+            [
+                a[0].min(c[0]),
+                a[1].min(c[1]),
+                a[2].max(c[0]),
+                a[3].max(c[1]),
+            ]
+        },
+    )
 }
 
 impl Part {
+    /// A part of open rings `rings`, the outer first, with its boxes.
+    fn new(rings: Vec<Vec<[f64; 2]>>) -> Part {
+        let chunks: Vec<Vec<[f64; 4]>> = rings
+            .iter()
+            .map(|r| {
+                let n = r.len();
+                (0..n.div_ceil(CHUNK))
+                    .map(|c| {
+                        let (a, b) = (c * CHUNK, ((c + 1) * CHUNK).min(n));
+                        points_box(r[a..b].iter().chain(Some(&r[b % n])))
+                    })
+                    .collect()
+            })
+            .collect();
+        let bx = points_box(&rings[0]);
+        Part { rings, bx, chunks }
+    }
+
     /// The polygon whole, its rings closed as controlledburn takes them.
     fn polygon(&self) -> Polygon {
         Polygon {
@@ -1490,28 +1536,7 @@ fn assemble(outer: Vec<(Vec<[f64; 2]>, f64)>, holes: Vec<Vec<[f64; 2]>>) -> Vec<
             rings[i].push(h);
         }
     }
-    rings
-        .into_iter()
-        .map(|rings| {
-            let bx = rings[0].iter().fold(
-                [
-                    f64::INFINITY,
-                    f64::INFINITY,
-                    f64::NEG_INFINITY,
-                    f64::NEG_INFINITY,
-                ],
-                |a, c| {
-                    [
-                        a[0].min(c[0]),
-                        a[1].min(c[1]),
-                        a[2].max(c[0]),
-                        a[3].max(c[1]),
-                    ]
-                },
-            );
-            Part { rings, bx }
-        })
-        .collect()
+    rings.into_iter().map(Part::new).collect()
 }
 
 /// Tiles over a piece's box in its world, marking each tile that a cell's
@@ -1638,76 +1663,153 @@ impl Tiles {
     /// (a hole, then, that takes nothing) and is [`Tiles::around`] if it
     /// does. The walk sees the same crossings and the same winding round
     /// `p0`, its interior point, so it gives the same index rings.
+    ///
+    /// A chunk whose box is apart from the piece has all its segments
+    /// apart, so only the segments of chunks near it are tested one by
+    /// one.
     fn trim(&self, q: &Part, p0: [f64; 2]) -> Option<Polygon> {
         let mut rings = Vec::with_capacity(q.rings.len());
-        for (ri, r) in q.rings.iter().enumerate() {
+        for (ri, (r, chunks)) in q.rings.iter().zip(&q.chunks).enumerate() {
             let n = r.len();
-            let apart: Vec<bool> = (0..n).map(|k| self.apart(r[k], r[(k + 1) % n])).collect();
-            if apart.iter().all(|&a| a) {
-                let w: i64 = (0..n).map(|k| crossing(r[k], r[(k + 1) % n], p0)).sum();
-                if w != 0 {
-                    rings.push(close(&self.around()));
-                } else if ri == 0 {
-                    return None;
+            let near: Vec<bool> = chunks.iter().map(|&b| self.meets(b)).collect();
+            let kept = if near.contains(&true) {
+                self.runs(r, chunks, &near, p0)
+            } else {
+                None
+            };
+            match kept {
+                Some(kept) => rings.push(close(&kept)),
+                None => {
+                    // wholly apart: round the piece, or round none of it
+                    let w: i64 = (0..chunks.len())
+                        .map(|c| {
+                            chunk_crossings(r, chunks, c, c * CHUNK, ((c + 1) * CHUNK).min(n), p0)
+                        })
+                        .sum();
+                    if w != 0 {
+                        rings.push(close(&self.around()));
+                    } else if ri == 0 {
+                        return None;
+                    }
                 }
-                continue;
             }
-            let mut keep = vec![true; n];
-            let mut k = 0;
-            while k < n {
-                if !apart[k] {
-                    k += 1;
-                    continue;
-                }
-                let a = k;
-                while k < n && apart[k] {
-                    k += 1;
-                }
-                // segments a..k, vertices a..=k (vertex n is vertex 0)
-                self.shorten(r, a, k, p0, &mut keep);
-            }
-            let kept: Vec<[f64; 2]> = r
-                .iter()
-                .zip(&keep)
-                .filter(|(_, &k)| k)
-                .map(|(p, _)| *p)
-                .collect();
-            rings.push(close(&kept));
         }
         Some(Polygon { rings })
     }
 
+    /// Ring `r` (open, with its chunks' boxes, those `near` the piece
+    /// marked) with each run of segments apart from the piece shortened;
+    /// `None` when every segment is apart. Far chunks are passed whole.
+    fn runs(
+        &self,
+        r: &[[f64; 2]],
+        chunks: &[[f64; 4]],
+        near: &[bool],
+        p0: [f64; 2],
+    ) -> Option<Vec<[f64; 2]>> {
+        let n = r.len();
+        let apart = |k: usize| !near[k / CHUNK] || self.apart(r[k], r[(k + 1) % n]);
+        let mut out = Vec::new();
+        let mut met = false;
+        let mut k = 0;
+        while k < n {
+            if !apart(k) {
+                met = true;
+                out.push(r[k]);
+                k += 1;
+                continue;
+            }
+            // a run of segments apart from the piece, a..b
+            let a = k;
+            while k < n {
+                if !near[k / CHUNK] {
+                    k = ((k / CHUNK + 1) * CHUNK).min(n);
+                } else if apart(k) {
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            self.shorten(r, chunks, a, k, p0, &mut out);
+        }
+        met.then_some(out)
+    }
+
     /// Vertices `a..=b` of ring `r` (vertex `n` is vertex 0), joined by
-    /// segments apart from the piece: clear `keep` for those a shortcut
-    /// skips. Greedily, each shortcut runs as far as it can while it is
-    /// apart from the piece too, and closes a loop of winding 0 round
+    /// segments apart from the piece: push those a walk round them keeps,
+    /// all but `b`. Greedily, each shortcut runs as far as it can while it
+    /// is apart from the piece too, and closes a loop of winding 0 round
     /// `p0` with the stretch it replaces. Being apart, the loop winds as
     /// often round every point of the piece, and its crossings of `p0`'s
     /// row are a tile or more from `p0`, so the walk's own winding test
     /// counts them alike.
-    fn shorten(&self, r: &[[f64; 2]], a: usize, b: usize, p0: [f64; 2], keep: &mut [bool]) {
+    ///
+    /// A shortcut tries a whole chunk ahead (its crossings are none when
+    /// its box is all above or below `p0`'s row) before one vertex at a
+    /// time, so a far run costs about a test a chunk.
+    fn shorten(
+        &self,
+        r: &[[f64; 2]],
+        chunks: &[[f64; 4]],
+        a: usize,
+        b: usize,
+        p0: [f64; 2],
+        out: &mut Vec<[f64; 2]>,
+    ) {
         let n = r.len();
         let v = |i: usize| r[i % n];
-        // crossings of the stretch from `a`, by its end vertex
-        let mut pre = vec![0i64; b - a + 1];
-        for i in a..b {
-            pre[i + 1 - a] = pre[i - a] + crossing(v(i), v(i + 1), p0);
-        }
-        let mut from = a;
-        let mut t = a + 2;
-        while t <= b {
-            let w = pre[t - a] - pre[from - a] + crossing(v(t), v(from), p0);
-            if w == 0 && self.apart(v(from), v(t)) {
-                t += 1;
+        // from -> to holds, `w` the crossings of the stretch from..to
+        let (mut from, mut to) = (a, a + 1);
+        let mut w = crossing(v(a), v(a + 1), p0);
+        out.push(v(a));
+        // a whole chunk ahead failed: one vertex at a time to its end
+        let mut slow = false;
+        while to < b {
+            let whole = !slow && to % CHUNK == 0 && to + CHUNK <= b;
+            let (next, wn) = if whole {
+                let c = to / CHUNK;
+                (
+                    to + CHUNK,
+                    w + chunk_crossings(r, chunks, c, to, to + CHUNK, p0),
+                )
+            } else {
+                (to + 1, w + crossing(v(to), v(to + 1), p0))
+            };
+            if wn + crossing(v(next), v(from), p0) == 0 && self.apart(v(from), v(next)) {
+                (to, w) = (next, wn);
+            } else if whole {
+                slow = true;
                 continue;
+            } else {
+                // from -> to is a shortcut; the next starts at `to`
+                out.push(v(to));
+                from = to;
+                to = from + 1;
+                w = crossing(v(from), v(to), p0);
             }
-            // from -> t - 1 holds (as one segment it always does)
-            keep[from + 1..t - 1].fill(false);
-            from = t - 1;
-            t = from + 2;
+            if to % CHUNK == 0 {
+                slow = false;
+            }
         }
-        keep[from + 1..b].fill(false);
     }
+}
+
+/// The crossings of `p0`'s row by segments `a..b` of ring `r`, all in
+/// chunk `c`: none when the chunk's box is all above or below the row.
+fn chunk_crossings(
+    r: &[[f64; 2]],
+    chunks: &[[f64; 4]],
+    c: usize,
+    a: usize,
+    b: usize,
+    p0: [f64; 2],
+) -> i64 {
+    let bx = chunks[c];
+    if p0[1] < bx[1] || p0[1] >= bx[3] {
+        return 0;
+    }
+    let n = r.len();
+    (a..b).map(|k| crossing(r[k], r[(k + 1) % n], p0)).sum()
 }
 
 /// Segment `a -> b`'s part in the winding number of a ring round `p`, as
@@ -2186,25 +2288,7 @@ mod tests {
                 })
                 .collect()
         };
-        let part = |r: Vec<[f64; 2]>| {
-            let bx = r.iter().fold(
-                [
-                    f64::INFINITY,
-                    f64::INFINITY,
-                    f64::NEG_INFINITY,
-                    f64::NEG_INFINITY,
-                ],
-                |a, c| {
-                    [
-                        a[0].min(c[0]),
-                        a[1].min(c[1]),
-                        a[2].max(c[0]),
-                        a[3].max(c[1]),
-                    ]
-                },
-            );
-            Part { rings: vec![r], bx }
-        };
+        let part = |r: Vec<[f64; 2]>| Part::new(vec![r]);
         let lat = {
             let [x, y] = p.mesh.corners(0, 0)[0];
             90.0 - 2.0 * (x.hypot(y) / (2.0 * R)).asin().to_degrees()

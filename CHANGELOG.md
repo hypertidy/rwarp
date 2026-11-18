@@ -139,6 +139,10 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       are, so polygons elsewhere are skipped and runs of edges away from
       it cut short, with the same result bit for bit. On ORCA2 the
       countries went from 3.0 s to 1.1 s.
+    - Each ring's edges are tested against a piece 32 at a time by
+      their box, one by one only near it, and far runs are cut short a
+      chunk at a time, again bit for bit. On one thread ORCA2's countries
+      take 0.96 s at 1 m (1.1 s before) and 4.6 s at 0.01 m (5.6 s).
     - `MeshSet::burn_par(geoms, bands, tolerance, opts, threads)` gives
       the same records on several threads. Pieces filter, walk and burn
       their polygons in parallel. Projection stays on the calling
