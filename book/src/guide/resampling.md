@@ -28,7 +28,7 @@ when matching on the enums.
 |---|---|---|
 | `alg` | `NearestNeighbour`, `Bilinear`, `Cubic`, `Lanczos`, `Average`, `Mode` | `-r` |
 | `scaling` | `WidenWhenDownsampling` (default), `Fixed { x, y }`, `Point` | `-wo XSCALE=`, `-wo YSCALE=` |
-| `footprint` | `GdalBox` (default), `Exact { densify }` | (average and mode only) |
+| `footprint` | `GdalBox` (default), `Exact { densify }`, `Adaptive { densify, tolerance }` | (average and mode only) |
 | `mode_ties` | `First` (default), `Min`, `Max` | `-wo MODE_TIES=` |
 | `average` | thresholds and excluded values | `NODATA_VALUES_PCT_THRESHOLD`, `EXCLUDED_VALUES`, `EXCLUDED_VALUES_PCT_THRESHOLD` |
 | `band_nodata` | `Partial` (default), `Unified`, `PerBand`, `AnyBand` | `-wo UNIFIED_SRC_NODATA=` |
@@ -105,6 +105,10 @@ area in source pixel space:
   over valid pixels, `Average` is then first-order conservative remapping.
   It costs about 25 times the box. The same overlaps are available as a
   weight table; see [Conservative weights](weights.md).
+- **`Footprint::Adaptive { densify, tolerance }`** is the exact footprint
+  with each segment bisected where the transform bends it, until the
+  outline is within `tolerance` (source pixels) of the true curve. Where
+  the transform is affine it is `Exact { densify }` bit for bit.
 
 `Mode` counts covered area per value and breaks ties with `ModeTies`.
 Counts are re-compared every time a value's count grows, in scan order, so

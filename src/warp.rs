@@ -72,6 +72,9 @@
 //!   conservative remapping with areas in source pixel space, or, for a
 //!   geolocation source, in the source's world coordinates
 //!   ([`Transformer::source_cells`]).
+//! - [`Footprint::Adaptive`] is the exact footprint with the outline's
+//!   segments bisected where the transform bends them, to a tolerance
+//!   (d3-geo's adaptive resampling, through bigcurve).
 //!
 //! For a destination pixel that maps to an axis-aligned rectangle the two
 //! agree. The exact footprint transforms the destination pixel lattice
@@ -363,6 +366,43 @@ pub enum Footprint {
     /// its world (round a polar projection's far pole) isn't measured in
     /// that world.
     Exact { densify: usize },
+    /// [`Footprint::Exact`] with the outline's edges refined where the
+    /// transform bends them: each edge is split into `densify` segments as
+    /// there, then each segment is bisected while its transformed midpoint
+    /// strays more than `tolerance` from the segment's chord (or lands
+    /// outside the chord's middle three fifths), up to 16 levels: d3-geo's
+    /// adaptive resampling, through [bigcurve](https://docs.rs/bigcurve)
+    /// with planar edges in destination pixel space. Each level's new
+    /// points go to the transformer in one call. A segment's new points
+    /// depend only on its own ends, so a segment shared by two
+    /// destination pixels gets the same points from both, and tiles and
+    /// threads give the same outlines as a whole window.
+    ///
+    /// `tolerance` is in the units the outline is measured in: source
+    /// pixels, or the source's world coordinates when its transformer
+    /// reports cells ([`Transformer::source_cells`]; there it is one length
+    /// for every cell, so small cells get it as a larger fraction of
+    /// themselves). The error in the weights falls with the tolerance, and
+    /// the points added grow as its inverse square root, the rate a fixed
+    /// `densify` has too. What changes is where they go: only to the
+    /// segments that bend, so a warp that bends in places (round a pole,
+    /// near a projection's edge) needs fewer points than a `densify` fine
+    /// enough for the worst of them, and the tolerance says how close the
+    /// outline is. Where the transform is affine nothing is added, and the
+    /// result is bit for bit `Exact { densify }`'s; each segment still
+    /// costs one transformed midpoint to find that out.
+    ///
+    /// A point that fails to transform fails its pixel, as a failed
+    /// lattice point does. A row line's new points at one level reach the
+    /// transformer as a scanline, which an approximating transformer
+    /// ([`crate::approx::ApproxTransformer`]) interpolates, so refinement
+    /// below its error follows its interpolation rather than the true
+    /// curve: use the exact transformer, or a tolerance above its error.
+    ///
+    /// # Panics
+    ///
+    /// If `tolerance` is not positive (or is NaN).
+    Adaptive { densify: usize, tolerance: f64 },
 }
 
 /// How [`ResampleAlg::Mode`] breaks a tie between values with equal
@@ -2958,8 +2998,13 @@ fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
 ) {
     let (nb, dst_ncol) = (img.nb, rows.ncol);
     let mut row_res: Vec<Res<T>> = vec![Res::None; dst_ncol * nb];
-    let exact = match opts.footprint {
-        Footprint::Exact { densify } => {
+    let edges = match opts.footprint {
+        Footprint::Exact { densify } => Some(Edges::new(densify, None)),
+        Footprint::Adaptive { densify, tolerance } => Some(Edges::new(densify, Some(tolerance))),
+        Footprint::GdalBox => None,
+    };
+    let exact = match edges {
+        Some(edges) => {
             // the band's lattice starts at its first row; turns are found
             // over the whole window, so every band finds the same
             let at = (opts.dst_col_off, opts.dst_row_off + band.start);
@@ -2967,12 +3012,12 @@ fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
                 Some(l) => l.start(transformer, at.1),
                 None => {
                     let src = (src_off.0 as usize, src_off.1 as usize, img.ncol, img.nrow);
-                    *lat = Some(Lattice::new(transformer, dst_ncol, densify.max(1), at, src, (opts.dst_row_off, rows.nrow)));
+                    *lat = Some(Lattice::new(transformer, dst_ncol, edges, at, src, (opts.dst_row_off, rows.nrow)));
                 }
             }
             lat.as_mut()
         }
-        Footprint::GdalBox => None,
+        None => None,
     };
     let mut exact = exact;
     for dst_row in band.clone() {
@@ -3110,16 +3155,137 @@ impl LatticeLine {
     }
 }
 
+/// How the exact footprint draws a destination pixel's edges: `densify`
+/// segments each, then, with a tolerance, each segment bisected where the
+/// transform bends it ([`Footprint::Adaptive`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Edges {
+    pub(crate) densify: usize,
+    pub(crate) tolerance: Option<f64>,
+}
+
+impl Edges {
+    /// At least one segment an edge.
+    ///
+    /// # Panics
+    ///
+    /// If the tolerance is not positive (or is NaN).
+    pub(crate) fn new(densify: usize, tolerance: Option<f64>) -> Edges {
+        if let Some(t) = tolerance {
+            assert!(t > 0.0, "the footprint's refinement tolerance must be positive, not {t}");
+        }
+        Edges { densify: densify.max(1), tolerance }
+    }
+}
+
+/// The new points of a run of lattice segments
+/// ([`Footprint::Adaptive`]): segment `i`'s are `x[ends[i - 1]..ends[i]]`
+/// (from 0 for `i = 0`), in its written direction, and `failed[i]` is
+/// whether a point it needed failed to transform. Empty without a
+/// tolerance.
+#[derive(Default)]
+struct Refined {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    ends: Vec<usize>,
+    failed: Vec<bool>,
+}
+
+impl Refined {
+    /// Append segment `i`'s new points to `rx`, `ry` (backwards with
+    /// `back`), less `off`; false if the segment failed. Nothing, and true,
+    /// when the run is empty.
+    #[inline]
+    fn put(&self, i: usize, back: bool, (col_off, row_off): (f64, f64), rx: &mut Vec<f64>, ry: &mut Vec<f64>) -> bool {
+        if self.ends.is_empty() { return true; }
+        let r = if i == 0 { 0 } else { self.ends[i - 1] }..self.ends[i];
+        if back {
+            for j in r.rev() {
+                rx.push(self.x[j] - col_off);
+                ry.push(self.y[j] - row_off);
+            }
+        } else {
+            for j in r {
+                rx.push(self.x[j] - col_off);
+                ry.push(self.y[j] - row_off);
+            }
+        }
+        !self.failed[i]
+    }
+}
+
+/// The transformer as bigcurve's forward map for a lattice's segments: to
+/// source pixels, or to world `world`'s coordinates, as
+/// [`LatticeLine::transform`]. Records the destination pixel position of
+/// each point that fails.
+struct LatticeForward<'a, T: Transformer> {
+    transformer: &'a T,
+    world: Option<usize>,
+    at: Vec<[f64; 2]>,
+    failed: Vec<[f64; 2]>,
+}
+
+impl<T: Transformer> bigcurve::ForwardBatch for LatticeForward<'_, T> {
+    fn forward_batch(&mut self, x: &mut [f64], y: &mut [f64], _near: &[[f64; 2]], ok: &mut [bool]) {
+        self.at.clear();
+        self.at.extend(x.iter().zip(y.iter()).map(|(&x, &y)| [x, y]));
+        let good = match (self.transformer.source_cells(), self.world) {
+            (Some(cells), Some(k)) => cells.dst_to_world_in(k, x, y),
+            _ => self.transformer.transform(true, x, y),
+        };
+        for i in 0..x.len() {
+            ok[i] = good[i] && x[i].is_finite() && y[i].is_finite();
+            if !ok[i] { self.failed.push(self.at[i]); }
+        }
+    }
+}
+
+/// Refine the segments `pts`, each between two transformed lattice points,
+/// with tolerance `tol` (in the transformed units) into `out`. `seg_of`
+/// gives the segment a failed point (in destination pixels) is on.
+fn refine_segments<T: Transformer>(
+    transformer: &T, world: Option<usize>, tol: f64, pts: &[(bigcurve::Vertex, bigcurve::Vertex)],
+    seg_of: impl Fn([f64; 2]) -> usize, out: &mut Refined, scratch: &mut Vec<bigcurve::Vertex>,
+) {
+    let fwd = LatticeForward { transformer, world, at: Vec::new(), failed: Vec::new() };
+    let mut r = bigcurve::Resampler::with_edge(fwd, bigcurve::Planar::new(), &bigcurve::Options::new(tol));
+    scratch.clear();
+    out.ends.clear();
+    r.edges(pts, scratch, &mut out.ends);
+    out.x.clear();
+    out.y.clear();
+    out.x.extend(scratch.iter().map(|v| v.x));
+    out.y.extend(scratch.iter().map(|v| v.y));
+    out.failed.clear();
+    out.failed.resize(pts.len(), false);
+    for p in r.into_inner().failed {
+        out.failed[seg_of(p).min(pts.len() - 1)] = true;
+    }
+}
+
+/// A lattice point as a bigcurve vertex: destination pixel position `at`,
+/// transformed to `(x, y)`.
+#[inline]
+fn lattice_vertex(at: [f64; 2], x: f64, y: f64, ok: bool) -> bigcurve::Vertex {
+    bigcurve::Vertex { lon: at[0], lat: at[1], x, y, ok: ok && x.is_finite() && y.is_finite() }
+}
+
 /// One world's transformed lattice: the row lines at the top and bottom
 /// of the band (`ncol * densify + 1` points, left to right) and the
 /// interior points of its column lines, one scanline per interior level:
 /// line `c`, point `k` (1 to `densify - 1`, downwards) at `(k - 1) * (ncol
-/// + 1) + c`.
+/// + 1) + c`. With a tolerance, the new points of each segment: of the
+/// row lines' (segment `i` from point `i` to `i + 1`), and of the column
+/// lines' (segment `c * densify + j` of line `c` from level `j` to `j + 1`,
+/// level 0 the top line and `densify` the bottom).
 #[derive(Default)]
 struct Lines {
     top: LatticeLine,
     bot: LatticeLine,
     vert: LatticeLine,
+    top_r: Refined,
+    bot_r: Refined,
+    vert_r: Refined,
 }
 
 /// A [`SourceSheet`] in a lattice: its cells, their window offset, the
@@ -3161,6 +3327,11 @@ impl Sheet {
 /// measure each pixel with [`Lattice::cover`].
 pub(crate) struct Lattice {
     densify: usize,
+    /// With [`Footprint::Adaptive`]: the tolerance segments are refined to.
+    tolerance: Option<f64>,
+    /// Scratch for refinement: segments, and their new points.
+    segs: Vec<(bigcurve::Vertex, bigcurve::Vertex)>,
+    new_pts: Vec<bigcurve::Vertex>,
     ncol: usize,
     xoff: f64,
     yoff: f64,
@@ -3241,7 +3412,7 @@ impl Lattice {
     /// in several worlds, each world's turn is found over it
     /// ([`Lattice::find_turns`]), so a band of its rows finds the same.
     pub(crate) fn new(
-        transformer: &impl Transformer, ncol: usize, densify: usize,
+        transformer: &impl Transformer, ncol: usize, edges: Edges,
         (dst_col_off, dst_row_off): (usize, usize), src: (usize, usize, usize, usize),
         window: (usize, usize),
     ) -> Self {
@@ -3289,7 +3460,7 @@ impl Lattice {
             }
         }
         let mut lat = Lattice {
-            densify, ncol,
+            densify: edges.densify, tolerance: edges.tolerance, segs: Vec::new(), new_pts: Vec::new(), ncol,
             xoff: dst_col_off as f64, yoff: dst_row_off as f64,
             lines: (0..worlds).map(|_| Lines::default()).collect(),
             level: LatticeLine::default(),
@@ -3313,7 +3484,63 @@ impl Lattice {
         for k in 0..self.lines.len() {
             self.lines[k].bot.fill_row((self.xoff, self.yoff), self.ncol, self.densify, 0);
             self.lines[k].bot.transform(transformer, world.then_some(k));
+            self.refine_bot(transformer, k, 0);
         }
+    }
+
+    /// With a tolerance, refine world `k`'s bottom row line, the band's
+    /// row line `row`: each of its segments, in one run.
+    fn refine_bot(&mut self, transformer: &impl Transformer, k: usize, row: usize) {
+        let Some(tol) = self.tolerance else { return };
+        let world = self.in_world().then_some(k);
+        let (xoff, y, d) = (self.xoff, self.yoff + row as f64, self.densify as f64);
+        let l = &mut self.lines[k];
+        let b = &l.bot;
+        // the positions fill_row gave the points
+        let at = |i: usize| [xoff + i as f64 / d, y];
+        self.segs.clear();
+        self.segs.extend((0..self.ncol * self.densify).map(|i| {
+            (lattice_vertex(at(i), b.x[i], b.y[i], b.ok[i]), lattice_vertex(at(i + 1), b.x[i + 1], b.y[i + 1], b.ok[i + 1]))
+        }));
+        let seg_of = |p: [f64; 2]| ((p[0] - xoff) * d).floor().max(0.0) as usize;
+        refine_segments(transformer, world, tol, &self.segs, seg_of, &mut l.bot_r, &mut self.new_pts);
+    }
+
+    /// With a tolerance, refine world `k`'s column lines over the band's
+    /// row `row`: line `c`'s segment `j`, from level `j` to `j + 1`, is
+    /// segment `c * densify + j`, in one run.
+    fn refine_columns(&mut self, transformer: &impl Transformer, k: usize, row: usize) {
+        let Some(tol) = self.tolerance else { return };
+        let world = self.in_world().then_some(k);
+        let (xoff, y0, d) = (self.xoff, self.yoff + row as f64, self.densify);
+        let (df, m) = (d as f64, self.ncol + 1);
+        let l = &mut self.lines[k];
+        // level j of line c, at the position the lattice gave it
+        let level = |c: usize, j: usize| {
+            let x = xoff + c as f64;
+            if j == 0 {
+                let i = c * d;
+                lattice_vertex([x, y0], l.top.x[i], l.top.y[i], l.top.ok[i])
+            } else if j == d {
+                let i = c * d;
+                lattice_vertex([x, self.yoff + (row + 1) as f64], l.bot.x[i], l.bot.y[i], l.bot.ok[i])
+            } else {
+                let i = (j - 1) * m + c;
+                lattice_vertex([x, y0 + j as f64 / df], l.vert.x[i], l.vert.y[i], l.vert.ok[i])
+            }
+        };
+        self.segs.clear();
+        for c in 0..m {
+            for j in 0..d {
+                self.segs.push((level(c, j), level(c, j + 1)));
+            }
+        }
+        let seg_of = |p: [f64; 2]| {
+            let c = (p[0] - xoff).round().max(0.0) as usize;
+            let j = (((p[1] - y0) * df).floor().max(0.0) as usize).min(d - 1);
+            c * d + j
+        };
+        refine_segments(transformer, world, tol, &self.segs, seg_of, &mut l.vert_r, &mut self.new_pts);
     }
 
     /// Whether outlines are measured in source world coordinates, against
@@ -3376,6 +3603,11 @@ impl Lattice {
                     l.vert.ok.extend_from_slice(&self.level.ok);
                 }
             }
+            if self.tolerance.is_some() {
+                std::mem::swap(&mut l.top_r, &mut l.bot_r);
+                self.refine_bot(transformer, k, row + 1);
+                self.refine_columns(transformer, k, row);
+            }
         }
     }
 
@@ -3415,25 +3647,45 @@ impl Lattice {
     /// into the source buffer: top left to right, right edge down, bottom
     /// right to left, left edge up (as rwarp 0.2 built it). False if any
     /// point failed.
+    ///
+    /// With a tolerance each segment's new points follow its start, in the
+    /// direction the outline goes.
     fn ring(&mut self, k: usize, c: usize, (col_off, row_off): (f64, f64)) -> bool {
         let d = self.densify;
+        let off = (col_off, row_off);
         self.rx.clear();
         self.ry.clear();
         let mut ok = true;
         let (rx, ry) = (&mut self.rx, &mut self.ry);
         let l = &self.lines[k];
-        let mut push = |l: &LatticeLine, k: usize| {
+        let push = |l: &LatticeLine, k: usize, rx: &mut Vec<f64>, ry: &mut Vec<f64>| {
             rx.push(l.x[k] - col_off);
             ry.push(l.y[k] - row_off);
-            ok &= l.ok[k];
+            l.ok[k]
         };
-        for j in 0..d { push(&l.top, c * d + j); }
-        push(&l.top, (c + 1) * d);
         let m = self.ncol + 1;
-        for j in 1..d { push(&l.vert, (j - 1) * m + c + 1); }
-        for j in 0..d { push(&l.bot, (c + 1) * d - j); }
-        push(&l.bot, c * d);
-        for j in (1..d).rev() { push(&l.vert, (j - 1) * m + c); }
+        // top, left to right
+        for j in 0..d {
+            ok &= push(&l.top, c * d + j, rx, ry);
+            ok &= l.top_r.put(c * d + j, false, off, rx, ry);
+        }
+        ok &= push(&l.top, (c + 1) * d, rx, ry);
+        // right, downwards
+        for j in 0..d {
+            ok &= l.vert_r.put((c + 1) * d + j, false, off, rx, ry);
+            if j + 1 < d { ok &= push(&l.vert, j * m + c + 1, rx, ry); }
+        }
+        // bottom, right to left
+        for j in 0..d {
+            ok &= push(&l.bot, (c + 1) * d - j, rx, ry);
+            ok &= l.bot_r.put((c + 1) * d - j - 1, true, off, rx, ry);
+        }
+        ok &= push(&l.bot, c * d, rx, ry);
+        // left, upwards
+        for j in (0..d).rev() {
+            ok &= l.vert_r.put(c * d + j, true, off, rx, ry);
+            if j > 0 { ok &= push(&l.vert, (j - 1) * m + c, rx, ry); }
+        }
         ok
     }
 
