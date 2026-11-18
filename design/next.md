@@ -10,7 +10,7 @@ This file is a snapshot, so replace it rather than append to it.
 
 | crate | version | date | what |
 |---|---|---|---|
-| rwarp | 0.5.0 | prepared 2026-11-18, not yet published | `MeshSet` and NEMO's halos, world-coordinate measure for curvilinear sources, threads (see the changelog) |
+| rwarp | 0.5.0 | 2026-11-18 | `MeshSet` and NEMO's halos, world-coordinate measure for curvilinear sources, threads (#99; see the changelog) |
 | rwarp | 0.4.1 | 2026-11-16 | `QuadMesh::burn_par`, `Rectilinear::burn_par` (#59, #63) |
 | rwarp | 0.4.0 | 2026-11-12 | controlledburn 0.3.1 (breaking for rwarp: its types are in rwarp's API); N6 recorded |
 | rwarp | 0.3.3 | 2026-11-12 | antimeridian split reads two edge windows, not the whole width; `merge_tile` |
@@ -20,7 +20,7 @@ This file is a snapshot, so replace it rather than append to it.
 
 `v0.4.0` (on `6a4c337`) and `v0.4.1` (on `e4c3e49`) were tagged on
 2026-11-16, each on the commit its crate was published from; `v0.5.0`
-goes on the commit 0.5.0 is published from.
+(on `67eb7c4`, #99's merge) on 2026-11-18.
 
 ## Since 0.4.1
 
@@ -44,7 +44,8 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 - **Decisions** N1 (#43), N3 and N4 (#77) decided and built.
 - **rwarp-r**: `warp_buffer()` (#54, #65), the Sentinel-2 vignette
   (#55), `warp_plan()` with gdalwarp's working-memory rules (#67), and
-  the Get started vignette (#74). It is still on rwarp 0.4.1.
+  the Get started vignette (#74). It moved to rwarp 0.5.0 on
+  2026-11-18, its tests unchanged.
 
 ## Open
 
@@ -54,23 +55,18 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 
 ## Next, in order
 
-1. **Publish 0.5.0** (the maintainer), and tag `v0.5.0` on that commit.
-2. **rwarp-r onto rwarp 0.5.0**: change `rwarp-r/src/rust/Cargo.toml`,
-   run `cargo update -p rwarp`, and commit the lock with it (the lock
-   and the manifest must move together, or `vendor.sh` fails). A crate
-   release doesn't trigger R-CMD-check, so rerun it by hand.
-3. **Bump main to the next version** with the next PR, with its
+1. **Bump main to the next version** with the next PR, with its
    changelog section (main's version leads the release).
-4. **#76**, the planner's fill-ratio split.
-5. **Stage 4 (#37)** is built; it can close. The one item left out is
+2. **#76**, the planner's fill-ratio split.
+3. **Stage 4 (#37)** is built; it can close. The one item left out is
    cheaper libproj copies for the threads (`proj_clone`, which the
    `proj` crate doesn't expose).
-6. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
+4. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
    for reprojected polygons and footprint edges), conservative stage 5
    (#39, meshes) and 6 (#40, second order).
-7. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
+5. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
    C4 (#48 to #51).
-8. **The rest of controlledburn 0.3**: `burn_window` could replace
+6. **The rest of controlledburn 0.3**: `burn_window` could replace
    `Cutline::burn_window` (check the records are identical first) and
    split one large geometry into tiles for `burn_par`; `relate_cells`
    finds cells a polygon only touches.
@@ -100,5 +96,11 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
   for that reason.
 - R-CMD-check only runs for changes under `rwarp-r/`. A crate release
   that rwarp-r depends on doesn't trigger it, so rerun it by hand.
+- Moving rwarp-r to a new rwarp: change `rwarp-r/src/rust/Cargo.toml`,
+  run `cargo update -p rwarp` there, and commit the lock with it (the
+  lock and the manifest must move together, or `vendor.sh` fails). To
+  install it locally, run `tools/vendor.sh` first, and remove a stale
+  `src/vendor` left by a failed build: the build uses that directory
+  before the tarball.
 - Main's version leads the release. After publishing, the next
   unreleased version and its changelog section go in with the next PR.

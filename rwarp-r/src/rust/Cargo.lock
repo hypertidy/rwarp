@@ -24,6 +24,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bigcurve"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b379533b5ee4677b098e88195d8dcc9d9caae591054a1bbfc0b1b3da4b86ce63"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,10 +288,11 @@ dependencies = [
 
 [[package]]
 name = "rwarp"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea9cd163a34f818886a42a20f66d4a5633b06f2163159a771247d520e51fb71f"
+checksum = "afbf7939f02bc52feb3fd4b4316528bbb8c86d248ccba9355ddf98e9ba0715ba"
 dependencies = [
+ "bigcurve",
  "controlledburn",
  "proj",
  "proj-sys",
