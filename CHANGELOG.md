@@ -155,6 +155,15 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `weights::exact_weights_par`: `exact_weights` on up to `threads`
+  threads, the same table entry for entry and bit for bit.
+  - Each thread builds its own transformer and takes bands of the
+    target's rows into a table of its own, with one lattice moved to each
+    band; the tables are joined in row order.
+  - A 0.1 degree global source to 1000 x 1000 south polar stereographic
+    at densify 2 (6.7 M entries) through libproj: 3.0 s on one thread,
+    0.58 s on 8. Through a `SetTransformer`, ORCA2 to 1 degree at
+    densify 8: 2.3 s and 0.35 s.
 - `plan::warp_chunks_par`: `warp_chunks` on up to `threads` threads,
   with the same values bit for bit.
   - Each thread builds its own transformer, and takes bands of each

@@ -16,7 +16,7 @@ use controlledburn::{BurnMode, BurnResult, Coord, Geometry, Polygon};
 use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, SetTransformer, WORLD_GT};
 use rwarp::transform::{CenterLong, GenImgProjTransformer};
 use rwarp::warp::{warp_to, warp_to_par, DstNodata, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
-use rwarp::weights::{exact_weights, lonlat_measure, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
+use rwarp::weights::{exact_weights, exact_weights_par, lonlat_measure, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
 use rwarp::{CrsTransform, Transformer};
 
 const R: f64 = 6371229.0;
@@ -962,5 +962,22 @@ fn warp_par_from_the_set_is_warp() {
             let differ = one.iter().zip(&par).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             assert_eq!(differ, 0, "{alg:?}, {threads} threads");
         }
+    }
+}
+
+/// `exact_weights_par` through a `SetTransformer` a thread: `exact_weights`'
+/// table, entry for entry and bit for bit.
+#[test]
+fn exact_weights_par_from_the_set() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let t = set_transformer(&s, GT);
+    let opts = WeightOptions::new(3);
+    let one = exact_weights(&t, &t.source_window(), GW, GH, &opts);
+    for threads in [0, 3] {
+        let par = exact_weights_par(|| Ok(set_transformer(&s, GT)), &t.source_window(), GW, GH, &opts, threads).unwrap();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert!(one.dst_row == par.dst_row && one.dst_col == par.dst_col && one.src_row == par.src_row && one.src_col == par.src_col);
+        assert!(bits(&one.frac) == bits(&par.frac) && bits(&one.dst_area) == bits(&par.dst_area) && bits(&one.src_cell_area) == bits(&par.src_cell_area));
     }
 }

@@ -147,6 +147,17 @@ its entries, storing nothing, for problems too big to hold. Entries cost
 
 (densify 1, release build, one thread, PROJ backend.)
 
+`exact_weights_par(make, &src, dst_ncol, dst_nrow, &opts, threads)` gives
+`exact_weights`' table entry for entry and bit for bit, on several
+threads. As for `warp_par` ([Resampling](resampling.md#threads)), `make`
+builds a transformer for each thread. Each thread takes bands of the
+target's rows into a table of its own, and the tables are joined in row
+order. A 0.1° global source to 1000 by 1000 pixels of south polar
+stereographic at densify 2 (6.7 M entries) takes 3.0 s on one thread,
+0.58 s on 8 and 0.29 s on 32. Through a `SetTransformer`, the same gives
+a whole ocean grid's weights to a grid on threads: ORCA2 to 1° at
+densify 8, 2.3 s on one thread and 0.35 s on 8.
+
 ## Weight files
 
 rwarp has no I/O. Writing ESMF/SCRIP netCDF, xESMF's format or Parquet is

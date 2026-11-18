@@ -7,7 +7,9 @@
 //! (destination cell, source cell) pair, with the overlap's area as a
 //! fraction of the source cell. That is the sparse matrix of first-order
 //! conservative remapping (ESMF's `conserve`), computed once and applied to
-//! any number of fields with [`Weights::apply`].
+//! any number of fields with [`Weights::apply`]. [`exact_weights_with`]
+//! streams them a destination cell at a time, and [`exact_weights_par`]
+//! works them out on several threads.
 //!
 //! # What the numbers are
 //!
@@ -412,28 +414,60 @@ pub fn exact_weights_with(
     opts: &WeightOptions,
     mut f: impl FnMut(CellWeights<'_>),
 ) {
-    let (ncol, nrow) = (src.ncol as i64, src.nrow as i64);
+    check_indices(src, dst_ncol, dst_nrow, opts);
+    if dst_ncol == 0 || dst_nrow == 0 { return; }
+    weights_rows(transformer, src, dst_ncol, dst_nrow, 0..dst_nrow, opts, &mut None, &mut f);
+}
+
+/// Every full-grid index of the source and destination windows fits in
+/// `u32`, or panic.
+fn check_indices(src: &GridWindow, dst_ncol: usize, dst_nrow: usize, opts: &WeightOptions) {
     to_u32(src.col_off + src.ncol, "source column");
     to_u32(src.row_off + src.nrow, "source row");
     to_u32(opts.dst_col_off + dst_ncol, "destination column");
     to_u32(opts.dst_row_off + dst_nrow, "destination row");
+}
+
+/// The message for weights from a source with world cells under a measure
+/// other than [`Measure::Planar`].
+const WORLD_MEASURE: &str = "a source with world cells (Transformer::source_cells) is measured in its world coordinates: \
+     WeightOptions::measure must be Measure::Planar";
+
+/// [`exact_weights_with`] for rows `band` of the `dst_ncol` by `dst_nrow`
+/// window, with the lattice kept in `lat` for the thread's next band.
+#[allow(clippy::too_many_arguments)]
+fn weights_rows(
+    transformer: &impl Transformer,
+    src: &GridWindow,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    band: std::ops::Range<usize>,
+    opts: &WeightOptions,
+    lat: &mut Option<Lattice>,
+    f: &mut impl FnMut(CellWeights<'_>),
+) {
+    let (ncol, nrow) = (src.ncol as i64, src.nrow as i64);
     let src_off = (src.col_off as f64, src.row_off as f64);
     let (mut sr, mut sc, mut fr, mut sa) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    if dst_ncol == 0 || dst_nrow == 0 { return; }
-    let mut lat = Lattice::new(
-        transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off),
-        (src.col_off, src.row_off, src.ncol, src.nrow), (opts.dst_row_off, dst_nrow),
-    );
-    assert!(
-        !lat.in_world() || opts.measure == Measure::Planar,
-        "a source with world cells (Transformer::source_cells) is measured in its world coordinates: \
-         WeightOptions::measure must be Measure::Planar"
-    );
     // The window works in source window pixels.
     let measure = shift_rows(opts.measure, src.row_off as f64);
-    lat.win.set_measure(measure);
-    for row in 0..dst_nrow {
-        lat.row(transformer, row);
+    let lat = match lat {
+        Some(l) => {
+            l.start(transformer, opts.dst_row_off + band.start);
+            l
+        }
+        None => {
+            let mut l = Lattice::new(
+                transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off + band.start),
+                (src.col_off, src.row_off, src.ncol, src.nrow), (opts.dst_row_off, dst_nrow),
+            );
+            assert!(!l.in_world() || opts.measure == Measure::Planar, "{WORLD_MEASURE}");
+            l.win.set_measure(measure);
+            lat.insert(l)
+        }
+    };
+    for row in band.clone() {
+        lat.row(transformer, row - band.start);
         let dst_row = (opts.dst_row_off + row) as u32;
         for c in 0..dst_ncol {
             sr.clear();
@@ -479,7 +513,8 @@ pub fn exact_weights_with(
 
 /// Exact-footprint weights of a `dst_ncol` by `dst_nrow` destination window
 /// (at the offset in `opts`) against the source window `src`; see the
-/// module docs. [`exact_weights_with`] streams them instead.
+/// module docs. [`exact_weights_with`] streams them instead, and
+/// [`exact_weights_par`] works them out on several threads.
 ///
 /// `transformer` maps destination pixels to full-grid source pixels, as
 /// for [`warp`](crate::warp::warp). Only source cells inside `src` get
@@ -491,25 +526,136 @@ pub fn exact_weights(
     dst_nrow: usize,
     opts: &WeightOptions,
 ) -> Weights {
-    let mut w = Weights {
+    let mut w = empty_weights(dst_ncol, dst_nrow, opts);
+    let world = transformer.source_cells().is_some();
+    exact_weights_with(transformer, src, dst_ncol, dst_nrow, opts, |cell| w.push_cell(&cell, world));
+    w
+}
+
+/// [`exact_weights`] on up to `threads` threads (0 for all available),
+/// with the same table, entry for entry and bit for bit.
+///
+/// - **A transformer per thread.** `transformer()` builds one on each
+///   thread, the calling thread's first, as for
+///   [`warp_to_par`](crate::warp::warp_to_par): one over libproj isn't
+///   `Sync`. A `Sync` one serves every thread borrowed: `|| Ok(&t)`.
+/// - **Bands of rows.** The destination's rows are cut into about four
+///   bands a thread, taken in turn. Each thread keeps one lattice, moved
+///   to each band's first row, and fills a table of its own; the tables
+///   are joined in row order, so entries come in [`exact_weights`]' order.
+///
+/// With `threads = 1` (or one row) nothing is spawned, and this is
+/// [`exact_weights`] through one `transformer()`. Errors with the first
+/// `transformer()` error, or if a thread panicked.
+///
+/// # Panics
+///
+/// As [`exact_weights`]: an index that doesn't fit in `u32`, or a source
+/// with world cells and a measure other than [`Measure::Planar`].
+pub fn exact_weights_par<X: Transformer>(
+    transformer: impl Fn() -> Result<X, String> + Sync,
+    src: &GridWindow,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WeightOptions,
+    threads: usize,
+) -> Result<Weights, String> {
+    let threads = match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+    let first = transformer()?;
+    if threads <= 1 || dst_nrow <= 1 || dst_ncol == 0 {
+        return Ok(exact_weights(&first, src, dst_ncol, dst_nrow, opts));
+    }
+    check_indices(src, dst_ncol, dst_nrow, opts);
+    let world = first.source_cells().is_some();
+    assert!(!world || opts.measure == Measure::Planar, "{WORLD_MEASURE}");
+    let per = dst_nrow.div_ceil(threads * 4).max(1);
+    let n = dst_nrow.div_ceil(per);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // bands in turn through `t`, each into a table of its own
+    let work = |t: &X| {
+        let (mut lat, mut done) = (None, Vec::new());
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= n { break; }
+            let band = i * per..((i + 1) * per).min(dst_nrow);
+            let mut w = Weights { dst_area: Vec::with_capacity(band.len() * dst_ncol), ..Weights::default() };
+            weights_rows(t, src, dst_ncol, dst_nrow, band, opts, &mut lat, &mut |cell| w.push_cell(&cell, world));
+            done.push((i, w));
+        }
+        done
+    };
+    let (mut done, failed, panicked) = std::thread::scope(|s| {
+        let hs: Vec<_> = (1..threads.min(n))
+            .map(|_| s.spawn(|| -> Result<Vec<(usize, Weights)>, String> { Ok(work(&transformer()?)) }))
+            .collect();
+        // the calling thread works too; every thread is joined, so the
+        // scope has none left to panic over
+        let (mut done, mut panicked) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&first))) {
+            Ok(d) => (d, false),
+            Err(_) => (Vec::new(), true),
+        };
+        let mut failed = None;
+        for h in hs {
+            match h.join() {
+                Ok(Ok(d)) => done.extend(d),
+                Ok(Err(e)) => { failed.get_or_insert(e); }
+                Err(_) => panicked = true,
+            }
+        }
+        (done, failed, panicked)
+    });
+    if panicked {
+        return Err("a weights thread panicked".into());
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    done.sort_by_key(|d| d.0);
+    let mut w = empty_weights(dst_ncol, dst_nrow, opts);
+    for (_, part) in done {
+        w.append(part);
+    }
+    Ok(w)
+}
+
+/// A table of no entries yet for a `dst_ncol` by `dst_nrow` window.
+fn empty_weights(dst_ncol: usize, dst_nrow: usize, opts: &WeightOptions) -> Weights {
+    Weights {
         dst_off: [opts.dst_col_off, opts.dst_row_off],
         dst_size: [dst_ncol, dst_nrow],
         dst_area: Vec::with_capacity(dst_ncol * dst_nrow),
         measure: opts.measure,
         ..Weights::default()
-    };
-    let world = transformer.source_cells().is_some();
-    exact_weights_with(transformer, src, dst_ncol, dst_nrow, opts, |cell| {
+    }
+}
+
+impl Weights {
+    /// One destination cell's entries, after those before it, with their
+    /// source cells' areas for a source with world cells.
+    fn push_cell(&mut self, cell: &CellWeights<'_>, world: bool) {
         let n = cell.frac.len();
-        if world { w.src_cell_area.extend_from_slice(cell.src_area); }
-        w.dst_row.extend(std::iter::repeat_n(cell.dst_row, n));
-        w.dst_col.extend(std::iter::repeat_n(cell.dst_col, n));
-        w.src_row.extend_from_slice(cell.src_row);
-        w.src_col.extend_from_slice(cell.src_col);
-        w.frac.extend_from_slice(cell.frac);
-        w.dst_area.push(cell.dst_area);
-    });
-    w
+        if world { self.src_cell_area.extend_from_slice(cell.src_area); }
+        self.dst_row.extend(std::iter::repeat_n(cell.dst_row, n));
+        self.dst_col.extend(std::iter::repeat_n(cell.dst_col, n));
+        self.src_row.extend_from_slice(cell.src_row);
+        self.src_col.extend_from_slice(cell.src_col);
+        self.frac.extend_from_slice(cell.frac);
+        self.dst_area.push(cell.dst_area);
+    }
+
+    /// The entries and cells of `part`, the rows after these.
+    fn append(&mut self, mut part: Weights) {
+        self.dst_row.append(&mut part.dst_row);
+        self.dst_col.append(&mut part.dst_col);
+        self.src_row.append(&mut part.src_row);
+        self.src_col.append(&mut part.src_col);
+        self.frac.append(&mut part.frac);
+        self.dst_area.append(&mut part.dst_area);
+        self.src_cell_area.append(&mut part.src_cell_area);
+    }
 }
 
 /// A destination reducer for [`Normalization::DestArea`]: the sum of
