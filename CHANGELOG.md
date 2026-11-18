@@ -2,7 +2,31 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
-## Unreleased
+## 0.5.0 (2026-11-18)
+
+Whole ocean-model grids as `mesh::MeshSet` (regridding to and from them,
+burning onto them, warping from them, NEMO's halos), curvilinear sources
+measured in their own world coordinates, and threads for warps, chunked
+warps and weights.
+
+Upgrading from 0.4:
+
+- No public item of 0.4.1 is removed or has a new signature.
+  `Transformer` gains `source_cells` and `source_wrap`, both with
+  defaults.
+- Values change for the exact footprint (`Footprint::Exact`,
+  `exact_weights`) over geolocation sources, now measured in the
+  source's world coordinates, and across a geographic source's
+  antimeridian and round its poles (see below). Point kernels, the GDAL
+  box footprint and affine sources are unchanged bit for bit.
+- Mesh burns change on meshes with cells of no area inside them, and for
+  a ring touching a mesh at one point (see Fixed). Other meshes give the
+  same records bit for bit.
+- New blanket impls: `Transformer` for `&T`, and `CrsTransform` for
+  `Box<C>` and `&C`. A crate that implements either trait for a
+  reference or a box of its own type conflicts with them; drop that
+  impl.
+- `mesh` is unstable (decision N4): it may break at a 0.x minor release.
 
 ### Changed
 
@@ -49,7 +73,12 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   Natural Earth 10m land onto the warped 1440 x 720 mesh of
   `examples/mesh_burn_par.rs` now takes 0.24 s with `burn` (1.15 s
   before), and 0.06 s at 8 threads (0.23 s).
-
+- Decision N1 (#43): coverage uses the equal-area map on every mesh.
+  `QuadMesh::ring_to_index`, `burn`, `burn_par` and `cover_ring` no longer
+  refuse a mesh built with `CellMap::Bilinear`; they give the same records
+  as on a `CellMap::EqualArea` mesh. A mesh's `CellMap` is now the map of
+  its point methods only (`to_index`, `to_world`, `local`, `world`),
+  `Bilinear` by default for GDAL parity.
 - `mesh` says what "unstable" means (decision N4): the module may break
   at a 0.x minor release, not at a patch release. Its docs show one mesh
   per scan for a swath whose scans overlap (decision N3; a doctest), and
@@ -160,33 +189,33 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   `MeshSet` keeps the file's size and halo (`file_size`, `halo`).
   - `from_file_layout` drops the halo, for a `SetTransformer`'s source
     buffer.
-  - `to_file_layout` puts a field back with the halo masked by a fill. A
-    T-point pivot's two halves of a model cell give it their mean by
+  - `to_file_layout` puts a field back with the halo masked by a fill.
+    Where the fold runs through the last row's centres (T cells at a
+    T-point pivot), the two halves of a model cell give it their mean by
     area.
-  - `fill_halo` writes NEMO's halo: the cyclic columns and the mirrored
-    north-fold row, for `Halo::NEMO_F_PIVOT` and `NEMO_T_PIVOT`. On
-    eORCA1 and ORCA2, cell centres taken to the set and back, halo
-    filled, match the file's to 2e-16 in every row but the first.
+  - `fill_halo(file, nbands, point)` writes NEMO's halo for a set with a
+    NEMO halo: the cyclic columns and the north fold's rows, for a field
+    at the grid's T, U, V or F points (`Stagger`), as NEMO 4.0 writes
+    them (3.6 takes the last column of U and F points at an F pivot from
+    the wrong column). On eORCA1 and ORCA2, cell centres taken to the set
+    and back, halo filled, match the file's to 2e-16 in every row but the
+    first, and the positions of all four points from the T cells' bounds
+    come back exactly.
   - `to_file_layout_vector` and `fill_halo_vector`, for components of a
     vector in the grid's directions: the fold's copies change sign
-    (NEMO's `psgn = -1`), and a T pivot's halves are turned round before
+    (NEMO's `psgn = -1`), and a fold row's halves are turned round before
     their mean. Components east and north are scalars here. On both
     files, components along each cell's own directions come back to
     1e-16, halo and all.
-  - Both fills take a `Stagger`: a field at the grid's T, U, V or F
-    points, whose folds land on other columns and rows, as NEMO 4.0
-    writes them (3.6 takes the last column of U and F points at an F
-    pivot from the wrong column). On both files, the positions of all
-    four points from the T cells' bounds come back exactly, halo masked
-    and filled.
-  - Sets of U, V and F cells: `Halo::nemo(pivot, cells)`, with `Pivot`
-    and the cells' `Stagger` (`NEMO_F_PIVOT` and `NEMO_T_PIVOT` are the
-    T cells'). V and F cells at a T pivot drop the last two rows; the
-    fold runs through the centres of the last row kept for T and U cells
-    at a T pivot and for V and F cells at an F pivot. `Halo` records the
-    grid (`nemo: Option<Nemo>`), for `fill_halo`'s pivot and to pair a
-    fold row's halves by NEMO's mirror for the cells' point. On both
-    files, each point's cells cover the cap north of 60 N to 2e-7.
+- Sets of NEMO's U, V and F cells: `Halo::nemo(pivot, cells)`, with
+  `Pivot` and the cells' `Stagger` (`Halo::NEMO_F_PIVOT` and
+  `NEMO_T_PIVOT` are the T cells'). V and F cells at a T pivot drop the
+  last two rows; the fold runs through the centres of the last row kept
+  for T and U cells at a T pivot and for V and F cells at an F pivot.
+  `Halo::nemo` records the grid (the field `nemo: Option<Nemo>`), for
+  `fill_halo`'s pivot and to pair a fold row's halves by NEMO's mirror
+  for the cells' point. On both files, each point's cells cover the cap
+  north of 60 N to 2e-7 of its area.
 - `MeshSet::weights_to_par` and `weights_onto_par`: `weights_to` and
   `weights_onto` on up to `threads` threads, the same tables bit for bit.
   Pieces with at least `1 / threads` of the set's cells are measured one
@@ -338,8 +367,9 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   - Overlap: refused, as a halo left in gives.
   - NEMO: `Halo::NEMO_F_PIVOT` and `Halo::NEMO_T_PIVOT` are the ORCA
     layouts as CMIP6 files have them (the last two columns, the first
-    row and the last row). At a T pivot the row the fold runs through is
-    halved, and its model cells are two mesh cells.
+    row and the last row), for the T cells; `Halo::nemo` gives the cells
+    round the grid's other points (above). At a T pivot the row the fold
+    runs through is halved, and its model cells are two mesh cells.
   - Real data: checked on IPSL's eORCA1 and ORCA2. Areas agree with
     `areacello` to 1e-4 in total, and a cap over the fold is covered to
     1e-10 of its area. Both files have land cells (eORCA1 south of 76 S,
@@ -388,15 +418,6 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   `GenImgProjTransformer` reports it for a north-up geographic source of
   at most 360 degrees wrapped around a centre longitude (after
   `with_source_size`), and `ApproxTransformer` passes it through.
-
-### Changed
-
-- Decision N1 (#43): coverage uses the equal-area map on every mesh.
-  `QuadMesh::ring_to_index`, `burn`, `burn_par` and `cover_ring` no longer
-  refuse a mesh built with `CellMap::Bilinear`; they give the same records
-  as on a `CellMap::EqualArea` mesh. A mesh's `CellMap` is now the map of
-  its point methods only (`to_index`, `to_world`, `local`, `world`),
-  `Bilinear` by default for GDAL parity.
 
 ## 0.4.1 (2026-11-16)
 
