@@ -732,6 +732,150 @@ fn a_t_pivot_cell_takes_its_halves_mean_by_area() {
     }
     // the rows below keep their own
     assert!((0..nc).all(|c| back[nr * nx - nx + c] == field[(nr - 2) * nc + c]));
+    // components in the grid's directions: the other half's value turned
+    // round, and the second copy the mean turned round
+    let back = s.to_file_layout_vector(&field, 1, -1.0).unwrap();
+    for c in 0..nc {
+        let m = (nc + 2 - c) % nc;
+        let got = back[(last + 1) * nx + c];
+        let want = if m == c {
+            c as f64
+        } else if c == 5 {
+            -(m as f64)
+        } else if m == 5 {
+            c as f64
+        } else if c < m {
+            (area(c) * c as f64 - area(m) * m as f64) / (area(c) + area(m))
+        } else {
+            -(area(m) * m as f64 - area(c) * c as f64) / (area(c) + area(m))
+        };
+        assert!((got - want).abs() < 1e-12, "vector col {c} (mirror {m}): {got} vs {want}");
+        if m != c {
+            assert_eq!(got, -back[(last + 1) * nx + m], "vector col {c}: the copies opposite");
+        }
+    }
+    assert!((0..nc).all(|c| back[nr * nx - nx + c] == field[(nr - 2) * nc + c]));
+}
+
+/// NEMO 3.6's `lbc_lnk` for a T-point field, transcribed from `lbclnk.F90`
+/// and `lbcnfd.F90` (1-based, `jpiglo` columns, `ijpj` rows, the fold's
+/// copies times `psgn`), without the closed south.
+fn nemo_lbc_lnk(f: &mut [i32], nx: usize, ny: usize, t_pivot: bool, psgn: i32) {
+    let at = |ji: usize, jj: usize| (jj - 1) * nx + ji - 1;
+    let (jpiglo, ijpj) = (nx, ny);
+    for jj in 1..=ijpj {
+        f[at(1, jj)] = f[at(jpiglo - 1, jj)];
+        f[at(jpiglo, jj)] = f[at(2, jj)];
+    }
+    if t_pivot {
+        for ji in 2..=jpiglo {
+            let ijt = jpiglo - ji + 2;
+            f[at(ji, ijpj)] = psgn * f[at(ijt, ijpj - 2)];
+        }
+        f[at(1, ijpj)] = psgn * f[at(3, ijpj - 2)];
+        for ji in jpiglo / 2 + 1..=jpiglo {
+            let ijt = jpiglo - ji + 2;
+            f[at(ji, ijpj - 1)] = psgn * f[at(ijt, ijpj - 1)];
+        }
+    } else {
+        for ji in 1..=jpiglo {
+            let ijt = jpiglo - ji + 1;
+            f[at(ji, ijpj)] = psgn * f[at(ijt, ijpj - 1)];
+        }
+    }
+}
+
+/// `fill_halo` and `fill_halo_vector` are NEMO's exchange with `psgn` 1
+/// and -1, cell for cell, on a field that is anything in the set's cells.
+/// NEMO copies the cyclic columns the other way (its first column from
+/// the last but one), so its field has them repeated first.
+#[test]
+fn the_halo_is_nemos_exchange() {
+    for t_pivot in [false, true] {
+        let (nc, ny) = (24, 10);
+        let s = orca_set(&orca(nc, ny, t_pivot), t_pivot);
+        let nx = nc + 2;
+        let ours: Vec<i32> = (0..nx * ny)
+            .map(|k| if k % nx >= nc || k / nx == ny - 1 { 77_777 } else { (1 + k % nx + 100 * (k / nx)) as i32 })
+            .collect();
+        let mut theirs = ours.clone();
+        for j in 0..ny {
+            theirs[j * nx + nc] = theirs[j * nx];
+            theirs[j * nx + nc + 1] = theirs[j * nx + 1];
+        }
+        for psgn in [1, -1] {
+            let (mut a, mut b) = (ours.clone(), theirs.clone());
+            if psgn == 1 {
+                s.fill_halo(&mut a, 1).unwrap();
+            } else {
+                s.fill_halo_vector(&mut a, 1).unwrap();
+            }
+            nemo_lbc_lnk(&mut b, nx, ny, t_pivot, psgn);
+            assert_eq!(&a[nx..], &b[nx..], "t_pivot {t_pivot}, psgn {psgn}");
+            assert_eq!(&a[..nc], &ours[..nc], "the first row's cells are left");
+        }
+    }
+}
+
+/// Components of a smooth vector field along each file cell's own row
+/// and column directions, from its corners: a halo cell is its mirror
+/// turned half round, so its components are the mirror's with the sign
+/// changed. Taken to the set and back with `to_file_layout_vector` and
+/// `fill_halo_vector`, every cell but the first row's comes back. A T
+/// pivot's cells are their own mirrors, and here their side midpoints
+/// meet at their centres: their components are rounding, and left to
+/// `the_halo_is_nemos_exchange`. The scalar helpers get the fold wrong.
+#[test]
+fn vector_components_turn_round_across_the_fold() {
+    for t_pivot in [false, true] {
+        let (nc, ny) = (24, 10);
+        let b = orca(nc, ny, t_pivot);
+        let s = orca_set(&b, t_pivot);
+        let (nx, nr) = (nc + 2, ny - 2);
+        let wind = |p: [f64; 2]| [1.0 + 0.004 * p[1], 0.3 - 0.003 * p[0]];
+        let mut file = vec![0.0; nx * ny * 2];
+        for k in 0..nx * ny {
+            let q: Vec<[f64; 2]> = (0..4).map(|v| [b.x[k * 4 + v], b.y[k * 4 + v]]).collect();
+            let mid = |a: usize, c: usize| [(q[a][0] + q[c][0]) / 2.0, (q[a][1] + q[c][1]) / 2.0];
+            let w = wind([(q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4.0, (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4.0]);
+            let along = |from: [f64; 2], to: [f64; 2]| {
+                let d = [to[0] - from[0], to[1] - from[1]];
+                (w[0] * d[0] + w[1] * d[1]) / d[0].hypot(d[1])
+            };
+            file[k * 2] = along(mid(0, 3), mid(1, 2));
+            file[k * 2 + 1] = along(mid(0, 1), mid(3, 2));
+        }
+        // the pivots (column 1, and its cyclic copy, and ncol / 2)
+        let pivot = |k: usize| t_pivot && k / nx == nr && [1, nx / 2, nx - 1].contains(&(k % nx));
+        let mut field = s.from_file_layout(&file, 2).unwrap();
+        let mut back = s.to_file_layout_vector(&field, 2, f64::NAN).unwrap();
+        // at a T pivot both copies of the last row's cells are written
+        for k in (nr * nx..nr * nx + nc).filter(|&k| !pivot(k)) {
+            for c in [k * 2, k * 2 + 1] {
+                assert!((back[c] - file[c]).abs() < 1e-9, "t_pivot {t_pivot}, before the halo: column {}", k % nx);
+            }
+        }
+        s.fill_halo_vector(&mut back, 2).unwrap();
+        for k in (nx..nx * ny).filter(|&k| !pivot(k)) {
+            for c in [k * 2, k * 2 + 1] {
+                assert!((back[c] - file[c]).abs() < 1e-9, "t_pivot {t_pivot}, ({}, {}): {} vs {}", k / nx, k % nx, back[c], file[c]);
+            }
+        }
+        // a half missing at a T pivot: the other's, turned round
+        if t_pivot {
+            let k = (nr - 1) * nc + 5;
+            field[k * 2] = f64::NAN;
+            let back = s.to_file_layout_vector(&field, 2, f64::NAN).unwrap();
+            let f = (nr * nx + 5) * 2;
+            assert!((back[f] - file[f]).abs() < 1e-9, "{} vs {}", back[f], file[f]);
+        }
+        // as scalars, the fold row comes back turned round
+        let field = s.from_file_layout(&file, 2).unwrap();
+        let mut scalar = s.to_file_layout(&field, 2, f64::NAN).unwrap();
+        s.fill_halo(&mut scalar, 2).unwrap();
+        let f = ((ny - 1) * nx + 3) * 2;
+        assert!((scalar[f] + file[f]).abs() < 1e-9 && file[f].abs() > 0.1);
+    }
 }
 
 /// The helpers refuse fields of the wrong size, and only NEMO's halos are
@@ -742,6 +886,8 @@ fn file_layout_refusals() {
     let s = orca_set(&b, false);
     assert!(s.from_file_layout(&[0.0; 10], 1).unwrap_err().contains("26 x 10"));
     assert!(s.to_file_layout(&[0.0f32; 10], 1, 0.0).unwrap_err().contains("24 x 8"));
+    assert!(s.to_file_layout_vector(&[0.0f32; 10], 1, 0.0).unwrap_err().contains("24 x 8"));
     let mut wrong = vec![0.0; 10];
     assert!(s.fill_halo(&mut wrong, 1).is_err());
+    assert!(s.fill_halo_vector(&mut wrong, 1).is_err());
 }

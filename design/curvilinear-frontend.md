@@ -1093,6 +1093,30 @@ with a pair of `CrsTransform`s a band. It borrows the set.
   the halo). Tests: the ORCA-like grids of `tests/mesh_cf.rs`, both
   pivots, centres back to 1e-9 with the halo filled; a T pivot's halves'
   area mean, one half missing; refusals.
+- **Vector components across the fold** (2026-11-18):
+  `to_file_layout_vector` and `fill_halo_vector`, for components in the
+  grid's directions (every band a component; components east and north
+  are scalars). `fill_halo_vector` is NEMO's `lbc_lnk` with `psgn = -1`
+  at T points: the fold's copies change sign, the cyclic columns'
+  don't, the cyclic first and then the fold, as in NEMO 3.6's
+  `lbclnk.F90` and `lbcnfd.F90` (4.0's `lbc_nfd_generic.h90` is the
+  same). That includes the T pivot: column `nx / 2` of the row below
+  the fold is its own mirror and changes sign, and column `nx - 1` of
+  that row is column 1 turned round, though the cyclic halo says column
+  1. A component that agrees with its own halo is zero at a pivot, and
+  ORCA's pivots are on land. `to_file_layout_vector`'s T-pivot halves
+  are in opposite directions (each is the lower half of its own copy),
+  so the other half's value is turned round before the mean by area,
+  and the second copy has the mean turned round. Checked on both CMIP6
+  files with components of a solid-body rotation along each cell's own
+  row and column directions from its bounds: the files' fold copies are
+  their mirrors' turned round exactly (724 and 533 components), and
+  through the set and back they come back to 0 and 1.1e-16 (the scalar
+  helpers: 1.9 and 1.8). Tests: NEMO's `lbc_lnk` transcribed from the
+  Fortran, both pivots, both signs, cell for cell; the same geometric
+  check on the ORCA-like grids; the halves' mean turned round, one half
+  missing. Not built: U, V and F points, whose folds differ (the set's
+  cells are T cells).
 
 ### The exact footprint at the antimeridian
 

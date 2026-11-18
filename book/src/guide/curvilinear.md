@@ -442,6 +442,17 @@ T-point pivot, each cell of the last row is two of the set's cells, and
 centres taken to the set and back, halo filled, come back to 2e-16 in
 every row but the first, which holds no cells.
 
+Components of a vector in the grid's own directions (along its rows and
+columns, as NEMO's velocities are) on the set's cells, T points, take
+`to_file_layout_vector` and `fill_halo_vector`. The grid turns half round across the fold, so the
+fold's copies change sign (NEMO's `psgn = -1`), and at a T pivot each
+half's value is turned round before the two are averaged. Components
+east and north are scalars here. On both files, components of a smooth
+field along each cell's own directions, worked out from its bounds,
+come back to 1e-16, halo and all; as scalars, the fold row comes back
+with its sign changed. NEMO turns round the T pivot's cells too, which
+are their own mirrors and have no directions.
+
 `warp_to_par` gives the same values on several threads, each with a
 `SetTransformer` of its own: `|| SetTransformer::new(&set, &crs, gt,
 dst_crs)`. ORCA2's `Average` at densify 8 takes 2.3 s on one thread,
