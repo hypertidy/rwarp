@@ -394,6 +394,35 @@ On IPSL's CMIP6 files (checked in scratch, not in CI), split at 20 S:
 The worst cells covered are 0.03 km² slivers next to the grid poles,
 where 5e-10 is rounding on a cell a millionth of a source pixel.
 
+`SetTransformer` makes the set the source of a warp, so `warp()` takes a
+field on the whole grid, one value per cell in the set's numbering, with
+any method:
+
+```rust,ignore
+use rwarp::mesh::SetTransformer;
+use rwarp::warp::{warp, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
+
+// tos: the file's field less its halo, one value per cell of the set, NaN on land
+let t = SetTransformer::new(&set, &crs, gt, "+proj=longlat +R=6371229")?;
+let [ncol, nrow] = set.size();
+let src = SourceBuffer { data: &tos, ncol, nrow, nbands: 1, col_off: 0, row_off: 0 };
+let opts = WarpOptions::new(ResampleAlg::Average).with_footprint(Footprint::Exact { densify: 2 });
+let out = warp(&t, &src, 360, 180, &opts);
+```
+
+With the exact footprint, each destination pixel's outline goes to both
+bands' projections and is walked onto every piece it reaches. So
+`Average`, `Mode`, `Min`, `Max` and the rest see every cell under the
+pixel, each weighted by its area. `Average` is `weights_to` and `apply`
+bit for bit, and quicker: 0.9 s on either file at densify 2, against 1.1
+and 1.2 s. Point kernels find the piece whose cell holds the pixel's
+centre and read neighbours in the set's numbering, across pieces and
+bands, as GDAL reads geolocation arrays (0.02 s). A polar projection
+can't hold its far pole: a pixel round the South Pole comes out round
+the whole north band there, turned the other way. An outline turned
+against its band isn't measured in it, so an Antarctic grid takes
+nothing from the north band.
+
 `MeshSet::burn` burns polygons and points in longitude and latitude
 onto the set's cells. It takes the bands the set was built with and a
 tolerance in the bands' world units, and returns controlledburn's tables

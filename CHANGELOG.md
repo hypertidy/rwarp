@@ -155,6 +155,22 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `mesh::SetTransformer`: a `MeshSet` as a warp source (stage 4i of
+  `design/curvilinear-frontend.md`, #37), for `warp()` and
+  `exact_weights` from a whole ocean grid in pieces with every method.
+  - Source pixels are the set's cells in its numbering, so a field on the
+    whole grid (less its halo) is one source buffer.
+  - Area methods with the exact footprint walk each destination pixel's
+    outline in every band's world onto each piece it reaches, into one
+    reduction. `Average` is `weights_to` and `apply` bit for bit, and on
+    ORCA2 to 1 degree 0.88 s against 1.21 s. An outline turned inside
+    out round a polar projection's far pole isn't measured in that band.
+  - Point kernels map into the set's index space through the piece that
+    holds the point, and read neighbours across pieces and bands.
+- `SourceCells` gains `worlds`, `dst_to_world_in` and `sheets` (with
+  `SourceSheet`), defaulted to one world and one sheet, for sources whose
+  cells are in several worlds. `MeshTarget` passes them on. Sources that
+  are one sheet warp and weigh as before, bit for bit.
 - `CrsTransform` for `Box<C>` and `&C` (`C: CrsTransform + ?Sized`), so
   `crs_pair`'s boxed transforms go where a `T: CrsTransform` is asked
   for, such as `MeshSet::burn_par_with`'s `to_world`.

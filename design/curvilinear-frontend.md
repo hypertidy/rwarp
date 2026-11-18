@@ -14,7 +14,8 @@ mesh is a warp target, through `MeshTarget` (4f, 2026-11-17; section 3),
 and a whole ocean grid is a `MeshSet` of pieces in two polar projections
 with damaged land left out (4g, 2026-11-17; section 3), and polygons in
 longitude and latitude burn onto a set, on several threads and
-projected there too (4h, 2026-11-17; section 3).
+projected there too (4h, 2026-11-17; section 3), and a set is a warp
+source, through `SetTransformer` (4i, 2026-11-18; section 3).
 Later stages proposed.
 Stage 2 as built: `QuadMesh::ring_to_index` (cells found by a flood
 from the first point's cell, or from crossed boundary sides, and each
@@ -718,8 +719,7 @@ and `Piece`.
   (0.9998 without the halved fold row), shared out to 8e-14 (1.2 s),
   covered to 1e-9 (0.1 s). The worst covered are 0.03 km² slivers by the
   grid poles.
-- **Not built.** `warp()` from a set (the lattice takes one world;
-  `Weights::apply` regrids instead). Burning came in 4h.
+- **Not built here.** Burning came in 4h, `warp()` from a set in 4i.
 
 ### Burning onto a set (built, 4h)
 
@@ -992,6 +992,80 @@ reached a piece, and again every vertex of a far run for its shortcuts:
 - **What's left** is the walk itself: neighbouring strips each walk the
   edges near them, about 1M vertices at 1 m on ORCA2 for 546k projected.
 
+### warp() from a set (built, 4i)
+
+Built (2026-11-18): `rwarp::mesh::SetTransformer` (`src/mesh/set_source.rs`),
+a `Transformer` whose source pixels are a `MeshSet`'s cells in the set's
+numbering, from a destination grid's geotransform and CRS. The
+constructors match `MeshTransformer`'s: `new(set, band_crs, dst_gt,
+dst_crs)` with the compiled-in backend, `with_backend(set, dst_gt, crs)`
+with a pair of `CrsTransform`s a band. It borrows the set.
+
+- **Several worlds in `SourceCells`.** The trait gains three defaulted
+  methods: `worlds()` (1), `dst_to_world_in(world, x, y)`
+  (`dst_to_world`) and `sheets(window)` (one `SourceSheet`: the window's
+  `mesh` in world 0). A set reports a world a band and each piece's part
+  of the window as a sheet, a mesh with its offset in the window. A mesh
+  target passes them through from its source. Sources that are one sheet
+  are unchanged, bit for bit (ORCA2's `weights_to` and `weights_onto`
+  hash the same as main's, densify 1 and 4).
+- **The lattice in each world.** `warp()`'s exact footprint and
+  `exact_weights` share `Lattice`. It now keeps its transformed row lines
+  and column interiors per world. With several worlds or sheets, each
+  destination pixel's outline is built in every world and walked onto
+  each of that world's sheets that it reaches. Their coverage, offset to
+  buffer pixels, is one `Cover`: a `Window` when one sheet is reached,
+  `Pieces` otherwise, so one reduction takes cells from every piece and
+  band. Each buffer pixel's world area is kept for the reduction.
+  `outline_area` (a weight table's `dst_area`) is the outline's area in
+  the world whose sheets it covers most, as `weights_to` takes it.
+- **Which sheets.** A sheet's box in its world, then the burn's tiles
+  (`Tiles`, now shared). A one-row piece round a latitude circle has a
+  box the size of its band's disk, and every outline in the band met it:
+  ORCA2's `Average` took 1.6 s at densify 2 with boxes only, 0.88 s
+  with the tiles. An outline whose box meets none of a sheet's tiles
+  neither reaches nor holds a cell of it, so nothing changes.
+- **Inside out.** A polar LAEA sends its far pole to its edge. A
+  destination pixel round that pole (the middle pixel of an Antarctic
+  grid, in the north band's world) comes out as a ring round the whole
+  disk, turned the other way, and would cover every cell of the band.
+  Each world's turn is found once, by majority, from small triangles
+  (1e-3 pixel) at pixel centres along a row. An outline whose shoelace
+  area has the other sign isn't measured in that world. Without the
+  test, the Antarctic test below takes the north band at the pole. One-
+  world sources don't get the test, so they are unchanged.
+- **Point kernels.** `transform` maps a destination pixel to each band's
+  world in turn and into the first piece whose cell holds it (the last
+  piece first, with its cell as the hint), then adds the piece's offset:
+  the set's index space. So bilinear and cubic read neighbours across
+  pieces and across the bands' meeting, as across a file's arrays. The
+  reverse goes through the piece that owns the cell (or a neighbour on
+  a shared edge). Points in a cell left out, in the gap or off the grid
+  fail.
+- **Tests** (`tests/mesh_set.rs`, the analytic grid of 4g):
+  - `exact_weights` through the set are `weights_to`'s, fractions equal
+    (0) and target areas to 2e-14; 2 x 2 source windows (across the
+    bands' meeting) tile the whole to 6e-15;
+  - `Average` is `apply(FracArea)` of warp-compatible weights bit for
+    bit (densify 1 and 3), a constant stays constant to 1e-14, `Mode` of
+    the bands takes the band each pixel covers most;
+  - nearest lands in the cell the pixel centre's longitude and latitude
+    give (7206 pixels) and never in a cell left out; bilinear of a field
+    linear in the indices is linear to 6e-14, over 1876 pixels that read
+    more than one piece, 270 of them both bands;
+  - an Antarctic grid in south-polar LAEA takes only the south band;
+  - a set of one piece warps as its mesh through `MeshTransformer`, bit
+    for bit, for `Average`, `Mode`, `Max`, bilinear, cubic and nearest.
+- **On the CMIP6 files** (scratch, one thread, a smooth field of cell
+  centres, NaN on land, to 1 degree): `Average` is `weights_to` and
+  `apply` bit for bit, at densify 2 and 8. eORCA1 0.91 s (1.06 s by
+  weights) and 1.98 s (2.60); ORCA2 0.88 s (1.21) and 2.28 s (3.58).
+  Bilinear and nearest 0.02 s, `Mode` 0.9 s. A 50 km south-polar LAEA
+  grid, 160 x 160 pixels round the pole: no pixel takes the north band.
+- **Not built.** Threads: `warp()` is one pass on the calling thread; a
+  plan's chunks are separate calls. A source buffer is the set's size:
+  the caller drops the file's halo.
+
 ### The exact footprint at the antimeridian
 
 Built (stage 3, #36): `Lattice::cover` in `src/warp.rs`, for sources
@@ -1261,7 +1335,7 @@ GDAL parity tests for `Bilinear` stay as they are.
 | 1 | `QuadMesh` (constructors, validation, `CellMap`, topology `Bounded`), `QuadIndex` upgrades (hints, `locate_all`, boundary index, CSR) | brute-force point in quad; existing geoloc parity tests unchanged |
 | 2 | the walk and equal-area map; `burn_curvilinear` and a small-ring path through `CoverageWindow`; rectilinear front end alongside | generators 1 to 4 and 7 |
 | 3 | exact footprint: equal-area walk for geoloc sources (built, #36); antimeridian unwrap and copies, ring-fold closure (built, #36); geoloc sources across the antimeridian (3b, built, #72) | generator 8; the antimeridian cases from #11's comparison |
-| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too, the filter by chunk boxes (4h, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
+| 4 | walls that meet in the world (seam, fold) for the polygon front end (4a, built); CF bounds and SCRIP corners, halo layout (duplicates dropped, a T pivot's row halved) and an overlap check for copies that keep orientation (N3) (4b, built); the ESMF comparison on a tripolar grid (4c, built); a mesh as a warp source, `MeshTransformer` (4d, built); a declared period for coordinates that jump at the seam, which holds the southern rows of a global ORCA grid (4e, built); a mesh as a warp target, `MeshTarget` (4f, built); a whole ocean grid as a `MeshSet` of pieces in two polar LAEAs, damaged land left out (4g, built); polygons in longitude and latitude burned onto a set, densified by bigcurve, on several threads with projection there too, the filter by chunk boxes (4h, built); a set as a warp source, `SetTransformer`, outlines walked onto pieces in several worlds (4i, built) | the world clip on an annulus, a fold and a tripolar disk (built); ORCA-like disks with their halos, both pivots: refused without the layout, the world clip with it (built), and eORCA1 and ORCA2 from CMIP6 (scratch); ESMF on an analytic tripolar cap, Cartesian to rounding and spherical recorded (built); a mesh source's weights against warp(), tiles, conservation (built); generator 5, a periodic mesh source across its seam and round a pole, eORCA1 and ORCA2 in longitude and latitude (built; ORCA in scratch); onto a mesh: the transpose in one plane, mesh to mesh, a lon/lat source across its seam and over the pole, ESMF onto the cap (built); an analytic global grid with damaged land, eORCA1 and ORCA2 whole (built; files in scratch); boxes on that grid against closed-form slivers, and on eORCA1 and ORCA2 against `weights_onto` (built; files in scratch) |
 | 5 | bigcurve feature: reprojected polygons, adaptive footprint edges | convergence at bigcurve's square-root rate; equality with fixed densify at a fine count |
 | later | overlapping sheets (refused, N3; one mesh per scan meanwhile), swath gaps (mesh holes), approx (cell-centre) mode | |
 

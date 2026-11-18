@@ -234,7 +234,10 @@
 //! [`MeshSet::weights_onto`] give conservative weights from and onto the
 //! whole grid, in the file's numbering, and [`MeshSet::burn`] burns
 //! polygons in longitude and latitude onto it, densified into each band's
-//! projection.
+//! projection. [`SetTransformer`] makes the whole grid the source of a
+//! warp: [`warp`](crate::warp::warp)'s area methods take each destination
+//! pixel's cells from every piece and band it reaches, and point kernels
+//! read across pieces in the set's numbering.
 //!
 //! # CF bounds, SCRIP corners and halos
 //!
@@ -342,6 +345,7 @@ mod cf;
 mod period;
 mod rect;
 mod set;
+mod set_source;
 mod source;
 mod target;
 mod walk;
@@ -351,6 +355,8 @@ pub use period::{unwrap_bounds, unwrap_grid};
 pub(crate) use period::Period;
 pub use rect::Rectilinear;
 pub use set::{Band, MeshSet, Piece};
+pub(crate) use set::Tiles;
+pub use set_source::SetTransformer;
 pub use source::MeshTransformer;
 pub use target::{MeshTarget, WORLD_GT};
 

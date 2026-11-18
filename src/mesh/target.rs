@@ -1,7 +1,7 @@
 //! A [`QuadMesh`] as a warp target: [`MeshTarget`].
 
 use super::QuadMesh;
-use crate::transform::{GenImgProjTransformer, SourceCells, SourceWrap, Transformer};
+use crate::transform::{GenImgProjTransformer, SourceCells, SourceSheet, SourceWrap, Transformer};
 
 /// The destination geotransform of a [`MeshTarget`]'s inner transformer:
 /// its destination pixel/line are the mesh's world coordinates.
@@ -192,6 +192,32 @@ impl<T: Transformer> SourceCells for MeshTarget<T> {
 
     fn lon_wrap(&self) -> bool {
         self.inner.source_cells().is_some_and(|c| c.lon_wrap())
+    }
+
+    fn worlds(&self) -> usize {
+        self.inner.source_cells().map_or(1, |c| c.worlds())
+    }
+
+    fn dst_to_world_in(&self, world: usize, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+        let first = self.to_world(x, y);
+        let second = match self.inner.source_cells() {
+            Some(cells) => cells.dst_to_world_in(world, x, y),
+            None => vec![false; x.len()],
+        };
+        merge(first, second, x, y)
+    }
+
+    fn sheets(
+        &self,
+        col_off: usize,
+        row_off: usize,
+        ncol: usize,
+        nrow: usize,
+    ) -> Result<Vec<SourceSheet>, String> {
+        match self.inner.source_cells() {
+            Some(cells) => cells.sheets(col_off, row_off, ncol, nrow),
+            None => Err("the source has no world cells".to_string()),
+        }
     }
 }
 

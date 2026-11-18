@@ -214,8 +214,8 @@
 //! covered (nearest likewise). There is no blending with the destination.
 
 use crate::cutline::{Cutline, CutlineRule, BAND_DENSITY_THRESHOLD, SRC_DENSITY_THRESHOLD};
-use crate::mesh::QuadMesh;
-use crate::transform::{transform_scanline, SourceWrap, Transformer};
+use crate::mesh::{QuadMesh, Tiles};
+use crate::transform::{transform_scanline, SourceSheet, SourceWrap, Transformer};
 
 /// Resampling algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +351,15 @@ pub enum Footprint {
     /// a pole handled as above, a turn being 360 degrees. Without cells a
     /// geolocation source is measured in source pixel space, off by about
     /// 1% of a cell along the outline on a curved grid.
+    ///
+    /// A source whose cells are in several worlds
+    /// ([`SourceCells::worlds`](crate::transform::SourceCells::worlds): a
+    /// whole ocean grid in pieces,
+    /// [`SetTransformer`](crate::mesh::SetTransformer)) has the outline
+    /// go to each world and walked onto each piece there that it reaches,
+    /// all into one reduction. An outline that comes out turned against
+    /// its world (round a polar projection's far pole) isn't measured in
+    /// that world.
     Exact { densify: usize },
 }
 
@@ -2909,13 +2918,63 @@ struct LatticeLine {
 }
 
 impl LatticeLine {
-    /// To source pixels, or with `world` to source world coordinates
-    /// ([`SourceCells::dst_to_world`](crate::transform::SourceCells::dst_to_world)).
-    fn transform(&mut self, transformer: &impl Transformer, world: bool) {
-        self.ok = match transformer.source_cells() {
-            Some(cells) if world => cells.dst_to_world(&mut self.x, &mut self.y),
+    /// To source pixels, or with `world` to that source world's coordinates
+    /// ([`SourceCells::dst_to_world_in`](crate::transform::SourceCells::dst_to_world_in)).
+    fn transform(&mut self, transformer: &impl Transformer, world: Option<usize>) {
+        self.ok = match (transformer.source_cells(), world) {
+            (Some(cells), Some(k)) => cells.dst_to_world_in(k, &mut self.x, &mut self.y),
             _ => transformer.transform(true, &mut self.x, &mut self.y),
         };
+    }
+
+    /// The untransformed row line `row` of a destination window `ncol`
+    /// pixels wide at `(xoff, yoff)`, `densify` points a pixel.
+    fn fill_row(&mut self, (xoff, yoff): (f64, f64), ncol: usize, densify: usize, row: usize) {
+        let (n, d) = (ncol * densify + 1, densify as f64);
+        let y = yoff + row as f64;
+        self.x.clear();
+        self.y.clear();
+        self.x.extend((0..n).map(|k| xoff + k as f64 / d));
+        self.y.resize(n, y);
+    }
+}
+
+/// One world's transformed lattice: the row lines at the top and bottom
+/// of the band (`ncol * densify + 1` points, left to right) and the
+/// interior points of its column lines, one scanline per interior level:
+/// line `c`, point `k` (1 to `densify - 1`, downwards) at `(k - 1) * (ncol
+/// + 1) + c`.
+#[derive(Default)]
+struct Lines {
+    top: LatticeLine,
+    bot: LatticeLine,
+    vert: LatticeLine,
+}
+
+/// A [`SourceSheet`] in a lattice: its cells, their window offset, the
+/// box `[x0, y0, x1, y1]` of their corners in its world, and tiles that
+/// mark where they are in it (a strip of cells round a pole has a box the
+/// size of its world).
+struct Sheet {
+    world: usize,
+    off: (i64, i64),
+    mesh: QuadMesh,
+    bx: [f64; 4],
+    tiles: Tiles,
+}
+
+impl Sheet {
+    fn new(s: SourceSheet) -> Sheet {
+        let mut bx = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for r in 0..s.mesh.nrow() {
+            for c in 0..s.mesh.ncol() {
+                for p in s.mesh.corners(r, c) {
+                    bx = [bx[0].min(p[0]), bx[1].min(p[1]), bx[2].max(p[0]), bx[3].max(p[1])];
+                }
+            }
+        }
+        let tiles = Tiles::new(&s.mesh);
+        Sheet { world: s.world, off: (s.col_off as i64, s.row_off as i64), mesh: s.mesh, bx, tiles }
     }
 }
 
@@ -2934,14 +2993,10 @@ pub(crate) struct Lattice {
     ncol: usize,
     xoff: f64,
     yoff: f64,
-    /// Row lines at the top and bottom of the band: `ncol * densify + 1`
-    /// points, left to right.
-    top: LatticeLine,
-    bot: LatticeLine,
-    /// Interior points of the band's column lines, one scanline per
-    /// interior level: line `c`, point `k` (1 to `densify - 1`, downwards)
-    /// at `(k - 1) * (ncol + 1) + c`.
-    vert: LatticeLine,
+    /// The band's lattice in each of the source's worlds, or in source
+    /// pixels: one, unless the cells are in several worlds
+    /// ([`SourceCells::worlds`](crate::transform::SourceCells::worlds)).
+    lines: Vec<Lines>,
     /// Scratch for one interior level.
     level: LatticeLine,
     /// Scratch: one pixel's outline (after [`Lattice::cover`]), and its
@@ -2966,10 +3021,22 @@ pub(crate) struct Lattice {
     /// The source window's cells in world coordinates, when the
     /// transformer has them ([`Transformer::source_cells`]): the lattice
     /// is then in source world coordinates and each outline is walked onto
-    /// this mesh, whose cell `(row, col)` is buffer pixel `(row, col)`.
-    /// `Err` when the window's mesh could not be built: every outline
-    /// fails.
-    mesh: Option<Result<QuadMesh, String>>,
+    /// these sheets
+    /// ([`SourceCells::sheets`](crate::transform::SourceCells::sheets)).
+    /// One sheet in one world, with no offset, is a mesh whose cell `(row,
+    /// col)` is buffer pixel `(row, col)`. `Err` when the window's cells
+    /// could not be built: every outline fails.
+    sheets: Option<Result<Vec<Sheet>, String>>,
+    /// More than one world or sheet: each outline goes to every world, and
+    /// onto each of its sheets that its box meets ([`Lattice::cover_sheets`]).
+    multi: bool,
+    /// With `multi`: each buffer pixel's world area (NaN in no sheet); the
+    /// sign each world gives a destination pixel's outline (0 until found),
+    /// and the outline area [`Lattice::cover`] left.
+    areas: Vec<f64>,
+    areas_ncol: usize,
+    turn: Vec<f64>,
+    outline: f64,
     /// The least and greatest world x of the mesh's corners, when it
     /// wraps.
     mesh_x: [f64; 2],
@@ -3004,17 +3071,28 @@ impl Lattice {
         (dst_col_off, dst_row_off): (usize, usize), src: (usize, usize, usize, usize),
     ) -> Self {
         let cells = transformer.source_cells();
-        let mesh = cells.map(|cells| cells.mesh(src.0, src.1, src.2, src.3));
+        let worlds = cells.map_or(1, |cells| cells.worlds().max(1));
+        let sheets: Option<Result<Vec<Sheet>, String>> = cells.map(|cells| {
+            cells.sheets(src.0, src.1, src.2, src.3).map(|v| v.into_iter().map(Sheet::new).collect())
+        });
+        let multi = worlds > 1
+            || matches!(&sheets, Some(Ok(v)) if v.len() != 1 || v[0].world != 0 || v[0].off != (0, 0));
+        let mesh = match &sheets {
+            Some(Ok(v)) if !multi => Some(&v[0].mesh),
+            _ => None,
+        };
         // longitude from the cells, or a period declared on their mesh
-        // (latitude 90 and -90 a quarter period from the equator)
-        let wrap = match (cells, &mesh) {
+        // (latitude 90 and -90 a quarter period from the equator); none
+        // for cells in several sheets
+        let wrap = match (cells, mesh) {
+            (Some(_), _) if multi => None,
             (Some(cells), _) if cells.lon_wrap() => Some(SourceWrap::new(360.0, [90.0, -90.0])),
-            (Some(_), Some(Ok(m))) => m.period().map(|p| SourceWrap::new(p, [p / 4.0, -p / 4.0])),
+            (Some(_), Some(m)) => m.period().map(|p| SourceWrap::new(p, [p / 4.0, -p / 4.0])),
             (Some(_), _) => None,
             (None, _) => transformer.source_wrap(),
         };
         let mut mesh_x = [f64::INFINITY, f64::NEG_INFINITY];
-        if let (Some(Ok(m)), Some(_)) = (&mesh, wrap) {
+        if let (Some(m), Some(_)) = (mesh, wrap) {
             for r in 0..m.nrow() {
                 for c in 0..m.ncol() {
                     for p in m.corners(r, c) {
@@ -3023,105 +3101,155 @@ impl Lattice {
                 }
             }
         }
+        let mut areas = Vec::new();
+        if let (true, Some(Ok(v))) = (multi, &sheets) {
+            areas = vec![f64::NAN; src.2 * src.3];
+            for s in v {
+                for r in 0..s.mesh.nrow() {
+                    for c in 0..s.mesh.ncol() {
+                        let at = (s.off.1 as usize + r) * src.2 + s.off.0 as usize + c;
+                        areas[at] = s.mesh.cell_area(r, c);
+                    }
+                }
+            }
+        }
         let mut lat = Lattice {
             densify, ncol,
             xoff: dst_col_off as f64, yoff: dst_row_off as f64,
-            top: LatticeLine::default(), bot: LatticeLine::default(), vert: LatticeLine::default(),
+            lines: (0..worlds).map(|_| Lines::default()).collect(),
             level: LatticeLine::default(),
             rx: Vec::new(), ry: Vec::new(), win: controlledburn::CoverageWindow::default(),
             wrap, sx: Vec::new(), pieces: Vec::new(),
-            mesh, mesh_x, world: Vec::new(), ix: Vec::new(), iy: Vec::new(),
+            sheets, multi, areas, areas_ncol: src.2, turn: vec![0.0; worlds], outline: f64::NAN,
+            mesh_x, world: Vec::new(), ix: Vec::new(), iy: Vec::new(),
         };
-        lat.fill_row_line(0);
-        lat.bot.transform(transformer, lat.mesh.is_some());
+        let world = lat.in_world();
+        for k in 0..worlds {
+            lat.lines[k].bot.fill_row((lat.xoff, lat.yoff), ncol, densify, 0);
+            lat.lines[k].bot.transform(transformer, world.then_some(k));
+        }
         lat
     }
 
     /// Whether outlines are measured in source world coordinates, against
     /// the source window's cells.
     pub(crate) fn in_world(&self) -> bool {
-        self.mesh.is_some()
+        self.sheets.is_some()
     }
 
     /// The area of buffer pixel `(col, row)`: its world area in world
     /// coordinates, 1 in source pixel space.
     #[inline]
     pub(crate) fn cell_area(&self, col: i64, row: i64) -> f64 {
-        match &self.mesh {
-            Some(Ok(m)) => m.cell_area(row as usize, col as usize),
+        match &self.sheets {
+            Some(Ok(_)) if self.multi => self.areas[row as usize * self.areas_ncol + col as usize],
+            Some(Ok(v)) => v[0].mesh.cell_area(row as usize, col as usize),
             _ => 1.0,
         }
     }
 
     /// The measure of the outline left by [`Lattice::cover`]: its planar
-    /// area in world coordinates, or `measure`'s in source pixel space.
+    /// area in world coordinates (with several worlds, in the one whose
+    /// sheets it covers most), or `measure`'s in source pixel space.
     pub(crate) fn outline_area(&self, measure: controlledburn::Measure) -> f64 {
-        if self.in_world() {
+        if self.multi {
+            self.outline
+        } else if self.in_world() {
             controlledburn::Measure::Planar.ring_area(&self.rx, &self.ry).abs()
         } else {
             measure.ring_area(&self.rx, &self.ry).abs()
         }
     }
 
-    /// Fill `bot` with the untransformed row line `row` of the destination.
-    fn fill_row_line(&mut self, row: usize) {
-        let (n, d) = (self.ncol * self.densify + 1, self.densify as f64);
-        let y = self.yoff + row as f64;
-        self.bot.x.clear();
-        self.bot.y.clear();
-        self.bot.x.extend((0..n).map(|k| self.xoff + k as f64 / d));
-        self.bot.y.resize(n, y);
-    }
-
     /// Advance to destination row `row`: the previous bottom line becomes
-    /// the top line; transform the new bottom line and column interiors.
+    /// the top line; transform the new bottom line and column interiors,
+    /// in each world.
     pub(crate) fn row(&mut self, transformer: &impl Transformer, row: usize) {
-        std::mem::swap(&mut self.top, &mut self.bot);
-        self.fill_row_line(row + 1);
         let world = self.in_world();
-        self.bot.transform(transformer, world);
-        let d = self.densify;
-        if d > 1 {
-            // Each interior level is a scanline too (constant y), so it goes
-            // to the transformer on its own.
-            self.vert.x.clear();
-            self.vert.y.clear();
-            self.vert.ok.clear();
-            for k in 1..d {
-                let y = self.yoff + row as f64 + k as f64 / d as f64;
-                self.level.x.clear();
-                self.level.y.clear();
-                self.level.x.extend((0..=self.ncol).map(|c| self.xoff + c as f64));
-                self.level.y.resize(self.ncol + 1, y);
-                self.level.transform(transformer, world);
-                self.vert.x.extend_from_slice(&self.level.x);
-                self.vert.y.extend_from_slice(&self.level.y);
-                self.vert.ok.extend_from_slice(&self.level.ok);
+        let (off, ncol, d) = ((self.xoff, self.yoff), self.ncol, self.densify);
+        for k in 0..self.lines.len() {
+            let w = world.then_some(k);
+            let l = &mut self.lines[k];
+            std::mem::swap(&mut l.top, &mut l.bot);
+            l.bot.fill_row(off, ncol, d, row + 1);
+            l.bot.transform(transformer, w);
+            if d > 1 {
+                // Each interior level is a scanline too (constant y), so it
+                // goes to the transformer on its own.
+                l.vert.x.clear();
+                l.vert.y.clear();
+                l.vert.ok.clear();
+                for j in 1..d {
+                    let y = self.yoff + row as f64 + j as f64 / d as f64;
+                    self.level.x.clear();
+                    self.level.y.clear();
+                    self.level.x.extend((0..=ncol).map(|c| self.xoff + c as f64));
+                    self.level.y.resize(ncol + 1, y);
+                    self.level.transform(transformer, w);
+                    l.vert.x.extend_from_slice(&self.level.x);
+                    l.vert.y.extend_from_slice(&self.level.y);
+                    l.vert.ok.extend_from_slice(&self.level.ok);
+                }
             }
+        }
+        if self.multi {
+            self.find_turns(transformer, row);
         }
     }
 
-    /// Outline of pixel `c` in the band, offset into the source buffer:
-    /// top left to right, right edge down, bottom right to left, left edge
-    /// up (as rwarp 0.2 built it). False if any point failed.
-    fn ring(&mut self, c: usize, (col_off, row_off): (f64, f64)) -> bool {
+    /// For each world whose turn isn't known yet: the sign of a small
+    /// triangle's area at pixel centres along destination row `row`, by
+    /// majority. A destination pixel's outline in that world has the same
+    /// sign unless it winds round a point the world can't hold (the far
+    /// pole of a polar projection), where it comes out inside out.
+    fn find_turns(&mut self, transformer: &impl Transformer, row: usize) {
+        let Some(cells) = transformer.source_cells() else { return };
+        const H: f64 = 1e-3;
+        let n = self.ncol.min(9);
+        for k in 0..self.turn.len() {
+            if self.turn[k] != 0.0 { continue; }
+            let (mut x, mut y) = (Vec::with_capacity(3 * n), Vec::with_capacity(3 * n));
+            for i in 0..n {
+                let px = self.xoff + (i as f64 + 0.5) * self.ncol as f64 / n as f64;
+                let py = self.yoff + row as f64 + 0.5;
+                x.extend([px, px + H, px]);
+                y.extend([py, py, py + H]);
+            }
+            let ok = cells.dst_to_world_in(k, &mut x, &mut y);
+            let mut votes = 0i64;
+            for i in 0..n {
+                let j = 3 * i;
+                if !(ok[j] && ok[j + 1] && ok[j + 2]) { continue; }
+                let o = (x[j + 1] - x[j]) * (y[j + 2] - y[j]) - (y[j + 1] - y[j]) * (x[j + 2] - x[j]);
+                if o.is_finite() && o != 0.0 { votes += if o > 0.0 { 1 } else { -1 }; }
+            }
+            self.turn[k] = votes.signum() as f64;
+        }
+    }
+
+    /// Outline of pixel `c` in the band, in world `k`'s lattice, offset
+    /// into the source buffer: top left to right, right edge down, bottom
+    /// right to left, left edge up (as rwarp 0.2 built it). False if any
+    /// point failed.
+    fn ring(&mut self, k: usize, c: usize, (col_off, row_off): (f64, f64)) -> bool {
         let d = self.densify;
         self.rx.clear();
         self.ry.clear();
         let mut ok = true;
         let (rx, ry) = (&mut self.rx, &mut self.ry);
+        let l = &self.lines[k];
         let mut push = |l: &LatticeLine, k: usize| {
             rx.push(l.x[k] - col_off);
             ry.push(l.y[k] - row_off);
             ok &= l.ok[k];
         };
-        for k in 0..d { push(&self.top, c * d + k); }
-        push(&self.top, (c + 1) * d);
+        for j in 0..d { push(&l.top, c * d + j); }
+        push(&l.top, (c + 1) * d);
         let m = self.ncol + 1;
-        for k in 1..d { push(&self.vert, (k - 1) * m + c + 1); }
-        for k in 0..d { push(&self.bot, (c + 1) * d - k); }
-        push(&self.bot, c * d);
-        for k in (1..d).rev() { push(&self.vert, (k - 1) * m + c); }
+        for j in 1..d { push(&l.vert, (j - 1) * m + c + 1); }
+        for j in 0..d { push(&l.bot, (c + 1) * d - j); }
+        push(&l.bot, c * d);
+        for j in (1..d).rev() { push(&l.vert, (j - 1) * m + c); }
         ok
     }
 
@@ -3138,8 +3266,9 @@ impl Lattice {
     /// it reaches the buffer: once, as [`Cover::Window`], or more than once,
     /// merged into [`Cover::Pieces`].
     pub(crate) fn cover(&mut self, c: usize, src_off: (f64, f64), (ncol, nrow): (i64, i64)) -> Cover {
+        if self.multi { return self.cover_sheets(c); }
         if self.in_world() { return self.cover_world(c, (ncol, nrow)); }
-        if !self.ring(c, src_off) { return Cover::Failed; }
+        if !self.ring(0, c, src_off) { return Cover::Failed; }
         if let Some(wrap) = self.wrap {
             if !self.unwrap(wrap, src_off.1) { return Cover::Failed; }
         }
@@ -3221,8 +3350,8 @@ impl Lattice {
     /// at which it reaches the mesh's longitudes, as [`Lattice::cover`]
     /// does in source pixels.
     fn cover_world(&mut self, c: usize, (ncol, nrow): (i64, i64)) -> Cover {
-        if !matches!(self.mesh, Some(Ok(_))) { return Cover::Failed; }
-        if !self.ring(c, (0.0, 0.0)) { return Cover::Failed; }
+        if !matches!(self.sheets, Some(Ok(_))) { return Cover::Failed; }
+        if !self.ring(0, c, (0.0, 0.0)) { return Cover::Failed; }
         if self.rx.iter().chain(&self.ry).any(|v| !v.is_finite()) { return Cover::Failed; }
         let (k0, k1, p) = match self.wrap {
             Some(wrap) => {
@@ -3235,7 +3364,8 @@ impl Lattice {
             None => (0, 0, 0.0),
         };
         if k1.saturating_sub(k0) > 3 { return Cover::Failed; }
-        let Some(Ok(mesh)) = &self.mesh else { return Cover::Failed };
+        let Some(Ok(sheets)) = &self.sheets else { return Cover::Failed };
+        let mesh = &sheets[0].mesh;
         debug_assert_eq!((mesh.ncol() as i64, mesh.nrow() as i64), (ncol, nrow));
         let mut hit = None;
         self.pieces.clear();
@@ -3287,6 +3417,114 @@ impl Lattice {
         }
     }
 
+    /// [`Lattice::cover`] against cells in several sheets or worlds: the
+    /// outline in each world, unless it fails there or comes out inside out
+    /// (its turn against the world's, [`Lattice::find_turns`]), walked onto
+    /// each of that world's sheets that its box meets, and covered in the
+    /// sheet's index space, offset to buffer pixels. One sheet reached gives
+    /// [`Cover::Window`], more [`Cover::Pieces`]. Failed when no world holds
+    /// the outline. The outline area left ([`Lattice::outline_area`]) is
+    /// the world's whose sheets it covers most (by world area), or the
+    /// first world's that holds it.
+    fn cover_sheets(&mut self, c: usize) -> Cover {
+        let sheets = match self.sheets.take() {
+            Some(Ok(v)) => v,
+            other => {
+                self.sheets = other;
+                return Cover::Failed;
+            }
+        };
+        let cover = self.cover_on(&sheets, c);
+        self.sheets = Some(Ok(sheets));
+        cover
+    }
+
+    /// [`Lattice::cover_sheets`] on `sheets`.
+    fn cover_on(&mut self, sheets: &[Sheet], c: usize) -> Cover {
+        self.pieces.clear();
+        self.outline = f64::NAN;
+        let (mut held, mut hits, mut most) = (false, 0usize, f64::NEG_INFINITY);
+        let mut first: Option<(i64, i64, usize)> = None;
+        for k in 0..self.lines.len() {
+            if !self.ring(k, c, (0.0, 0.0)) { continue; }
+            if self.rx.iter().chain(&self.ry).any(|v| !v.is_finite()) { continue; }
+            let a = controlledburn::Measure::Planar.ring_area(&self.rx, &self.ry);
+            // shoelace's sign, positive for the pixel's own turn
+            let turn = signed_ring_area(&self.rx, &self.ry);
+            if self.turn[k] != 0.0 && turn * self.turn[k] <= 0.0 { continue; }
+            if !held {
+                held = true;
+                self.outline = a.abs();
+            }
+            let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+            for (&x, &y) in self.rx.iter().zip(&self.ry) {
+                minx = minx.min(x); maxx = maxx.max(x);
+                miny = miny.min(y); maxy = maxy.max(y);
+            }
+            let mut covered = 0.0;
+            for s in sheets.iter().filter(|s| s.world == k) {
+                // an outline whose box meets none of the sheet's tiles neither
+                // reaches nor holds a cell of it
+                if s.bx[0] > maxx || s.bx[2] < minx || s.bx[1] > maxy || s.bx[3] < miny { continue; }
+                if !s.tiles.meets([minx, miny, maxx, maxy]) { continue; }
+                self.world.clear();
+                self.world.extend(self.rx.iter().zip(&self.ry).map(|(&x, &y)| [x, y]));
+                let ring = match s.mesh.ring_to_index(&self.world) {
+                    Ok(r) => r,
+                    Err(_) => return Cover::Failed,
+                };
+                if ring.len() < 3 { continue; }
+                self.ix.clear();
+                self.iy.clear();
+                let (mut x0, mut x1, mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+                for p in &ring {
+                    self.ix.push(p[0]);
+                    self.iy.push(p[1]);
+                    x0 = x0.min(p[0]); x1 = x1.max(p[0]);
+                    y0 = y0.min(p[1]); y1 = y1.max(p[1]);
+                }
+                let (mc, mr) = (s.mesh.ncol() as i64, s.mesh.nrow() as i64);
+                let (c0, c1) = ((x0.floor() as i64).max(0), (x1.ceil() as i64).min(mc));
+                let (r0, r1) = ((y0.floor() as i64).max(0), (y1.ceil() as i64).min(mr));
+                if c0 >= c1 || r0 >= r1 { continue; }
+                // the sheet reached before, still in the window, goes to the
+                // pieces before the window is reused
+                if let Some(f) = first.take() {
+                    push_pieces(&self.win, f, &mut self.pieces);
+                }
+                let w = (c1 - c0) as usize;
+                self.win.reset(c0, r0, w, (r1 - r0) as usize);
+                self.win.add_ring(&self.ix, &self.iy, 1.0);
+                self.win.resolve();
+                for (i, &f) in self.win.coverage().iter().enumerate() {
+                    if f != 0.0 {
+                        covered += f * s.mesh.cell_area((r0 + (i / w) as i64) as usize, (c0 + (i % w) as i64) as usize);
+                    }
+                }
+                let at = (c0 + s.off.0, r0 + s.off.1, w);
+                hits += 1;
+                if hits == 1 {
+                    first = Some(at);
+                } else {
+                    push_pieces(&self.win, at, &mut self.pieces);
+                }
+            }
+            if covered > 0.0 && covered > most {
+                most = covered;
+                self.outline = a.abs();
+            }
+        }
+        if !held { return Cover::Failed; }
+        match (hits, first) {
+            (0, _) => Cover::Outside,
+            (1, Some((c0, r0, w))) => Cover::Window { c0, r0, w },
+            _ => {
+                merge_pieces(&mut self.pieces);
+                Cover::Pieces
+            }
+        }
+    }
+
     /// Unwrap the outline in `rx` across the source's seam, so that no
     /// step moves by more than half a period. An outline around a pole
     /// then comes back one period from where it started: close it along
@@ -3317,6 +3555,19 @@ impl Lattice {
         self.ry.extend([y0, pole, pole]);
         true
     }
+}
+
+/// Twice the signed area of the ring `x`, `y` (shoelace; positive
+/// anticlockwise with y up), taken about its first point.
+fn signed_ring_area(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len();
+    if n < 3 { return 0.0; }
+    let (x0, y0) = (x[0], y[0]);
+    let mut s = 0.0;
+    for i in 1..n - 1 {
+        s += (x[i] - x0) * (y[i + 1] - y0) - (x[i + 1] - x0) * (y[i] - y0);
+    }
+    s
 }
 
 /// Append the nonzero coverage in `win` (of buffer pixels `c0..c0 + w`

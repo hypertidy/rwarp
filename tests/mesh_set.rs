@@ -13,10 +13,11 @@
 use std::collections::{HashMap, HashSet};
 
 use controlledburn::{BurnMode, BurnResult, Coord, Geometry, Polygon};
-use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, WORLD_GT};
+use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, SetTransformer, WORLD_GT};
 use rwarp::transform::{CenterLong, GenImgProjTransformer};
-use rwarp::weights::{lonlat_measure, GridWindow, WeightOptions, Weights};
-use rwarp::CrsTransform;
+use rwarp::warp::{warp_to, DstNodata, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::weights::{exact_weights, lonlat_measure, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
+use rwarp::{CrsTransform, Transformer};
 
 const R: f64 = 6371229.0;
 const NC: usize = 48;
@@ -671,3 +672,274 @@ fn burn_refusals() {
     assert!(s.burn(&poly, &bands, 1.0, BurnMode::Coverage).is_ok());
 }
 
+
+// ---------------------------------------------------------------------------
+// warp() from the set: SetTransformer
+// ---------------------------------------------------------------------------
+
+/// The set as a warp source onto a lon/lat grid `gt`.
+fn set_transformer(s: &MeshSet, gt: [f64; 6]) -> SetTransformer<'_> {
+    let crs: Vec<(Box<dyn CrsTransform>, Box<dyn CrsTransform>)> = vec![
+        (Box::new(World(0, false)), Box::new(World(0, true))),
+        (Box::new(World(1, false)), Box::new(World(1, true))),
+    ];
+    SetTransformer::with_backend(s, gt, crs).unwrap()
+}
+
+/// The largest difference between two tables' fractions, an entry in one
+/// only counting whole.
+fn max_diff(a: &HashMap<Key, f64>, b: &HashMap<Key, f64>) -> f64 {
+    a.iter()
+        .map(|(k, v)| (v - b.get(k).copied().unwrap_or(0.0)).abs())
+        .chain(b.iter().filter(|(k, _)| !a.contains_key(k)).map(|(_, v)| v.abs()))
+        .fold(0.0, f64::max)
+}
+
+/// `exact_weights` through the set's transformer are `weights_to`'s: the
+/// same cells walked in the same worlds, outlines from every band in one
+/// table. Source windows of it tile it.
+#[test]
+fn exact_weights_from_the_set_are_weights_to() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let t = set_transformer(&s, GT);
+    for densify in [1, 4] {
+        let w = exact_weights(&t, &t.source_window(), GW, GH, &WeightOptions::new(densify));
+        let want = to_grid(&s, densify);
+        let d = max_diff(&entries(&w), &entries(&want));
+        // each target pixel's area, from the band it covers most of
+        let mut darea = 0.0f64;
+        for k in 0..GW * GH {
+            let (a, b) = (w.dst_area[k], want.dst_area[k]);
+            if a.is_finite() && b.is_finite() {
+                darea = darea.max((a - b).abs() / b);
+            }
+        }
+        eprintln!("densify {densify}: {} entries ({} from weights_to), fractions to {d:.1e}, target areas to {darea:.1e}", w.len(), want.len());
+        assert!(d < 1e-12, "{d:e}");
+        assert!(darea < 1e-9, "{darea:e}");
+        assert!(w.src_cell_area.len() == w.len() && w.src_cell_area.iter().all(|a| *a > 0.0));
+    }
+    // 2 x 2 source windows, split across the bands' meeting and a column
+    let whole = entries(&exact_weights(&t, &t.source_window(), GW, GH, &WeightOptions::new(2)));
+    let mut tiled = HashMap::new();
+    for (c0, c1) in [(0, 20), (20, NC)] {
+        for (r0, r1) in [(0, EQUATOR + 2), (EQUATOR + 2, NR)] {
+            let src = GridWindow::new(c1 - c0, r1 - r0).with_offset(c0, r0);
+            let w = exact_weights(&t, &src, GW, GH, &WeightOptions::new(2));
+            assert!(w.src_col.iter().all(|&c| (c0..c1).contains(&(c as usize))));
+            assert!(w.src_row.iter().all(|&r| (r0..r1).contains(&(r as usize))));
+            tiled.extend(entries(&w));
+        }
+    }
+    let d = max_diff(&whole, &tiled);
+    eprintln!("{} entries whole, {} in windows, to {d:.1e}", whole.len(), tiled.len());
+    assert!(d < 1e-12, "{d:e}");
+}
+
+/// `warp()`'s `Average` from the set is `apply(FracArea)` of its
+/// warp-compatible weights, bit for bit, and a constant field stays
+/// constant; `Mode` of a field of bands takes the band covering most.
+#[test]
+fn warp_average_from_the_set_is_apply() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let t = set_transformer(&s, GT);
+    let data: Vec<f64> = (0..NC * NR).map(|k| 10.0 + ((k % NC) as f64 * 0.4).sin() * ((k / NC) as f64 * 0.3).cos()).collect();
+    let buf = SourceBuffer { data: &data, ncol: NC, nrow: NR, nbands: 1, col_off: 0, row_off: 0 };
+    for densify in [1, 3] {
+        let opts = WarpOptions::new(ResampleAlg::Average).with_footprint(Footprint::Exact { densify });
+        let warped = warp_to::<f64, f64>(&t, &buf, GW, GH, &opts);
+        let w = exact_weights(&t, &GridWindow::from(&buf), GW, GH, &WeightOptions::warp_compatible(densify));
+        let applied: Vec<f64> = w.apply(&buf, Normalization::FracArea, &ApplyOptions::from(&opts));
+        let differ = warped.iter().zip(&applied).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let computed = warped.iter().filter(|v| (5.0..15.0).contains(*v)).count();
+        eprintln!("densify {densify}: {computed} pixels computed, {differ} differ");
+        assert_eq!(differ, 0);
+        assert!(computed > GW * GH * 9 / 10, "{computed}");
+    }
+    // a constant: every pixel the set reaches, to rounding
+    let one = vec![1.0f64; NC * NR];
+    let buf1 = SourceBuffer { data: &one, ..buf };
+    let opts = WarpOptions::new(ResampleAlg::Average).with_footprint(Footprint::Exact { densify: 2 }).with_dst_nodata(DstNodata::Value(-1.0));
+    let out = warp_to::<f64, f64>(&t, &buf1, GW, GH, &opts);
+    let worst = out.iter().filter(|v| **v != -1.0).map(|v| (v - 1.0).abs()).fold(0.0, f64::max);
+    assert!(worst < 1e-14, "{worst:e}");
+    // Mode of each cell's band: a pixel across the equator takes the band
+    // it covers most, the others their own
+    let bands: Vec<f64> = (0..NC * NR).map(|k| ((k / NC) >= EQUATOR) as u8 as f64).collect();
+    let bufb = SourceBuffer { data: &bands, ..buf };
+    let opts = WarpOptions::new(ResampleAlg::Mode).with_footprint(Footprint::Exact { densify: 2 });
+    let out = warp_to::<f64, f64>(&t, &bufb, GW, GH, &opts);
+    // 2.5 degree rows: 35 is 2.5 N to 0, 36 is 0 to 2.5 S
+    assert!(out[30 * GW..36 * GW].iter().all(|&v| v == 1.0));
+    assert!(out[36 * GW..60 * GW].iter().all(|&v| v == 0.0));
+}
+
+/// Point kernels land in the cell that holds the pixel's centre, and read
+/// their neighbours across the set's index space: bilinear over a field
+/// linear in the cells' indices is linear, across pieces and bands. Cells
+/// left out hold no point.
+#[test]
+fn point_kernels_read_across_pieces() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let t = set_transformer(&s, GT);
+    let dropped: HashSet<_> = s.dropped().iter().copied().collect();
+    let near = |r: usize, c: usize| MOVED.iter().any(|&((j, i), _)| (r as i64 - j as i64).abs() <= 3 && (c as i64 - i as i64).abs() <= 3);
+    // nearest of each cell's number: the cell in the regular rows from
+    // the pixel centre's longitude and latitude, away from the damage
+    let ids: Vec<f64> = (0..NC * NR).map(|k| k as f64).collect();
+    let buf = SourceBuffer { data: &ids, ncol: NC, nrow: NR, nbands: 1, col_off: 0, row_off: 0 };
+    let opts = WarpOptions::new(ResampleAlg::NearestNeighbour).with_dst_nodata(DstNodata::Value(-1.0));
+    let out = warp_to::<f64, f64>(&t, &buf, GW, GH, &opts);
+    let (mut checked, mut gone) = (0, 0);
+    for j in 0..GH {
+        for i in 0..GW {
+            let (lon, lat) = ((-178.75 + 2.5 * i as f64).rem_euclid(360.0), 88.75 - 2.5 * j as f64);
+            if !(-78.0..60.0).contains(&lat) {
+                continue;
+            }
+            let (r, c) = (((lat + 78.0) / 6.0) as usize, (lon / 7.5) as usize);
+            if near(r, c) {
+                continue;
+            }
+            let v = out[j * GW + i];
+            if dropped.contains(&(r, c)) {
+                assert_eq!(v, -1.0, "({r}, {c}) is left out");
+                gone += 1;
+            } else {
+                assert_eq!(v, (r * NC + c) as f64, "pixel ({j}, {i}) at ({lon}, {lat})");
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("nearest: {checked} pixels in their cells, {gone} in cells left out");
+    assert!(checked > 5000);
+    // no point lands in a cell left out, on a finer grid over the damage
+    let (mut x, mut y): (Vec<f64>, Vec<f64>) = (0..400 * 200).map(|k| ((k % 400) as f64 + 0.5, (k / 400) as f64 + 0.5)).unzip();
+    let fine = [-180.0, 0.9, 0.0, 90.0, 0.0, -0.9];
+    let tf = set_transformer(&s, fine);
+    let ok = tf.transform(true, &mut x, &mut y);
+    let landed: HashSet<(usize, usize)> = (0..x.len()).filter(|&k| ok[k]).map(|k| (y[k] as usize, x[k] as usize)).collect();
+    let bad: Vec<_> = landed.iter().filter(|c| dropped.contains(c)).collect();
+    eprintln!("{} cells hold a point of the fine grid; in cells left out: {bad:?}", landed.len());
+    assert!(landed.len() > NC * NR * 3 / 4, "{}", landed.len());
+    assert!(bad.is_empty());
+    let moved_cells = dropped.iter().filter(|&&(r, c)| near(r, c)).count();
+    assert!(moved_cells > 0);
+    // bilinear of 3 col + 5 row is 3 (x - 1/2) + 5 (y - 1/2) at the centre's
+    // place (x, y) in the set's index space
+    let lin: Vec<f64> = (0..NC * NR).map(|k| 3.0 * (k % NC) as f64 + 5.0 * (k / NC) as f64).collect();
+    let buf = SourceBuffer { data: &lin, ..buf };
+    let opts = WarpOptions::new(ResampleAlg::Bilinear).with_dst_nodata(DstNodata::Value(-1.0));
+    let out = warp_to::<f64, f64>(&t, &buf, GW, GH, &opts);
+    let piece = |r: usize, c: usize| s.locate_cell(r, c).map(|(p, _, _)| p.offset());
+    let (mut across, mut bands, mut worst) = (0, 0, 0.0f64);
+    for j in 0..GH {
+        for i in 0..GW {
+            let (mut x, mut y) = ([i as f64 + 0.5], [j as f64 + 0.5]);
+            if !t.transform(true, &mut x, &mut y)[0] {
+                continue;
+            }
+            let (bx, by) = (x[0] - 0.5, y[0] - 0.5);
+            if !(bx >= 1.0 && by >= 0.0 && bx <= (NC - 2) as f64 && by <= (NR - 1) as f64) {
+                continue;
+            }
+            let (c, r) = (bx as usize, by as usize);
+            let four = [(r, c), (r, c + 1), (r + 1, c), (r + 1, c + 1)];
+            if four.iter().any(|&(r, c)| r >= NR || dropped.contains(&(r, c))) || r >= NREG {
+                continue;
+            }
+            let ps: HashSet<_> = four.iter().map(|&(r, c)| piece(r, c)).collect();
+            if ps.len() > 1 {
+                across += 1;
+                bands += (r + 1 == EQUATOR) as usize;
+            }
+            let d = (out[j * GW + i] - (3.0 * bx + 5.0 * by)).abs();
+            worst = worst.max(d);
+        }
+    }
+    eprintln!("bilinear: linear to {worst:.1e}, {across} pixels read more than one piece, {bands} both bands");
+    assert!(worst < 1e-9, "{worst:e}");
+    assert!(across > 50 && bands > 50, "{across}, {bands}");
+}
+
+/// A south-polar target round the South Pole: its outline there goes to
+/// the north band's edge and round the whole band, turned the other way,
+/// and is not measured there. Every pixel takes the south band only.
+#[test]
+fn outlines_round_the_far_pole_are_not_turned_inside_out() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    // the target in south-polar LAEA, band 0's world: band 1 through lon/lat
+    struct Then(World, World);
+    impl CrsTransform for Then {
+        fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+            let (a, b) = self.0.convert(x, y)?;
+            self.1.convert(a, b)
+        }
+    }
+    struct Same;
+    impl CrsTransform for Same {
+        fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+            Some((x, y))
+        }
+    }
+    let crs: Vec<(Box<dyn CrsTransform>, Box<dyn CrsTransform>)> = vec![
+        (Box::new(Same), Box::new(Same)),
+        (Box::new(Then(World(0, true), World(1, false))), Box::new(Then(World(1, true), World(0, false)))),
+    ];
+    // 9 x 9 pixels of 600 km, the pole at the centre of the middle one
+    let gt = [-2700e3, 600e3, 0.0, 2700e3, 0.0, -600e3];
+    let t = SetTransformer::with_backend(&s, gt, crs).unwrap();
+    let bands: Vec<f64> = (0..NC * NR).map(|k| ((k / NC) >= EQUATOR) as u8 as f64).collect();
+    let buf = SourceBuffer { data: &bands, ncol: NC, nrow: NR, nbands: 1, col_off: 0, row_off: 0 };
+    for alg in [ResampleAlg::Average, ResampleAlg::Max] {
+        let opts = WarpOptions::new(alg).with_footprint(Footprint::Exact { densify: 8 }).with_dst_nodata(DstNodata::Value(-1.0));
+        let out = warp_to::<f64, f64>(&t, &buf, 9, 9, &opts);
+        eprintln!("{alg:?}: {out:?}");
+        // 78 S is 1332 km from the pole: the middle pixel reaches no cell
+        assert_eq!(out[4 * 9 + 4], -1.0);
+        assert!(out.iter().all(|&v| v == -1.0 || v == 0.0), "{out:?}");
+        assert!(out.iter().filter(|&&v| v == 0.0).count() >= 40);
+    }
+}
+
+/// A set of one band in one piece warps as its mesh does through
+/// `MeshTransformer`, bit for bit, for area methods and point kernels.
+#[test]
+fn a_set_of_one_piece_is_its_mesh() {
+    // 12 columns of 30 degrees from the equator to the pole, north-polar
+    // LAEA on the sphere
+    let (nc, nr) = (12, 3);
+    let (mut xb, mut yb) = (Vec::new(), Vec::new());
+    for j in 0..nr {
+        for i in 0..nc {
+            for (di, dj) in [(0, 0), (1, 0), (1, 1), (0, 1)] {
+                xb.push(-180.0 + 30.0 * (i + di) as f64);
+                yb.push(30.0 * (j + dj) as f64);
+            }
+        }
+    }
+    let north = World(1, false);
+    let bands = [Band { rows: 0..nr, to_world: &north }];
+    let s = MeshSet::from_cf_bounds(nc, nr, &xb, &yb, Halo::NONE, &bands, None).unwrap();
+    assert_eq!(s.pieces().len(), 1);
+    let gt = [-180.0, 5.0, 0.0, 90.0, 0.0, -5.0];
+    let crs: Vec<(Box<dyn CrsTransform>, Box<dyn CrsTransform>)> = vec![(Box::new(World(1, false)), Box::new(World(1, true)))];
+    let set_t = SetTransformer::with_backend(&s, gt, crs).unwrap();
+    let mesh_t = MeshTransformer::with_backend(s.pieces()[0].mesh().clone(), gt, Box::new(World(1, false)), Box::new(World(1, true))).unwrap();
+    let data: Vec<f64> = (0..nc * nr).map(|k| ((k * 7) % 11) as f64 + 0.5 * (k as f64).sin()).collect();
+    let buf = SourceBuffer { data: &data, ncol: nc, nrow: nr, nbands: 1, col_off: 0, row_off: 0 };
+    for alg in [ResampleAlg::Average, ResampleAlg::Mode, ResampleAlg::Max, ResampleAlg::Bilinear, ResampleAlg::Cubic, ResampleAlg::NearestNeighbour] {
+        let opts = WarpOptions::new(alg).with_footprint(Footprint::Exact { densify: 3 });
+        let a = warp_to::<f64, f64>(&set_t, &buf, 72, 18, &opts);
+        let b = warp_to::<f64, f64>(&mesh_t, &buf, 72, 18, &opts);
+        let differ = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let computed = a.iter().filter(|v| **v != 0.0).count();
+        eprintln!("{alg:?}: {computed} pixels computed, {differ} differ");
+        assert_eq!(differ, 0, "{alg:?}");
+        assert!(computed > 72 * 18 / 3, "{alg:?}: {computed}");
+    }
+}
