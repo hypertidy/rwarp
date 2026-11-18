@@ -87,6 +87,10 @@ impl Piece {
 /// - **Burning.** [`MeshSet::burn`] burns polygons and points given in the
 ///   bounds' coordinates onto the set's cells, densified into each band's
 ///   world.
+/// - **Warping.** [`SetTransformer`](crate::mesh::SetTransformer) is the
+///   set as the source of [`warp`](crate::warp::warp), for every method:
+///   area methods with the exact footprint walk each destination pixel
+///   onto every piece it reaches, point kernels read across pieces.
 ///
 /// Where two bands meet, each side's cells have edges straight in their
 /// own projection, so the two bow apart between corners: a thin gap
@@ -449,6 +453,11 @@ impl MeshSet {
     /// The set's size in cells, `[ncol, nrow]`.
     pub fn size(&self) -> [usize; 2] {
         [self.ncol, self.nrow]
+    }
+
+    /// How many bands the set was built with.
+    pub(crate) fn band_count(&self) -> usize {
+        self.clips.len()
     }
 
     /// The pieces, by first row and then first column.
@@ -1543,7 +1552,7 @@ fn assemble(outer: Vec<(Vec<[f64; 2]>, f64)>, holes: Vec<Vec<[f64; 2]>>) -> Vec<
 /// corners' box reaches, widened by a tile each way. A box or a segment
 /// that meets no marked tile can't meet the piece, and is a tile or more
 /// from every point of it. Held as a summed-area table.
-struct Tiles {
+pub(crate) struct Tiles {
     x0: f64,
     y0: f64,
     /// The tiles' side, in world units.
@@ -1558,7 +1567,7 @@ impl Tiles {
     /// Square tiles, twice as many along the box's longer side as the
     /// piece has cells along its longer side (4 to 512), and one more all
     /// round, so the widening fits.
-    fn new(m: &QuadMesh) -> Tiles {
+    pub(crate) fn new(m: &QuadMesh) -> Tiles {
         let [x0, y0, x1, y1] = mesh_box(m);
         let n = (2 * m.ncol().max(m.nrow())).clamp(4, 512);
         let side = ((x1 - x0).max(y1 - y0) / n as f64).max(f64::MIN_POSITIVE);
@@ -1624,7 +1633,7 @@ impl Tiles {
     }
 
     /// Whether box `b` meets a marked tile.
-    fn meets(&self, b: [f64; 4]) -> bool {
+    pub(crate) fn meets(&self, b: [f64; 4]) -> bool {
         let Some([i0, j0, i1, j1]) = self.range(b, 0) else {
             return false;
         };

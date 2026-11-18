@@ -116,8 +116,11 @@ pub trait Transformer {
     /// Geolocation sources report it
     /// ([`GeolocArrays::world_cells`](crate::geoloc_transform::GeolocArrays::world_cells)),
     /// and so does a mesh source
-    /// ([`MeshTransformer`](crate::mesh::MeshTransformer)); a mesh target
-    /// ([`MeshTarget`](crate::mesh::MeshTarget)) passes its source's on.
+    /// ([`MeshTransformer`](crate::mesh::MeshTransformer)) and a whole
+    /// grid in pieces ([`SetTransformer`](crate::mesh::SetTransformer),
+    /// whose cells are in several worlds, [`SourceCells::sheets`]); a mesh
+    /// target ([`MeshTarget`](crate::mesh::MeshTarget)) passes its
+    /// source's on.
     fn source_cells(&self) -> Option<&dyn SourceCells> {
         None
     }
@@ -208,6 +211,46 @@ pub trait SourceCells {
     fn lon_wrap(&self) -> bool {
         false
     }
+
+    /// How many worlds the source's cells are in: one for a source that is
+    /// one sheet (the default), more for one in pieces, each in the world
+    /// of its band of rows, such as a [`MeshSet`](crate::mesh::MeshSet)'s
+    /// ([`SetTransformer`](crate::mesh::SetTransformer)).
+    fn worlds(&self) -> usize {
+        1
+    }
+
+    /// [`SourceCells::dst_to_world`] into world `world`. The default is
+    /// `dst_to_world`, the one world's.
+    fn dst_to_world_in(&self, world: usize, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+        let _ = world;
+        self.dst_to_world(x, y)
+    }
+
+    /// The cells of the source window of `ncol` by `nrow` pixels at
+    /// `(col_off, row_off)`, as sheets: meshes, each in one of the
+    /// source's worlds, that cover the window's cells between them, each
+    /// cell at most once. The default is [`SourceCells::mesh`], one sheet
+    /// in world 0. Window pixels in no sheet have no cell.
+    fn sheets(&self, col_off: usize, row_off: usize, ncol: usize, nrow: usize) -> Result<Vec<SourceSheet>, String> {
+        Ok(vec![SourceSheet { world: 0, col_off: 0, row_off: 0, mesh: self.mesh(col_off, row_off, ncol, nrow)? }])
+    }
+}
+
+/// Some of a source window's cells as one mesh in one of the source's
+/// worlds ([`SourceCells::sheets`]): mesh cell `(row, col)` is window pixel
+/// `(row_off + row, col_off + col)`.
+#[derive(Debug, Clone)]
+pub struct SourceSheet {
+    /// The world the mesh's corners are in, below
+    /// [`SourceCells::worlds`].
+    pub world: usize,
+    /// The window column of the mesh's column 0.
+    pub col_off: usize,
+    /// The window row of the mesh's row 0.
+    pub row_off: usize,
+    /// The cells.
+    pub mesh: QuadMesh,
 }
 
 // ---------------------------------------------------------------------------
