@@ -45,9 +45,11 @@
 //! the mesh boundary. Burning the result with controlledburn gives each
 //! cell's covered fraction of its world area, exactly for polygons with
 //! straight edges in the corners' coordinates. [`QuadMesh::burn`] does
-//! that for polygons and points, [`QuadMesh::cover_ring`] for one small
-//! ring through a reused `CoverageWindow`. [`Rectilinear`] is the same
-//! front end for grids given by column and row edges.
+//! that for polygons and points, [`QuadMesh::burn_from`] for polygons in
+//! another CRS (densified into the mesh's by bigcurve),
+//! [`QuadMesh::cover_ring`] for one small ring through a reused
+//! `CoverageWindow`. [`Rectilinear`] is the same front end for grids given
+//! by column and row edges.
 //!
 //! # A mesh as a warp source
 //!
@@ -345,6 +347,7 @@ use std::sync::OnceLock;
 mod cf;
 mod period;
 mod rect;
+mod reproject;
 mod set;
 mod set_source;
 mod source;

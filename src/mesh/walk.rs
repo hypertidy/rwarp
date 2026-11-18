@@ -48,7 +48,8 @@ use controlledburn::{
     Polygon,
 };
 
-use super::{orient, CellMap, Period, QuadMesh, UNIT};
+use super::{orient, reproject, CellMap, Period, QuadMesh, UNIT};
+use crate::crs::CrsTransform;
 
 /// A multiplicative hash for cell numbers (as rustc's `FxHasher`): the
 /// flood's set of seen cells is small and hot, and needs no protection
@@ -947,7 +948,7 @@ impl QuadMesh {
     /// to world units). Coverage mode only.
     ///
     /// Polygon edges are straight in the mesh's world coordinates; for
-    /// polygons in another CRS, densify first (bigcurve). With a declared
+    /// polygons in another CRS, see [`QuadMesh::burn_from`]. With a declared
     /// period ([`QuadMesh::with_period`]), each polygon is burned at every
     /// whole period at which it overlaps the mesh, and points are found at
     /// any whole period.
@@ -983,6 +984,110 @@ impl QuadMesh {
             &|r| self.ring_to_index(r),
             &|p, hint| self.locate(p, hint),
         )
+    }
+
+    /// [`QuadMesh::burn`] for polygons and points in another CRS, with
+    /// edges straight there: `to_world` takes them to the mesh's world
+    /// coordinates, `from_world` takes the mesh's back
+    /// ([`crs_pair`](crate::crs::crs_pair)`(mesh_crs, geoms_crs)` gives
+    /// both, in that order).
+    ///
+    /// - **Densified.** Each polygon edge is cut into equal pieces no
+    ///   longer than the mesh's tallest cell is high in the geometries'
+    ///   CRS, and each piece densified by bigcurve (d3-geo's adaptive
+    ///   resampling, planar edges) until no chord strays more than
+    ///   `tolerance` from the edge's image, in world units. A fraction is
+    ///   then good to about `tolerance` times the length of polygon edge
+    ///   in the cell, over its area, and the points grow as `1 /
+    ///   sqrt(tolerance)`. The first cut keeps an edge whose ends land
+    ///   together (a parallel all the way round, in a polar projection)
+    ///   from being passed over.
+    /// - **Cut to the mesh first.** The polygons are cut to the y range of
+    ///   the mesh's vertices in their CRS, widened by its tallest cell each
+    ///   way, as [`MeshSet::burn`](super::MeshSet::burn) cuts a band's. A
+    ///   projection holds the near side well and the far one not at all (a
+    ///   polar one sends the far pole to its edge, or to infinity), so a
+    ///   polygon round the far pole would come out inside out. Points
+    ///   beyond that range, or that don't go to the world, are on no cell.
+    /// - **Split where a ring meets itself**, as there: a cut at 180
+    ///   degrees comes out of a polar projection with both sides on one
+    ///   line.
+    /// - **With a declared period** ([`QuadMesh::with_period`]: a mesh in
+    ///   longitude and latitude), each ring is unwrapped in the world, each
+    ///   point to within half a period of the one before, and then burned
+    ///   at every period it reaches. A ring that doesn't close then goes
+    ///   round a pole of the world and is refused.
+    ///
+    /// Errors for a polygon point that doesn't go to the world, a
+    /// tolerance that isn't positive, lines, and modes other than
+    /// coverage. `to_world` and `from_world` run on the calling thread,
+    /// so they needn't be thread-safe.
+    ///
+    /// ```
+    /// use rwarp::mesh::{CellMap, QuadMesh};
+    /// use rwarp::CrsTransform;
+    /// use controlledburn::{BurnMode, Coord, Geometry, Polygon};
+    ///
+    /// // north-polar LAEA on the unit sphere, and back
+    /// struct Laea(bool);
+    /// impl CrsTransform for Laea {
+    ///     fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+    ///         Some(if self.0 {
+    ///             let rho = 2.0 * ((90.0 - y).to_radians() / 2.0).sin();
+    ///             let (s, c) = x.to_radians().sin_cos();
+    ///             (rho * s, -rho * c)
+    ///         } else {
+    ///             (x.atan2(-y).to_degrees(), 90.0 - 2.0 * (x.hypot(y) / 2.0).asin().to_degrees())
+    ///         })
+    ///     }
+    /// }
+    /// // a 20 by 20 mesh of the square round the pole out to 1, in LAEA
+    /// let n = 20;
+    /// let v: Vec<f64> = (0..=n).map(|i| -1.0 + 2.0 * i as f64 / n as f64).collect();
+    /// let x: Vec<f64> = (0..=n).flat_map(|_| v.iter().copied()).collect();
+    /// let y: Vec<f64> = (0..=n).flat_map(|j| std::iter::repeat_n(-v[j], n + 1)).collect();
+    /// let mesh = QuadMesh::from_corners(n, n, x, y, CellMap::EqualArea).unwrap();
+    ///
+    /// // the cap north of 70 N, in longitude and latitude: a circle in
+    /// // LAEA, of area 2 pi (1 - sin 70) on the unit sphere
+    /// let ring = [(-180.0, 70.0), (180.0, 70.0), (180.0, 90.0), (-180.0, 90.0), (-180.0, 70.0)];
+    /// let cap = Geometry::Polygon(Polygon::new(vec![ring.iter().map(|&(x, y)| Coord { x, y }).collect()]));
+    /// let r = mesh.burn_from(&[cap], &Laea(true), &Laea(false), 1e-6, BurnMode::Coverage).unwrap();
+    /// let area = r.covered_cells() * 0.01; // each cell 0.1 by 0.1
+    /// let want = std::f64::consts::TAU * (1.0 - 70f64.to_radians().sin());
+    /// assert!((area - want).abs() < 1e-5, "{area} vs {want}");
+    /// ```
+    pub fn burn_from(
+        &self,
+        geoms: &[Geometry],
+        to_world: &dyn CrsTransform,
+        from_world: &dyn CrsTransform,
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+    ) -> Result<BurnResult, String> {
+        self.burn_from_par(geoms, to_world, from_world, tolerance, opts, 1)
+    }
+
+    /// [`QuadMesh::burn_from`] with the burn on up to `threads` threads
+    /// (0 for all available), as [`QuadMesh::burn_par`]: the same result
+    /// record for record. The projection stays on the calling thread.
+    pub fn burn_from_par(
+        &self,
+        geoms: &[Geometry],
+        to_world: &dyn CrsTransform,
+        from_world: &dyn CrsTransform,
+        tolerance: f64,
+        opts: impl Into<BurnOptions>,
+        threads: usize,
+    ) -> Result<BurnResult, String> {
+        let opts = opts.into();
+        if opts.mode != BurnMode::Coverage {
+            return Err("only coverage mode is defined for a grid front end".into());
+        }
+        let w = self.ncol + 1;
+        let reach = reproject::reach(self.ncol, self.nrow, |j, i| [self.x[j * w + i], self.y[j * w + i]], from_world)?;
+        let world = reproject::to_world(geoms, to_world, reach, tolerance, self.period())?;
+        self.burn_par(&world, opts, threads)
     }
 
     /// Exact coverage of one small world ring, through a reused

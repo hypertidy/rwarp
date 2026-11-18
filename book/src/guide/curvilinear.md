@@ -115,14 +115,31 @@ point methods (`to_index`, `to_world`). The module needs no CRS backend.
 `QuadMesh::burn` takes polygons and points in the grid's coordinates
 and returns controlledburn's tables with the grid's own `(row, col)`:
 fractions are of each cell's world area, exact for polygon edges that
-are straight in those coordinates (densify polygons from another CRS
-first). It walks each ring through the cells' triangles, inserting a
-vertex wherever the ring crosses a cell side or split spoke, and closes
-any part outside the grid along the grid's boundary.
+are straight in those coordinates. It walks each ring through the cells'
+triangles, inserting a vertex wherever the ring crosses a cell side or
+split spoke, and closes any part outside the grid along the grid's
+boundary.
 `QuadMesh::cover_ring` does the same for one small ring into a reused
 `CoverageWindow`, and `mesh::Rectilinear` is the front end for grids
 given by column and row edges. Lines and approx mode are not supported
 yet.
+
+For polygons in another CRS, with edges straight there (longitude and
+latitude onto a grid in a polar projection, say), `burn_from(geoms,
+to_world, from_world, tolerance, opts)` densifies them into the grid's
+coordinates first. Each edge is cut into pieces no longer than the
+grid's tallest cell is high, then bisected by bigcurve until no chord is
+more than `tolerance` (world units) from the edge's image. The polygons
+are cut to the grid's latitudes (its y range in their CRS) first, so the
+far hemisphere doesn't come out of a polar projection inside out. With a
+declared period, rings are unwrapped across the seam. `from_world` is
+the inverse, used to find where the grid's cells are in the polygons'
+CRS; `crs_pair(grid_crs, geoms_crs)` gives both.
+
+```rust,ignore
+let (to_world, from_world) = rwarp::crs::crs_pair("EPSG:3413", "EPSG:4326")?;
+let r = mesh.burn_from(&countries, &*to_world, &*from_world, 1.0, BurnMode::Coverage)?;
+```
 
 ```rust,ignore
 use controlledburn::{BurnOptions, Coord, Geometry, Polygon};
