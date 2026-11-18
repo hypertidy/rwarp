@@ -1,7 +1,7 @@
 //! Meshes of polygons and their conservative weights with a grid:
 //! [`PolyMesh`] (conservative stage 5, `design/conservative.md` section 7).
 
-use bigcurve::{Edge, ForwardBatch, Options, Resampler, Span, Vertex};
+use bigcurve::{Edge, ForwardBatch, GreatCircle, Options, Resampler, Span, Vertex};
 use controlledburn::CoverageWindow;
 
 use crate::transform::Transformer;
@@ -19,7 +19,8 @@ const CHUNK: usize = 1 << 16;
 /// [`PolyMesh::weights_to`] (mesh to grid).
 ///
 /// - **Faces** have edges straight in the nodes' coordinates (any CRS:
-///   the transformer the weights take maps them to the grid). A face
+///   the transformer the weights take maps them to the grid), or great
+///   circles. A face
 ///   lists its nodes in order round it, either way round, three or more.
 ///   Faces that share an edge should share its nodes: the edge is then
 ///   bitwise the same line from both sides, and the faces tile the grid
@@ -30,10 +31,18 @@ const CHUNK: usize = 1 << 16;
 ///   face round a pole (its edges going once round in x) is closed along
 ///   the pole by the grid it is measured on. Without a period, edges are
 ///   taken as written.
-/// - **Great-circle edges** (an ICON or MPAS mesh's) are not built yet:
-///   with planar edges in longitude and latitude, a face's area differs
-///   from its great-circle area by its edges' bow, which shrinks as the
-///   square of the face's size.
+/// - **Great-circle edges** ([`PolyMesh::with_great_circles`], an ICON or
+///   MPAS mesh's): nodes in longitude and latitude in degrees, each edge
+///   the shorter arc of the great circle through its ends, cut at
+///   `densify` equal angles (or refined by bigcurve's great-circle model).
+///   They need `densify` above 1 or a refinement tolerance to bend: at
+///   densify 1 an edge is its chord in the grid's pixels. An edge across
+///   the equator is cut there first: in longitude and latitude a great
+///   circle's curve turns at the equator, and refinement, which tests
+///   each piece's middle, can't see a turn there. A node on a
+///   pole joins its two edges along their meridians: in longitude and
+///   latitude the face runs along the pole from one to the other, whatever
+///   longitude the node is written with (ICON puts nodes on the poles).
 ///
 /// No CRS is involved: the type builds with `--no-default-features`.
 ///
@@ -82,6 +91,8 @@ pub struct PolyMesh {
     start: Vec<usize>,
     nodes: Vec<usize>,
     period: Option<f64>,
+    /// Edges are great circles, nodes longitude and latitude.
+    great: bool,
 }
 
 impl PolyMesh {
@@ -122,7 +133,7 @@ impl PolyMesh {
                 }
             }
         }
-        Ok(PolyMesh { x, y, start, nodes, period: None })
+        Ok(PolyMesh { x, y, start, nodes, period: None, great: false })
     }
 
     /// From a padded table of `width` node indices per face, face after
@@ -149,12 +160,40 @@ impl PolyMesh {
 
     /// The same mesh with x periodic: each edge goes the shorter way round
     /// (see the type's docs). Errors when `period` isn't finite and
-    /// positive.
+    /// positive, or isn't 360 for a mesh with great-circle edges.
     pub fn with_period(mut self, period: f64) -> Result<PolyMesh, String> {
         if !(period.is_finite() && period > 0.0) {
             return Err(format!("the period must be finite and positive, not {period}"));
         }
+        if self.great && period != 360.0 {
+            return Err(format!("great-circle edges are in degrees of longitude: the period is 360, not {period}"));
+        }
         self.period = Some(period);
+        Ok(self)
+    }
+
+    /// The same mesh with great-circle edges (see the type's docs): its
+    /// nodes are longitude and latitude in degrees, and the period of
+    /// longitude is 360.
+    ///
+    /// Errors when a face's node has a latitude beyond 90 or -90, or an
+    /// edge joins two antipodes, whose great circle isn't one.
+    pub fn with_great_circles(mut self) -> Result<PolyMesh, String> {
+        for f in 0..self.nface() {
+            let v = self.face(f);
+            for (i, &n) in v.iter().enumerate() {
+                if self.y[n].abs() > 90.0 {
+                    return Err(format!("face {f}: node {n} has latitude {}, beyond a pole", self.y[n]));
+                }
+                let m = v[(i + 1) % v.len()];
+                let (a, b) = (unit(self.node(n)), unit(self.node(m)));
+                if dot(a, b) < -1.0 + 1e-12 {
+                    return Err(format!("face {f}: the edge from node {n} to node {m} joins antipodes"));
+                }
+            }
+        }
+        self.period = Some(360.0);
+        self.great = true;
         Ok(self)
     }
 
@@ -181,6 +220,11 @@ impl PolyMesh {
     /// The period of x, if it has one.
     pub fn period(&self) -> Option<f64> {
         self.period
+    }
+
+    /// Whether the edges are great circles.
+    pub fn great_circles(&self) -> bool {
+        self.great
     }
 
     /// Conservative weights from a grid onto the mesh: the faces are the
@@ -319,7 +363,7 @@ impl PolyMesh {
             }
         }
         let d = opts.densify.max(1);
-        let edge = MeshEdge { period: self.period };
+        let edge = MeshEdge { period: self.period, great: self.great };
         let wrap = inner.source_wrap();
         let size = (grid.ncol as i64, grid.nrow as i64);
         let (col_off, row_off) = (grid.col_off as f64, grid.row_off as f64);
@@ -383,19 +427,61 @@ impl PolyMesh {
 
     /// Face `f`'s outline points in the mesh's coordinates, appended to
     /// `pts`: each edge's first node, then its interior points, `d - 1`
-    /// of them, at equal steps from the edge's lexicographically smaller
-    /// end (the other aligned to it by the period), so a shared edge gets
-    /// bitwise the same points from both faces.
+    /// of them, at equal steps (or, on a great circle, equal angles) from
+    /// the edge's lexicographically smaller end (the other aligned to it
+    /// by the period), so a shared edge gets bitwise the same points from
+    /// both faces. With great circles, a node on a pole is two points on
+    /// it, at the longitudes of the nodes before and after it, and an edge
+    /// across the equator is cut there and each piece cut at `d` angles.
     fn face_points(&self, f: usize, d: usize, edge: &MeshEdge, pts: &mut Points) {
         let nodes = self.face(f);
         let m = nodes.len();
         for i in 0..m {
             let (a, b) = (self.node(nodes[i]), self.node(nodes[(i + 1) % m]));
-            pts.mx.push(a[0]);
-            pts.my.push(a[1]);
-            if d > 1 {
-                let rev = b[0] < a[0] || (b[0] == a[0] && b[1] < a[1]);
-                let (s, e) = if rev { (b, a) } else { (a, b) };
+            if self.great && a[1].abs() == 90.0 {
+                let before = self.node(nodes[(i + m - 1) % m]);
+                let mut any = false;
+                for n in [before, b] {
+                    if n[1].abs() != 90.0 {
+                        pts.mx.push(n[0]);
+                        pts.my.push(a[1]);
+                        any = true;
+                    }
+                }
+                if !any {
+                    pts.mx.push(a[0]);
+                    pts.my.push(a[1]);
+                }
+            } else {
+                pts.mx.push(a[0]);
+                pts.my.push(a[1]);
+            }
+            let rev = b[0] < a[0] || (b[0] == a[0] && b[1] < a[1]);
+            let (s, e) = if rev { (b, a) } else { (a, b) };
+            if self.great {
+                // an arc across the equator is cut there, where its curve in
+                // longitude and latitude turns: refinement can't see a turn
+                // at a piece's middle
+                let arc = Arc::new(s, e);
+                let pieces = match arc.equator() {
+                    Some(c) => vec![Arc::new(s, c), Arc::new(c, e)],
+                    None => vec![arc],
+                };
+                let mut chain = Vec::with_capacity(pieces.len() * d);
+                for (j, piece) in pieces.iter().enumerate() {
+                    if j > 0 {
+                        chain.push(piece.s);
+                    }
+                    chain.extend((1..d).map(|k| piece.at(k as f64 / d as f64)));
+                }
+                if rev {
+                    chain.reverse();
+                }
+                for p in chain {
+                    pts.mx.push(p[0]);
+                    pts.my.push(p[1]);
+                }
+            } else if d > 1 {
                 let (dx, dy) = (edge.align_x(s[0], e[0]) - s[0], e[1] - s[1]);
                 for k in 1..d {
                     let t = (if rev { d - k } else { k }) as f64 / d as f64;
@@ -405,6 +491,92 @@ impl PolyMesh {
             }
         }
         pts.at.push(pts.mx.len());
+    }
+}
+
+/// A point's unit vector, from longitude and latitude in degrees.
+fn unit(p: [f64; 2]) -> [f64; 3] {
+    let (lon, lat) = (p[0].to_radians(), p[1].to_radians());
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// A longitude difference in [-180, 180], exactly 180 keeping its sign.
+fn wrap180(d: f64) -> f64 {
+    let w = d - 360.0 * (d / 360.0).round();
+    if w.abs() == 180.0 { 180f64.copysign(d) } else { w }
+}
+
+/// The shorter great-circle arc from `s` to `e` (longitude and latitude
+/// in degrees, not antipodes).
+struct Arc {
+    s: [f64; 2],
+    e: [f64; 2],
+    a: [f64; 3],
+    b: [f64; 3],
+    angle: f64,
+    /// A meridian's longitude: the arc's when its ends share one, the
+    /// other end's when one is on a pole.
+    meridian: Option<f64>,
+}
+
+impl Arc {
+    fn new(s: [f64; 2], e: [f64; 2]) -> Arc {
+        let (a, b) = (unit(s), unit(e));
+        let c = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let angle = dot(c, c).sqrt().atan2(dot(a, b));
+        let meridian = match (s[1].abs() == 90.0, e[1].abs() == 90.0) {
+            (true, false) => Some(e[0]),
+            (false, true) => Some(s[0]),
+            (false, false) if wrap180(e[0] - s[0]) == 0.0 => Some(s[0]),
+            _ => None,
+        };
+        Arc { s, e, a, b, angle, meridian }
+    }
+
+    /// Where the arc crosses the equator, strictly between its ends (not
+    /// on a meridian, which crosses it straight), longitude in the
+    /// start's frame.
+    fn equator(&self) -> Option<[f64; 2]> {
+        if self.meridian.is_some() || self.s[1] * self.e[1] >= 0.0 {
+            return None;
+        }
+        let n = [
+            self.a[1] * self.b[2] - self.a[2] * self.b[1],
+            self.a[2] * self.b[0] - self.a[0] * self.b[2],
+            self.a[0] * self.b[1] - self.a[1] * self.b[0],
+        ];
+        // the great circle's plane meets the equator's along n x z
+        let mut q = [n[1], -n[0]];
+        if q[0] * (self.a[0] + self.b[0]) + q[1] * (self.a[1] + self.b[1]) < 0.0 {
+            q = [-q[0], -q[1]];
+        }
+        let lon = q[1].atan2(q[0]).to_degrees();
+        Some([self.s[0] + wrap180(lon - self.s[0]), 0.0])
+    }
+
+    /// The point a fraction `t` of the way along, its longitude within 180
+    /// of the start's (the start's own on a pole), or on a meridian its
+    /// longitude, exactly, with latitude in proportion.
+    fn at(&self, t: f64) -> [f64; 2] {
+        if let Some(lon) = self.meridian {
+            return [lon, self.s[1] + (self.e[1] - self.s[1]) * t];
+        }
+        if self.angle < 1e-15 {
+            return self.s;
+        }
+        let sin = self.angle.sin();
+        let (wa, wb) = (((1.0 - t) * self.angle).sin() / sin, (t * self.angle).sin() / sin);
+        let v = [0, 1, 2].map(|k| wa * self.a[k] + wb * self.b[k]);
+        let h = v[0].hypot(v[1]);
+        let lat = v[2].atan2(h).to_degrees();
+        if h == 0.0 {
+            return [self.s[0], lat];
+        }
+        [self.s[0] + wrap180(v[1].atan2(v[0]).to_degrees() - self.s[0]), lat]
     }
 }
 
@@ -538,11 +710,13 @@ impl<T: Transformer> ForwardBatch for MeshForward<'_, T> {
     }
 }
 
-/// Planar edges in the mesh's coordinates, the shorter way round its
-/// period if it has one: bigcurve's edge model for the faces' segments.
+/// bigcurve's edge model for the faces' segments: planar in the mesh's
+/// coordinates, the shorter way round its period if it has one, or great
+/// circles (bigcurve's [`GreatCircle`]).
 #[derive(Debug, Clone, Copy)]
 struct MeshEdge {
     period: Option<f64>,
+    great: bool,
 }
 
 impl MeshEdge {
@@ -563,18 +737,34 @@ impl MeshEdge {
 
 impl Edge for MeshEdge {
     fn mid(&self, a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+        if self.great {
+            return GreatCircle.mid(a, b);
+        }
         [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
     }
 
-    fn span(&self, a: [f64; 2], b: [f64; 2], _floor: f64) -> Span {
+    fn span(&self, a: [f64; 2], b: [f64; 2], floor: f64) -> Span {
+        if self.great {
+            return GreatCircle.span(a, b, floor);
+        }
         if a == b { Span::Negligible } else { Span::Normal }
     }
 
+    fn floor(&self, tolerance: f64) -> f64 {
+        if self.great { GreatCircle.floor(tolerance) } else { 0.0 }
+    }
+
     fn align(&self, from: [f64; 2], to: [f64; 2]) -> [f64; 2] {
+        if self.great {
+            return GreatCircle.align(from, to);
+        }
         [self.align_x(from[0], to[0]), to[1]]
     }
 
     fn reframe(&self, written: [f64; 2], framed: [f64; 2]) -> [f64; 2] {
+        if self.great {
+            return GreatCircle.reframe(written, framed);
+        }
         match self.period {
             Some(p) => [((written[0] - framed[0]) / p).round() * p, 0.0],
             None => [0.0, 0.0],
@@ -588,14 +778,14 @@ mod tests {
 
     #[test]
     fn align_goes_the_shorter_way() {
-        let e = MeshEdge { period: Some(360.0) };
+        let e = MeshEdge { period: Some(360.0), great: false };
         assert_eq!(e.align_x(-179.0, 179.0), -181.0);
         assert_eq!(e.align_x(179.0, -179.0), 181.0);
         assert_eq!(e.align_x(10.0, 20.0), 20.0);
         assert_eq!(e.align_x(0.0, 180.0), 180.0);
         assert_eq!(e.align_x(0.0, -180.0), -180.0);
         assert_eq!(e.align_x(0.0, 540.0), 180.0);
-        assert_eq!(MeshEdge { period: None }.align_x(-179.0, 179.0), 179.0);
+        assert_eq!(MeshEdge { period: None, great: false }.align_x(-179.0, 179.0), 179.0);
     }
 
     /// Two faces share an edge, written each way: its interior points are
@@ -606,7 +796,7 @@ mod tests {
             let y = vec![0.2, 0.9, 1.3, -0.7];
             let mut m = PolyMesh::new(x.to_vec(), y, vec![0, 3, 6], vec![0, 1, 2, 1, 0, 3]).unwrap();
             m.period = period;
-            let edge = MeshEdge { period };
+            let edge = MeshEdge { period, great: false };
             for d in [3, 7] {
                 let mut pts = Points::default();
                 pts.clear();
@@ -640,7 +830,7 @@ mod tests {
     fn a_shared_edge_refines_to_the_same_points() {
         let (x, y) = (vec![170.0, -160.0, 175.0, -170.0], vec![60.0, 75.0, 80.0, 55.0]);
         let m = PolyMesh::new(x, y, vec![0, 3, 6], vec![0, 1, 2, 1, 0, 3]).unwrap().with_period(360.0).unwrap();
-        let edge = MeshEdge { period: m.period };
+        let edge = MeshEdge { period: m.period, great: false };
         let mut pts = Points::default();
         pts.clear();
         m.face_points(0, 1, &edge, &mut pts);
@@ -654,6 +844,91 @@ mod tests {
         b.reverse();
         assert!(a.len() > 10, "{}", a.len());
         assert_eq!(a, b);
+    }
+
+    /// With great circles: two faces share an edge from a node on the
+    /// pole and two faces an edge across the seam, each written both ways.
+    /// The interior points, and the pole's point at the edge's longitude,
+    /// are bitwise the same from both, fixed and refined.
+    #[test]
+    fn great_circle_edges_are_the_same_from_both_faces() {
+        // nodes: the pole (written at lon 17), A, B, C; D, E across 180
+        let x = vec![17.0, 40.0, 95.0, -20.0, 179.0, -176.5, 170.0];
+        let y = vec![90.0, 70.0, 75.0, 72.0, 10.0, 22.0, 30.0];
+        let m = PolyMesh::new(x, y, vec![0, 3, 6, 9, 12], vec![0, 1, 2, 1, 0, 3, 4, 5, 6, 5, 4, 2]).unwrap();
+        let m = m.with_great_circles().unwrap();
+        let edge = MeshEdge { period: m.period, great: true };
+        let bits = |pts: &Points, r: std::ops::Range<usize>| r.map(|k| (pts.mx[k].to_bits(), pts.my[k].to_bits())).collect::<Vec<_>>();
+        for d in [1, 4] {
+            let mut pts = Points::default();
+            pts.clear();
+            for f in 0..4 {
+                m.face_points(f, d, &edge, &mut pts);
+            }
+            // face 0: the pole as (lon B, 90), (lon A, 90), then P -> A's
+            // interior; face 1: A, A -> P's interior, then (lon A, 90)
+            let a = bits(&pts, 1..d + 1);
+            let at1 = pts.at[1];
+            let mut b = bits(&pts, at1 + 1..at1 + d + 1);
+            b.reverse();
+            assert_eq!(a, b, "the pole's edge, densify {d}");
+            assert_eq!((pts.mx[1], pts.my[1]), (40.0, 90.0));
+            // face 2 runs D -> E first, face 3 E -> D first
+            let (at2, at3) = (pts.at[2], pts.at[3]);
+            let a = bits(&pts, at2 + 1..at2 + d);
+            let mut b = bits(&pts, at3 + 1..at3 + d);
+            b.reverse();
+            assert_eq!(a, b, "across the seam, densify {d}");
+            pts.transform(&Polar);
+            let mut r = Refined::default();
+            r.run(&Polar, edge, 1e-4, &pts);
+            let refined = |j: usize| r.segment(j).unwrap().iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect::<Vec<_>>();
+            if d == 1 {
+                // the segment from (lon A, 90) to A in face 0 is point 1's;
+                // in face 1, from A to (lon A, 90) is point at1's
+                let (a, mut b) = (refined(1), refined(at1));
+                b.reverse();
+                assert_eq!(a, b, "the pole's edge, refined");
+                let (a, mut b) = (refined(at2), refined(at3));
+                b.reverse();
+                assert!(!a.is_empty());
+                assert_eq!(a, b, "across the seam, refined");
+            }
+        }
+    }
+
+    /// An arc's points are at equal angles along it, and its cut at the
+    /// equator is on it, between its ends. A shared edge across the
+    /// equator gets bitwise the same points, cut included, from both faces.
+    #[test]
+    fn arcs_are_cut_at_equal_angles_and_at_the_equator() {
+        let angle = |p: [f64; 2], q: [f64; 2]| dot(unit(p), unit(q)).clamp(-1.0, 1.0).acos();
+        let (s, e) = ([-10.0, -20.0], [30.0, 25.0]);
+        let arc = Arc::new(s, e);
+        let steps: Vec<f64> = (0..8).map(|k| angle(arc.at(k as f64 / 8.0), arc.at((k + 1) as f64 / 8.0))).collect();
+        assert!(steps.iter().all(|a| (a - steps[0]).abs() < 1e-12), "{steps:?}");
+        let c = arc.equator().unwrap();
+        assert_eq!(c[1], 0.0);
+        assert!((angle(s, c) + angle(c, e) - angle(s, e)).abs() < 1e-12);
+        assert!(Arc::new([10.0, 5.0], [20.0, 30.0]).equator().is_none());
+        assert!(Arc::new([10.0, -5.0], [10.0, 30.0]).equator().is_none(), "a meridian");
+        let m = PolyMesh::new(vec![-10.0, 30.0, 0.0, 20.0], vec![-20.0, 25.0, 30.0, -30.0], vec![0, 3, 6], vec![0, 1, 2, 1, 0, 3]);
+        let m = m.unwrap().with_great_circles().unwrap();
+        let edge = MeshEdge { period: m.period, great: true };
+        for d in [1, 3] {
+            let mut pts = Points::default();
+            pts.clear();
+            m.face_points(0, d, &edge, &mut pts);
+            m.face_points(1, d, &edge, &mut pts);
+            // the edge's 2 d - 1 points after its first node, each way
+            let n = 2 * d - 1;
+            let a: Vec<_> = (1..1 + n).map(|k| (pts.mx[k].to_bits(), pts.my[k].to_bits())).collect();
+            let at1 = pts.at[1];
+            let mut b: Vec<_> = (at1 + 1..at1 + 1 + n).map(|k| (pts.mx[k].to_bits(), pts.my[k].to_bits())).collect();
+            b.reverse();
+            assert_eq!(a, b, "densify {d}");
+            assert_eq!(pts.my[d], 0.0, "the cut, densify {d}");
+        }
     }
 
     #[test]
