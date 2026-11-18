@@ -2,7 +2,7 @@
 //! its band's world coordinates: [`MeshSet`].
 
 use std::collections::HashMap;
-use std::ops::Range;
+use std::ops::{Neg, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bigcurve::{from_fn, ForwardBatch, Options, Planar, Resampler, Vertex};
@@ -478,7 +478,9 @@ impl MeshSet {
     /// cell `(row, col)` is the file's `(row + halo.rows[0], col +
     /// halo.cols[0])`. At a T-point pivot each cell of the last row kept
     /// is two of the set's cells, each with the file's value there; a
-    /// halo-exchanged field has the model's value in both.
+    /// halo-exchanged field has the model's value in both. A component of
+    /// a vector in the grid's directions needs nothing more: each half has
+    /// its own copy's value, in that copy's directions, which are its own.
     ///
     /// Errors when `data` isn't the file's size.
     pub fn from_file_layout<T: Copy>(&self, data: &[T], nbands: usize) -> Result<Vec<T>, String> {
@@ -508,7 +510,8 @@ impl MeshSet {
     /// area, in both of the file's copies of it, leaving out a half that
     /// is `fill`, NaN or a cell left out. That is the model cell's value
     /// for what [`Weights::apply`] and [`MeshSet::burn`] give: means and
-    /// fractions of each cell's area.
+    /// fractions of each cell's area. For components of a vector in the
+    /// grid's directions, [`MeshSet::to_file_layout_vector`].
     ///
     /// Errors when `data` isn't the set's size.
     pub fn to_file_layout<T: crate::warp::Sample>(
@@ -516,6 +519,40 @@ impl MeshSet {
         data: &[T],
         nbands: usize,
         fill: T,
+    ) -> Result<Vec<T>, String> {
+        self.to_file(data, nbands, fill, |v| v)
+    }
+
+    /// [`MeshSet::to_file_layout`] for components of a vector in the grid's
+    /// own directions (along its rows or its columns, as NEMO's velocities
+    /// are), every band a component, on the set's cells (T points). The
+    /// grid turns half round across the north fold. So at a T-point pivot,
+    /// where the two halves of a model cell are the lower halves of its two
+    /// copies, each half's value is in its own copy's directions, opposite
+    /// to the other's. The mean by area takes the other half's value with
+    /// its sign changed, and the second copy has the mean with its sign
+    /// changed, as NEMO's halo has it. A pivot's own cell, its own mirror,
+    /// keeps its value (see [`MeshSet::fill_halo_vector`]). Elsewhere this
+    /// is [`MeshSet::to_file_layout`].
+    ///
+    /// Errors when `data` isn't the set's size.
+    pub fn to_file_layout_vector<T: crate::warp::Sample + Neg<Output = T>>(
+        &self,
+        data: &[T],
+        nbands: usize,
+        fill: T,
+    ) -> Result<Vec<T>, String> {
+        self.to_file(data, nbands, fill, |v: T| -v)
+    }
+
+    /// [`MeshSet::to_file_layout`] with `turn` taking a value from one copy
+    /// of a T pivot's cell to the other: the identity, or a change of sign.
+    fn to_file<T: crate::warp::Sample>(
+        &self,
+        data: &[T],
+        nbands: usize,
+        fill: T,
+        turn: impl Fn(T) -> T,
     ) -> Result<Vec<T>, String> {
         let (nc, nr) = (self.ncol, self.nrow);
         if data.len() != nc * nr * nbands {
@@ -542,11 +579,15 @@ impl MeshSet {
                 };
                 for b in 0..nbands {
                     let v = |c: usize| data[(r * nc + c) * nbands + b];
-                    let parts: Vec<(f64, f64)> = [c, m]
+                    // each half in `c`'s directions
+                    let parts: Vec<(f64, f64)> = [(c, false), (m, true)]
                         .into_iter()
                         .take(if m == c { 1 } else { 2 })
-                        .filter(|&k| !missing(v(k)))
-                        .filter_map(|k| area(k).map(|a| (a, v(k).to_f64())))
+                        .filter(|&(k, _)| !missing(v(k)))
+                        .filter_map(|(k, other)| {
+                            let x = if other { turn(v(k)) } else { v(k) };
+                            area(k).map(|a| (a, x.to_f64()))
+                        })
                         .collect();
                     let total: f64 = parts.iter().map(|p| p.0).sum();
                     let merged = if parts.is_empty() {
@@ -556,8 +597,10 @@ impl MeshSet {
                     } else {
                         T::from_f64(parts.iter().map(|p| p.1).sum::<f64>() / parts.len() as f64)
                     };
-                    for k in [c, m] {
-                        out[((r + r0) * fc + k + c0) * nbands + b] = merged;
+                    out[((r + r0) * fc + c + c0) * nbands + b] = merged;
+                    if m != c {
+                        out[((r + r0) * fc + m + c0) * nbands + b] =
+                            if parts.is_empty() { fill } else { turn(merged) };
                     }
                 }
             }
@@ -631,11 +674,45 @@ impl MeshSet {
     /// below the fold, mirrored (column `i` from column `ncol - 1 - i` of
     /// the row before it at an F-point pivot, from column `ncol - i` of the
     /// row two before at a T-point pivot, where the row before mirrors
-    /// itself too). The first row, which holds no cells, is left. Scalar
-    /// fields only: a vector component would change sign across the fold.
+    /// itself too). The first row, which holds no cells, is left. For
+    /// scalar fields (components east and north are scalars here); for
+    /// components in the grid's directions, [`MeshSet::fill_halo_vector`].
     ///
     /// Errors for another halo, or when `file` isn't the file's size.
     pub fn fill_halo<T: Copy>(&self, file: &mut [T], nbands: usize) -> Result<(), String> {
+        self.fill_nemo(file, nbands, |v| v)
+    }
+
+    /// [`MeshSet::fill_halo`] for components of a vector in the grid's own
+    /// directions (along its rows or its columns, as NEMO's velocities
+    /// are), every band a component, on T points as the set's cells are
+    /// (NEMO's U, V and F points fold onto other columns and rows, and
+    /// aren't done here). The grid turns half round across the north fold,
+    /// so the fold's copies change sign (NEMO's `psgn = -1`); the cyclic
+    /// columns' don't. At a T-point pivot, as NEMO leaves it,
+    /// the cell at column `ncol / 2` of the row below the fold, its own
+    /// mirror, changes sign, and column `ncol - 1` of that row is column 1
+    /// (the other pivot) with its sign changed. The grid has no directions
+    /// at a pivot, and a component that agrees with its own halo is zero
+    /// there.
+    ///
+    /// Errors for another halo, or when `file` isn't the file's size.
+    pub fn fill_halo_vector<T: Copy + Neg<Output = T>>(
+        &self,
+        file: &mut [T],
+        nbands: usize,
+    ) -> Result<(), String> {
+        self.fill_nemo(file, nbands, |v: T| -v)
+    }
+
+    /// NEMO's `lbc_lnk` without the closed south: the cyclic columns, then
+    /// the north fold, its copies through `turn` (`psgn`).
+    fn fill_nemo<T: Copy>(
+        &self,
+        file: &mut [T],
+        nbands: usize,
+        turn: impl Fn(T) -> T,
+    ) -> Result<(), String> {
         let t_pivot = match self.halo {
             h if h == Halo::NEMO_F_PIVOT => false,
             h if h == Halo::NEMO_T_PIVOT => true,
@@ -649,26 +726,29 @@ impl MeshSet {
             ));
         }
         let nb = nbands;
-        let copy = |file: &mut [T], (j, i): (usize, usize), (sj, si): (usize, usize)| {
+        let copy = |file: &mut [T], (j, i): (usize, usize), (sj, si): (usize, usize), across: bool| {
             let (to, from) = ((j * nx + i) * nb, (sj * nx + si) * nb);
-            file.copy_within(from..from + nb, to);
+            for b in 0..nb {
+                let v = file[from + b];
+                file[to + b] = if across { turn(v) } else { v };
+            }
         };
         // a column at or past ncol - 2 is the one ncol - 2 before it
         let wrap = |i: usize| if i >= nx - 2 { i - (nx - 2) } else { i };
         for j in 0..ny - 1 {
-            copy(file, (j, nx - 2), (j, 0));
-            copy(file, (j, nx - 1), (j, 1));
+            copy(file, (j, nx - 2), (j, 0), false);
+            copy(file, (j, nx - 1), (j, 1), false);
         }
         if t_pivot {
             for i in nx / 2..nx {
-                copy(file, (ny - 2, i), (ny - 2, wrap(nx - i)));
+                copy(file, (ny - 2, i), (ny - 2, wrap(nx - i)), true);
             }
             for i in 0..nx {
-                copy(file, (ny - 1, i), (ny - 3, wrap(nx - i)));
+                copy(file, (ny - 1, i), (ny - 3, wrap(nx - i)), true);
             }
         } else {
             for i in 0..nx {
-                copy(file, (ny - 1, i), (ny - 2, nx - 1 - i));
+                copy(file, (ny - 1, i), (ny - 2, nx - 1 - i), true);
             }
         }
         Ok(())

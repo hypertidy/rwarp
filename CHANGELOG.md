@@ -167,6 +167,12 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     north-fold row, for `Halo::NEMO_F_PIVOT` and `NEMO_T_PIVOT`. On
     eORCA1 and ORCA2, cell centres taken to the set and back, halo
     filled, match the file's to 2e-16 in every row but the first.
+  - `to_file_layout_vector` and `fill_halo_vector`, for components of a
+    vector in the grid's directions: the fold's copies change sign
+    (NEMO's `psgn = -1`), and a T pivot's halves are turned round before
+    their mean. Components east and north are scalars here. On both
+    files, components along each cell's own directions come back to
+    1e-16, halo and all.
 - `MeshSet::weights_to_par` and `weights_onto_par`: `weights_to` and
   `weights_onto` on up to `threads` threads, the same tables bit for bit.
   Pieces with at least `1 / threads` of the set's cells are measured one
