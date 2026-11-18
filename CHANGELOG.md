@@ -155,6 +155,13 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `MeshSet::weights_to_par` and `weights_onto_par`: `weights_to` and
+  `weights_onto` on up to `threads` threads, the same tables bit for bit.
+  Pieces with at least `1 / threads` of the set's cells are measured one
+  after another, each on every thread (`exact_weights_par`, a transformer
+  per thread from the closure); the rest at once, one a thread, the most
+  cells first; merged in the pieces' order. To 1 degree at densify 8:
+  eORCA1's `weights_to` 3.0 s on one thread, 0.42 s on 8.
 - `weights::exact_weights_par`: `exact_weights` on up to `threads`
   threads, the same table entry for entry and bit for bit.
   - Each thread builds its own transformer and takes bands of the
