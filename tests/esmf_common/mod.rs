@@ -1,6 +1,6 @@
 //! The ESMF oracle fixtures (`tests/fixtures/esmf/`, made by `gen.py`) and
-//! the comparison of a map with them, shared by `tests/esmf.rs` and
-//! `tests/esmf_tripolar.rs`.
+//! the comparison of a map with them, shared by `tests/esmf.rs`,
+//! `tests/esmf_tripolar.rs` and `tests/esmf_mesh.rs`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

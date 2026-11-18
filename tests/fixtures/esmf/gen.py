@@ -1,4 +1,5 @@
-"""Regenerate the ESMF oracle fixtures for tests/esmf.rs and tests/esmf_tripolar.rs.
+"""Regenerate the ESMF oracle fixtures for tests/esmf.rs, tests/esmf_tripolar.rs
+and tests/esmf_mesh.rs.
 
     /opt/gdal-py/bin/python tests/fixtures/esmf/gen.py [case ...]
 
@@ -43,6 +44,20 @@ grid in the same plane and a regular lon/lat grid up to the pole:
 The onto_tripolar cases are the same grids the other way round: the regular
 grid is the source and the tripolar cap the destination (rwarp's
 mesh::MeshTarget).
+
+The mesh cases (tests/esmf_mesh.rs) are between a mesh of polygons and a
+regular grid, both ways (rwarp's mesh::PolyMesh): hexagons with every
+third split into six triangles round its centre, its nodes shared and
+moved a little, over part of a grid of unit cells and past its top-left
+corner (mesh_hex.mesh.txt). Cartesian, in the grid's plane, where every
+edge is straight on both sides, so rwarp must match it to rounding:
+
+- mesh_hex_to.cart.txt: mesh to grid (the mesh's elements the source).
+- mesh_hex_onto.cart.txt: grid to mesh.
+
+ESMF splits a polygon into triangles and gives one weight per triangle,
+so a mesh map's weights are summed per (row, col) before they are
+written.
 
 Fixture layout: '# key value' header lines, then 'n_b n_s', then n_b lines
 'frac_b area_b' (destination row-major), then n_s lines 'row col S' (ESMF's
@@ -141,11 +156,18 @@ def grid(corner, centre, coord_sys):
     return g
 
 
+def cell_field(g):
+    """A field of one value per cell: a grid's centres or a mesh's elements."""
+    if isinstance(g, esmpy.Mesh):
+        return esmpy.Field(g, meshloc=esmpy.MeshLoc.ELEMENT)
+    return esmpy.Field(g, staggerloc=esmpy.StaggerLoc.CENTER)
+
+
 def conserve(src_grid, dst_grid):
-    src = esmpy.Field(src_grid, staggerloc=esmpy.StaggerLoc.CENTER)
-    dst = esmpy.Field(dst_grid, staggerloc=esmpy.StaggerLoc.CENTER)
-    frac = esmpy.Field(dst_grid, staggerloc=esmpy.StaggerLoc.CENTER)
-    area = esmpy.Field(dst_grid, staggerloc=esmpy.StaggerLoc.CENTER)
+    src = cell_field(src_grid)
+    dst = cell_field(dst_grid)
+    frac = cell_field(dst_grid)
+    area = cell_field(dst_grid)
     r = esmpy.Regrid(src, dst,
                      regrid_method=esmpy.RegridMethod.CONSERVE,
                      norm_type=esmpy.NormType.DSTAREA,
@@ -392,6 +414,105 @@ def tripolar(names):
             write_map(os.path.join(HERE, f"{name}.{sys_}.txt"), header, sys_, res)
 
 
+# ---- a mesh of polygons --------------------------------------------------------
+
+# The grid: unit cells, pixel (col, row) at (x, -y); as in the regular cases,
+# ESMF gets it with y up.
+MESH_GRID_GT = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0]
+MESH_GRID_SIZE = (14, 12)
+
+
+def hex_mesh():
+    """Pointy-top hexagons of circumradius 0.8 in rows 1.2 apart, from
+    above and left of the grid's top-left corner to short of its right and
+    bottom edges, every third split into six triangles round its centre.
+    Nodes are shared (found by position), then each moved by up to 0.06 in
+    x and y, by C library sines of where it was. Returns the nodes' x and
+    y and the faces, anticlockwise, as lists of 0-based node indices."""
+    rho = 0.8
+    w = math.sqrt(3.0) * rho
+    index, xs, ys, faces = {}, [], [], []
+
+    def node(px, py):
+        key = (round(px * 1e6), round(py * 1e6))
+        if key not in index:
+            index[key] = len(xs)
+            xs.append(px)
+            ys.append(py)
+        return index[key]
+
+    k = 0
+    for j in range(-1, 10):
+        for i in range(-1, 10):
+            cx = -0.5 + i * w + (w / 2 if j % 2 else 0.0)
+            cy = 0.6 - j * 1.5 * rho
+            ring = [node(cx + rho * math.cos(math.radians(90 + 60 * m)),
+                         cy + rho * math.sin(math.radians(90 + 60 * m))) for m in range(6)]
+            if k % 3 == 2:
+                c = node(cx, cy)
+                faces.extend([c, ring[m], ring[(m + 1) % 6]] for m in range(6))
+            else:
+                faces.append(ring)
+            k += 1
+    for n in range(len(xs)):
+        px, py = xs[n], ys[n]
+        xs[n] = px + 0.06 * math.sin(3.1 * px + 1.7 * py)
+        ys[n] = py + 0.06 * math.cos(2.3 * px - 1.1 * py)
+    return xs, ys, faces
+
+
+def write_mesh(path, xs, ys, faces):
+    with open(path, "w") as f:
+        f.write("# mesh hexagons, every third split into six triangles; nodes in the grid's plane\n")
+        f.write(f"{len(xs)} {len(faces)}\n")
+        for x, y in zip(xs, ys):
+            f.write(f"{x:.17g} {y:.17g}\n")
+        for face in faces:
+            f.write(" ".join(str(v) for v in [len(face)] + list(face)) + "\n")
+    print(f"{os.path.basename(path)}: {len(xs)} nodes, {len(faces)} faces")
+
+
+def esmf_mesh(xs, ys, faces):
+    m = esmpy.Mesh(parametric_dim=2, spatial_dim=2, coord_sys=esmpy.CoordSys.CART)
+    n = len(xs)
+    m.add_nodes(n, np.arange(1, n + 1), np.column_stack([xs, ys]).ravel(), np.zeros(n, dtype=int))
+    # element coordinates aren't used by conserve, but ESMF looks for them
+    centroids = [(sum(xs[v] for v in f) / len(f), sum(ys[v] for v in f) / len(f)) for f in faces]
+    m.add_elements(len(faces), np.arange(1, len(faces) + 1), np.array([len(f) for f in faces]),
+                   np.array([v for f in faces for v in f]), element_coords=np.array(centroids).ravel())
+    return m
+
+
+def summed(result):
+    """One weight per (row, col): ESMF gives one per triangle of a polygon."""
+    frac_b, area_b, row, col, s = result
+    keys, inv = np.unique(np.column_stack([row, col]), axis=0, return_inverse=True)
+    total = np.zeros(len(keys))
+    np.add.at(total, inv.ravel(), s)
+    return frac_b, area_b, keys[:, 0], keys[:, 1], total
+
+
+def mesh_cases():
+    xs, ys, faces = hex_mesh()
+    write_mesh(os.path.join(HERE, "mesh_hex.mesh.txt"), xs, ys, faces)
+    mesh = esmf_mesh(xs, ys, faces)
+    size, gt = MESH_GRID_SIZE, MESH_GRID_GT
+    corner, centre = (pixel_to_geo(gt, *lattice(*size, off)) for off in (False, True))
+    g = grid(corner, centre, esmpy.CoordSys.CART)
+    common = [
+        "mesh mesh_hex.mesh.txt",
+        f"grid_gt {' '.join(repr(float(v)) for v in gt)}",
+        f"grid_size {size[0]} {size[1]}",
+    ]
+    oracle = f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, Cartesian in the grid's plane"
+    for name, note, res in [
+        ("mesh_hex_to", "the hexagon mesh to the grid", conserve(mesh, g)),
+        ("mesh_hex_onto", "the grid onto the hexagon mesh", conserve(g, mesh)),
+    ]:
+        write_map(os.path.join(HERE, f"{name}.cart.txt"), [f"case {name}: {note}", oracle] + common,
+                  "cart", summed(res))
+
+
 def main():
     esmpy.Manager(debug=False)
     names = sys.argv[1:]
@@ -422,6 +543,8 @@ def main():
             shutil.rmtree(work)
     if not names or any("tripolar" in n for n in names):
         tripolar(names)
+    if not names or any("mesh" in n for n in names):
+        mesh_cases()
 
 
 if __name__ == "__main__":

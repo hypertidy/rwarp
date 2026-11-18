@@ -3701,77 +3701,12 @@ impl Lattice {
     /// around a pole), then measured at each whole-period offset at which
     /// it reaches the buffer: once, as [`Cover::Window`], or more than once,
     /// merged into [`Cover::Pieces`].
-    pub(crate) fn cover(&mut self, c: usize, src_off: (f64, f64), (ncol, nrow): (i64, i64)) -> Cover {
+    pub(crate) fn cover(&mut self, c: usize, src_off: (f64, f64), size: (i64, i64)) -> Cover {
         if self.multi { return self.cover_sheets(c); }
-        if self.in_world() { return self.cover_world(c, (ncol, nrow)); }
+        if self.in_world() { return self.cover_world(c, size); }
         if !self.ring(0, c, src_off) { return Cover::Failed; }
-        if let Some(wrap) = self.wrap {
-            if !self.unwrap(wrap, src_off.1) { return Cover::Failed; }
-        }
-        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
-        for (&x, &y) in self.rx.iter().zip(&self.ry) {
-            minx = minx.min(x); maxx = maxx.max(x);
-            miny = miny.min(y); maxy = maxy.max(y);
-        }
-        if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) { return Cover::Failed; }
-        let r0 = (miny.floor() as i64).max(0);
-        let r1 = (maxy.ceil() as i64).min(nrow);
-        if r0 >= r1 { return Cover::Outside; }
-        let h = (r1 - r0) as usize;
-        // the whole-period offsets at which the outline reaches the buffer's
-        // columns: just 0 without a wrap
-        let p = self.wrap.map_or(0.0, |w| w.period);
-        let (k0, k1) = if p > 0.0 {
-            ((-maxx / p).floor() as i64 + 1, ((ncol as f64 - minx) / p).ceil() as i64 - 1)
-        } else {
-            (0, 0)
-        };
-        let cols = |k: i64| {
-            let s = k as f64 * p;
-            (((minx + s).floor() as i64).max(0), ((maxx + s).ceil() as i64).min(ncol))
-        };
-        let mut hits = [0i64; 4];
-        let mut n = 0;
-        for k in k0..=k1 {
-            let (c0, c1) = cols(k);
-            if c0 < c1 {
-                if n == hits.len() { return Cover::Failed; }
-                hits[n] = k;
-                n += 1;
-            }
-        }
-        match n {
-            0 => Cover::Outside,
-            1 => {
-                let k = hits[0];
-                if k != 0 {
-                    let s = k as f64 * p;
-                    for x in &mut self.rx { *x += s; }
-                }
-                let (c0, c1) = cols(k);
-                let w = (c1 - c0) as usize;
-                self.win.reset(c0, r0, w, h);
-                self.win.add_ring(&self.rx, &self.ry, 1.0);
-                self.win.resolve();
-                Cover::Window { c0, r0, w }
-            }
-            _ => {
-                self.pieces.clear();
-                for &k in &hits[..n] {
-                    let s = k as f64 * p;
-                    self.sx.clear();
-                    self.sx.extend(self.rx.iter().map(|x| x + s));
-                    let (c0, c1) = cols(k);
-                    let w = (c1 - c0) as usize;
-                    self.win.reset(c0, r0, w, h);
-                    self.win.add_ring(&self.sx, &self.ry, 1.0);
-                    self.win.resolve();
-                    push_pieces(&self.win, (c0, r0, w), &mut self.pieces);
-                }
-                merge_pieces(&mut self.pieces);
-                Cover::Pieces
-            }
-        }
+        let mut scratch = OutlineScratch { win: &mut self.win, sx: &mut self.sx, pieces: &mut self.pieces };
+        cover_outline(&mut self.rx, &mut self.ry, self.wrap, src_off.1, size, &mut scratch)
     }
 
     /// [`Lattice::cover`] against the source window's cells: the outline
@@ -3961,35 +3896,133 @@ impl Lattice {
         }
     }
 
-    /// Unwrap the outline in `rx` across the source's seam, so that no
-    /// step moves by more than half a period. An outline around a pole
-    /// then comes back one period from where it started: close it along
-    /// the row of the pole it is nearest (in buffer pixels, the full
-    /// source's row less `row_off`), out and back at the period's two ends.
-    /// False for an outline that winds round more than once.
+    /// [`unwrap_outline`] on the outline in `rx`, `ry`.
     fn unwrap(&mut self, wrap: SourceWrap, row_off: f64) -> bool {
-        let p = wrap.period;
-        if !(p.is_finite() && p > 0.0) || self.rx.is_empty() { return true; }
-        let mut shift = 0.0;
-        let mut prev = self.rx[0];
-        for x in self.rx.iter_mut().skip(1) {
-            let raw = *x;
-            shift -= ((raw - prev) / p).round() * p;
-            prev = raw;
-            *x = raw + shift;
+        unwrap_outline(&mut self.rx, &mut self.ry, wrap, row_off)
+    }
+}
+
+/// Unwrap the outline `rx`, `ry` across the source's seam, so that no
+/// step moves by more than half a period. An outline around a pole then
+/// comes back one period from where it started: close it along the row of
+/// the pole it is nearest (in buffer pixels, the full source's row less
+/// `row_off`), out and back at the period's two ends. False for an
+/// outline that winds round more than once.
+pub(crate) fn unwrap_outline(rx: &mut Vec<f64>, ry: &mut Vec<f64>, wrap: SourceWrap, row_off: f64) -> bool {
+    let p = wrap.period;
+    if !(p.is_finite() && p > 0.0) || rx.is_empty() { return true; }
+    let mut shift = 0.0;
+    let mut prev = rx[0];
+    for x in rx.iter_mut().skip(1) {
+        let raw = *x;
+        shift -= ((raw - prev) / p).round() * p;
+        prev = raw;
+        *x = raw + shift;
+    }
+    let net = shift - ((rx[0] - prev) / p).round() * p;
+    let turns = (net / p).round();
+    if turns == 0.0 { return true; }
+    if turns.abs() > 1.0 { return false; }
+    let near = |row: f64| ry.iter().map(|&y| (y - (row - row_off)).abs()).fold(f64::INFINITY, f64::min);
+    let [north, south] = wrap.pole_rows;
+    let pole = if near(north) <= near(south) { north } else { south } - row_off;
+    let (x0, y0) = (rx[0], ry[0]);
+    let x1 = x0 + turns * p;
+    rx.extend([x1, x1, x0]);
+    ry.extend([y0, pole, pole]);
+    true
+}
+
+/// The coverage window and scratch [`cover_outline`] works in.
+pub(crate) struct OutlineScratch<'a> {
+    pub(crate) win: &'a mut controlledburn::CoverageWindow,
+    pub(crate) sx: &'a mut Vec<f64>,
+    pub(crate) pieces: &'a mut Vec<(i64, i64, f64)>,
+}
+
+/// Exact coverage of the buffer pixels (`ncol` by `nrow`) by the outline
+/// `rx`, `ry` in buffer pixels, under the window's measure: what
+/// [`Lattice::cover`] does once it has a pixel's outline, and what a
+/// [`PolyMesh`](crate::mesh::PolyMesh)'s faces are measured with.
+///
+/// For a source that wraps in longitude (`wrap`), the outline is
+/// unwrapped across the seam first (and closed along the pole's row if it
+/// goes around a pole; `row_off` is the buffer's first row in the full
+/// source), then measured at each whole-period offset at which it reaches
+/// the buffer: once, as [`Cover::Window`], or more than once, merged into
+/// [`Cover::Pieces`] (`scratch.pieces`). `rx` is left as measured: moved
+/// by the period if it reaches the buffer at one offset only.
+pub(crate) fn cover_outline(
+    rx: &mut Vec<f64>, ry: &mut Vec<f64>, wrap: Option<SourceWrap>, row_off: f64, (ncol, nrow): (i64, i64),
+    scratch: &mut OutlineScratch<'_>,
+) -> Cover {
+    if let Some(wrap) = wrap {
+        if !unwrap_outline(rx, ry, wrap, row_off) { return Cover::Failed; }
+    }
+    let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for (&x, &y) in rx.iter().zip(ry.iter()) {
+        minx = minx.min(x); maxx = maxx.max(x);
+        miny = miny.min(y); maxy = maxy.max(y);
+    }
+    if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) { return Cover::Failed; }
+    let r0 = (miny.floor() as i64).max(0);
+    let r1 = (maxy.ceil() as i64).min(nrow);
+    if r0 >= r1 { return Cover::Outside; }
+    let h = (r1 - r0) as usize;
+    // the whole-period offsets at which the outline reaches the buffer's
+    // columns: just 0 without a wrap
+    let p = wrap.map_or(0.0, |w| w.period);
+    let (k0, k1) = if p > 0.0 {
+        ((-maxx / p).floor() as i64 + 1, ((ncol as f64 - minx) / p).ceil() as i64 - 1)
+    } else {
+        (0, 0)
+    };
+    let cols = |k: i64| {
+        let s = k as f64 * p;
+        (((minx + s).floor() as i64).max(0), ((maxx + s).ceil() as i64).min(ncol))
+    };
+    let mut hits = [0i64; 4];
+    let mut n = 0;
+    for k in k0..=k1 {
+        let (c0, c1) = cols(k);
+        if c0 < c1 {
+            if n == hits.len() { return Cover::Failed; }
+            hits[n] = k;
+            n += 1;
         }
-        let net = shift - ((self.rx[0] - prev) / p).round() * p;
-        let turns = (net / p).round();
-        if turns == 0.0 { return true; }
-        if turns.abs() > 1.0 { return false; }
-        let near = |row: f64| self.ry.iter().map(|&y| (y - (row - row_off)).abs()).fold(f64::INFINITY, f64::min);
-        let [north, south] = wrap.pole_rows;
-        let pole = if near(north) <= near(south) { north } else { south } - row_off;
-        let (x0, y0) = (self.rx[0], self.ry[0]);
-        let x1 = x0 + turns * p;
-        self.rx.extend([x1, x1, x0]);
-        self.ry.extend([y0, pole, pole]);
-        true
+    }
+    let win = &mut *scratch.win;
+    match n {
+        0 => Cover::Outside,
+        1 => {
+            let k = hits[0];
+            if k != 0 {
+                let s = k as f64 * p;
+                for x in rx.iter_mut() { *x += s; }
+            }
+            let (c0, c1) = cols(k);
+            let w = (c1 - c0) as usize;
+            win.reset(c0, r0, w, h);
+            win.add_ring(rx, ry, 1.0);
+            win.resolve();
+            Cover::Window { c0, r0, w }
+        }
+        _ => {
+            scratch.pieces.clear();
+            for &k in &hits[..n] {
+                let s = k as f64 * p;
+                scratch.sx.clear();
+                scratch.sx.extend(rx.iter().map(|x| x + s));
+                let (c0, c1) = cols(k);
+                let w = (c1 - c0) as usize;
+                win.reset(c0, r0, w, h);
+                win.add_ring(scratch.sx, ry, 1.0);
+                win.resolve();
+                push_pieces(win, (c0, r0, w), scratch.pieces);
+            }
+            merge_pieces(scratch.pieces);
+            Cover::Pieces
+        }
     }
 }
 

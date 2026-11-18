@@ -356,6 +356,63 @@ ICON triangles, MPAS hexagons, a UGRID mesh, an ESMF mesh file.
 - **Shared-edge exactness** carries over: faces that share an edge share its
   vertices, so the per-cell sums telescope.
 
+**Status (2026-11-18): 5a built**, `mesh::PolyMesh` (`src/mesh/poly.rs`),
+mesh to grid and grid to mesh with edges straight in the mesh's
+coordinates:
+
+- **The mesh.** Nodes and faces as compressed rows (`PolyMesh::new`, ESMF's
+  `elementConn`) or a padded table (`from_padded`: UGRID's
+  `face_node_connectivity`, MPAS's `verticesOnCell`). With a period
+  (`with_period`, 360 for longitude) each edge goes the shorter way round,
+  and a face round a pole is closed along it by the grid.
+- **The engine is the exact footprint's, not `controlledburn::burn`.** Each
+  face is an outline, measured as `exact_weights` measures a destination
+  pixel: its edges cut into `densify` pieces in the mesh's coordinates (or
+  refined by bigcurve to `refine_tolerance`), through the transformer into
+  the grid's pixels, and covered there by `cover_outline`, the part of
+  `Lattice::cover` that measures an outline in source pixels (factored out;
+  warp and weights hashes unchanged). That gives `f64` overlaps, the grid's
+  measure (`Measure::CosLatitude` for areas on the sphere), the seam and
+  the poles. `burn`'s fractions are `f32` and planar; its runs would pay
+  for faces many cells across, where the window over a face's box costs
+  its area.
+- **One table, both ways.** `weights_onto` is `exact_weights`' table with
+  face `f` as destination cell `(0, f)`. `weights_to` is the same overlaps
+  turned round: grouped by grid cell, `frac` over the face's measure
+  (`src_cell_area`), `dst_area` the cells'.
+- **Shared edges.** A face's interior edge points are made from the edge's
+  lexicographically smaller end, the other aligned to it by the period,
+  so a shared edge gets bitwise the same points from both faces. bigcurve
+  refines in the same canonical direction; its edge model here is planar
+  with `align` and `reframe` by the period, so a shared edge across the
+  seam refines to the same points too, and the transformer sees the same
+  inputs (it must take each point on its own: not `ApproxTransformer`).
+- **Measured** (`tests/poly_mesh.rs`, `tests/esmf_mesh.rs`):
+  - ESMF, Cartesian, hexagons and triangles over part of a grid and past
+    its corner: `S` within 1.6e-14 (mesh to grid) and 5.7e-14 (grid to
+    mesh), `frac_b` and `area_b` to 6e-14.
+  - Boxes in longitude and latitude on a 1 degree grid under the
+    spherical measure: every overlap is the closed form to 1e-16 sr.
+    Across 180 and round both poles (a cap of 36 nodes on 80 N, three
+    nodes on 60 S), each face's area is its closed form to 1e-14 of it,
+    and the grid stored from 0 to 360 gives the same weights.
+  - Boxes in longitude and latitude onto a polar LAEA grid (100 km),
+    refined: each box's area is within 1.35 to 1.58 times the tolerance of
+    its area on the sphere from 1e-1 to 1e-6 pixels, the points growing as
+    the tolerance to the power -0.493 (from 1e-3), and the faces tile the
+    grid (every whole cell's `frac` sums to 1 to 1e-13) at every
+    tolerance, across the mesh's seam too.
+  - The mesh of a grid's own cells is the identity; triangles halve their
+    cells; a mixed mesh of quads, triangles and hexagons tiles the grid,
+    and `apply` keeps the integral both ways.
+
+Next, as 5b: great-circle edges for meshes on the sphere (ICON, MPAS),
+with bigcurve's great-circle model, against ESMF's spherical maps (whose
+grid cells are great-circle quadrilaterals too, so a difference is
+recorded, as for the regular cases in 5.2). Later: a grid with world cells
+on the other side (geolocation, a `QuadMesh`, a `MeshSet`), and threads.
+Mesh to mesh stays out of scope.
+
 ## 8. Stage 6: second order
 
 ESMF's `conserve_2nd` adds a per-source-cell gradient term, with weights that

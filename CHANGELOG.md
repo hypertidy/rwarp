@@ -29,6 +29,21 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   unwrapped across the seam, and one round a pole is refused. The area
   burned converges on the closed form at the tolerance's rate, with the
   points growing as its inverse square root.
+- `mesh::PolyMesh`, a mesh of polygonal faces (ICON's triangles, MPAS's
+  hexagons, a UGRID or ESMF mesh; `new` from compressed rows,
+  `from_padded` from a padded table), and conservative weights between
+  it and a grid both ways: `weights_onto` (grid to mesh) and
+  `weights_to` (mesh to grid), one table of overlaps turned round
+  (conservative stage 5, #39). Each face is measured as `exact_weights`
+  measures a destination pixel: its edges densified (or refined by
+  bigcurve) through the transformer into the grid's pixels, under the
+  grid's measure, across a seam and round a pole. Faces that share an
+  edge get bitwise the same points on it, so they tile the grid. With a
+  period (`with_period`), edges go the shorter way round. Against ESMF
+  (Cartesian, hexagons and triangles over part of a grid) the weights
+  agree to 6e-14 both ways. Edges are planar in the mesh's coordinates;
+  great-circle edges, and grids with world cells on the other side, are
+  not built yet.
 
 ### Fixed
 
