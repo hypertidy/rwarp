@@ -2,6 +2,8 @@
 
 All notable changes to rwarp. Dates are when the change reached `main`.
 
+## 0.5.1 (unreleased)
+
 ## 0.5.0 (2026-11-18)
 
 Whole ocean-model grids as `mesh::MeshSet` (regridding to and from them,

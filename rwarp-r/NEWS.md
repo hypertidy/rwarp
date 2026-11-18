@@ -1,5 +1,10 @@
 # rwarp (development version)
 
+* Built on rwarp (the crate) 0.5.0, with controlledburn 0.3 and bigcurve
+  0.3. The R functions give the same results: the crate's 0.4 and 0.5
+  changes are in its mesh and weights API, the exact footprint, and new
+  functions on several threads, which the package doesn't bind yet.
+
 * rwarp has a hex logo, drawn from rwarp's own output: MUR sea surface
   temperature warped to Antarctic polar stereographic in a regular grid of
   tiles, and one row per tile for the plan. The site has favicons to match.
@@ -63,10 +68,6 @@
   vector.
 
 * `warp_plan()` documents `fill_ratio`: GDAL's, which can be above 1.
-
-* Built on rwarp (the crate) 0.4.1, with controlledburn 0.3. The R functions
-  are unchanged: the crate's 0.4 changes are in its mesh and weights API,
-  which the package doesn't bind yet.
 
 * `warp_plan()` gains `split_antimeridian` (default `TRUE`): a destination
   crossing the antimeridian of a global longitude/latitude source reads the
