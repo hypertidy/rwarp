@@ -155,6 +155,22 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `plan::warp_chunks_par`: `warp_chunks` on up to `threads` threads,
+  with the same values bit for bit.
+  - Each thread builds its own transformer, and takes bands of each
+    chunk's rows from one queue, about four bands a thread over the plan.
+    So a plan of one chunk runs on every thread, and one of many warps
+    several chunks at once.
+  - A chunk's source window is copied when its first band starts
+    (borrowed when it is whole rows of the buffer) and dropped after its
+    last. Bands go into the target in the plan's order, as on one thread
+    (the two chunks of an antimeridian gap share a target window).
+  - A 0.1 degree global grid to 4000 x 4000 south polar stereographic
+    pixels through libproj, 8 chunks: bilinear 1.48 s on one thread,
+    0.26 s on 8; cubic 3.09 s and 0.46 s.
+- Targets are filled with their nodata by copying (`slice::repeat`), not
+  pixel by pixel. `warp_chunks` of a one-chunk plan to 16 million pixels
+  took 0.94 s on one thread, 1.03 s before.
 - `warp::warp_par` and `warp_to_par`: `warp` and `warp_to` on up to
   `threads` threads, with the same values bit for bit.
   - Each thread builds its own transformer with a closure, as GDAL's
