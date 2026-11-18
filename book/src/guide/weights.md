@@ -156,9 +156,18 @@ Against ESMF, Cartesian (hexagons and triangles over part of a grid,
 `tests/esmf_mesh.rs`), the weights agree to 6e-14 both ways. On the
 sphere (a geodesic mesh and its dual with a global 5° grid) the faces'
 areas agree to 8e-8, and the weights differ by the grid's cells, which
-rwarp bounds by parallels and ESMF by great circles (`S` to 3.8e-3). A
-grid with world cells (geolocation, a `QuadMesh`) on the other side isn't
-supported yet.
+rwarp bounds by parallels and ESMF by great circles (`S` to 3.8e-3).
+
+The grid can also be one whose cells are in its world coordinates, as for
+`exact_weights`: geolocation arrays (`GenImgGeolocTransformer`), a
+curvilinear grid by its corners (`MeshTransformer` over a `QuadMesh`) or a
+whole ocean grid in pieces (`SetTransformer` over a `MeshSet`), each with
+destination geotransform `WORLD_GT`, so that its destination coordinates
+are the mesh's. Each face is then measured in the source's world and
+walked onto its cells, `frac` is a fraction of a cell's world area
+(`src_cell_area`), and the measure must be planar. For a set, each face
+goes to every band's world and is left out of one where it comes out
+inside out, such as round the far pole of a polar projection.
 
 ## Densify
 

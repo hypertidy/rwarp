@@ -41,8 +41,7 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   edge get bitwise the same points on it, so they tile the grid. With a
   period (`with_period`), edges go the shorter way round. Against ESMF
   (Cartesian, hexagons and triangles over part of a grid) the weights
-  agree to 6e-14 both ways. Grids with world cells on the other side are
-  not built yet.
+  agree to 6e-14 both ways.
 - `PolyMesh::with_great_circles`: edges on great circles, as ICON's and
   MPAS's are, nodes in longitude and latitude (conservative stage 5b,
   #39). Each edge is cut at `densify` equal angles, or refined by
@@ -56,6 +55,18 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   5 degree grid) the faces' areas agree to 8e-8; the weights differ by
   the grid's cells, which rwarp bounds by parallels and ESMF by great
   circles (`S` to 3.8e-3).
+- `PolyMesh::weights_onto` and `weights_to` with a grid whose cells are in
+  its world coordinates: geolocation arrays (`GenImgGeolocTransformer`), a
+  `QuadMesh` (`MeshTransformer`) or a `MeshSet` (`SetTransformer`), each
+  with destination geotransform `WORLD_GT` (conservative stage 5c, #39).
+  Each face is measured as such a source measures a destination pixel:
+  its outline in the source's world, walked onto its cells, across a seam
+  and round a pole; for a set, in each band's world, left out of one where
+  it comes out inside out, judged against the face's own turn. Onto a
+  curvilinear mesh the fractions are the faces' clipped overlaps to
+  1.1e-13; onto a set the faces tile every cell to 1e-12. The world-cell
+  measure is factored out of the exact footprint's lattice
+  (`WorldCells`); warp and weights hashes are unchanged.
 
 ### Fixed
 

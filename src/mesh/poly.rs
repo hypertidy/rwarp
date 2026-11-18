@@ -2,10 +2,10 @@
 //! [`PolyMesh`] (conservative stage 5, `design/conservative.md` section 7).
 
 use bigcurve::{Edge, ForwardBatch, GreatCircle, Options, Resampler, Span, Vertex};
-use controlledburn::CoverageWindow;
+use controlledburn::{CoverageWindow, Measure};
 
-use crate::transform::Transformer;
-use crate::warp::{cover_outline, Cover, OutlineScratch};
+use crate::transform::{SourceCells, SourceWrap, Transformer};
+use crate::warp::{cover_outline, unwrap_outline, Cover, OutlineScratch, WorldCells};
 use crate::weights::{shift_rows, to_u32, GridWindow, WeightOptions, Weights};
 
 /// Points of the faces transformed at once, at most (a chunk ends after
@@ -16,7 +16,10 @@ const CHUNK: usize = 1 << 16;
 /// ring of the mesh's nodes: ICON's triangles, MPAS's hexagons, a UGRID
 /// or ESMF mesh. For conservative weights between the mesh and a grid,
 /// both ways: [`PolyMesh::weights_onto`] (grid to mesh) and
-/// [`PolyMesh::weights_to`] (mesh to grid).
+/// [`PolyMesh::weights_to`] (mesh to grid). The grid is a regular one in
+/// any CRS, or one whose cells are in its world coordinates: geolocation
+/// arrays, a [`QuadMesh`](super::QuadMesh) (a curvilinear grid by its
+/// corners), a [`MeshSet`](super::MeshSet) (a whole ocean grid in pieces).
 ///
 /// - **Faces** have edges straight in the nodes' coordinates (any CRS:
 ///   the transformer the weights take maps them to the grid), or great
@@ -254,6 +257,27 @@ impl PolyMesh {
     ///   destination offset in `opts` is not used;
     /// - [`Weights::apply`] takes the grid's values and gives one per face.
     ///
+    /// **A grid whose cells are in its world coordinates**
+    /// ([`Transformer::source_cells`]: geolocation arrays through
+    /// [`GenImgGeolocTransformer`](crate::geoloc_transform::GenImgGeolocTransformer),
+    /// a [`QuadMesh`](super::QuadMesh) through
+    /// [`MeshTransformer`](super::MeshTransformer), a
+    /// [`MeshSet`](super::MeshSet) through
+    /// [`SetTransformer`](super::SetTransformer), each with destination
+    /// geotransform [`WORLD_GT`](super::WORLD_GT)) is measured as those
+    /// sources are for a destination pixel. The outline's points go to the
+    /// source's world coordinates (refined there, the tolerance in world
+    /// units), are joined by straight lines there, and are walked onto its
+    /// cells, so `frac` is a fraction of a cell's world area (in
+    /// [`Weights::src_cell_area`]) and `dst_area` the face's world area;
+    /// `opts.measure` must be [`Measure::Planar`]. Across a seam with
+    /// `lon_wrap` or a declared period, and round a pole, as for a pixel.
+    /// For cells in several worlds (a set's bands) each face is taken to
+    /// each world, left out of one where it comes out inside out (round
+    /// the far pole of a polar projection, say, judged against the face's
+    /// own turn in the mesh's coordinates), and its area is the world's
+    /// whose cells it covers most.
+    ///
     /// Faces that share an edge share its points exactly, so where the
     /// faces cover a grid cell, its `frac` sums to 1 over them, up to
     /// rounding. That needs a transformer that takes each point on its
@@ -261,10 +285,9 @@ impl PolyMesh {
     /// [`ApproxTransformer`](crate::approx::ApproxTransformer), which
     /// interpolates along what it is given.
     ///
-    /// Errors when `inner`'s source has world cells
-    /// ([`Transformer::source_cells`]: geolocation arrays, a mesh), which
-    /// is not supported yet, or when `opts.refine_tolerance` is not
-    /// positive. Panics if a grid or face index doesn't fit in `u32`.
+    /// Errors when `opts.refine_tolerance` is not positive, or with world
+    /// cells when `opts.measure` isn't planar or the cells can't be built.
+    /// Panics if a grid or face index doesn't fit in `u32`.
     pub fn weights_onto<T: Transformer>(&self, inner: &T, grid: &GridWindow, opts: &WeightOptions) -> Result<Weights, String> {
         let nface = self.nface();
         check_indices(grid, nface);
@@ -275,7 +298,8 @@ impl PolyMesh {
             measure: opts.measure,
             ..Weights::default()
         };
-        self.overlaps(inner, grid, opts, |f, area, cells| {
+        let mut at = Vec::new();
+        let areas = self.overlaps(inner, grid, opts, |f, area, cells| {
             w.dst_area.push(area);
             for &(pc, pr, v) in cells {
                 if let Some(v) = opts.weight(v) {
@@ -284,9 +308,13 @@ impl PolyMesh {
                     w.src_row.push((grid.row_off as i64 + pr) as u32);
                     w.src_col.push((grid.col_off as i64 + pc) as u32);
                     w.frac.push(v);
+                    at.push(pr as usize * grid.ncol + pc as usize);
                 }
             }
         })?;
+        if inner.source_cells().is_some() {
+            w.src_cell_area = at.into_iter().map(|k| areas[k]).collect();
+        }
         Ok(w)
     }
 
@@ -304,7 +332,9 @@ impl PolyMesh {
     ///   [`Weights::src_cell_area`] (each entry's face); the drop, snap
     ///   and rounding options apply to it;
     /// - `dst_off` and `dst_size` are the window's, and `dst_area` each
-    ///   cell's measure under `opts.measure` (1 for the planar measure);
+    ///   cell's measure under `opts.measure` (1 for the planar measure), or
+    ///   with world cells its world area (`NaN` for a window pixel with no
+    ///   cell);
     /// - [`Weights::apply`] takes one value per face, as a source buffer
     ///   `nface` wide and 1 high, and gives the grid's.
     ///
@@ -313,19 +343,24 @@ impl PolyMesh {
         check_indices(grid, self.nface());
         // (row, col) of the window, face, frac, the face's measure
         let mut e: Vec<(u32, u32, u32, f64, f64)> = Vec::new();
-        self.overlaps(inner, grid, opts, |f, area, cells| {
+        let areas = self.overlaps(inner, grid, opts, |f, area, cells| {
             for &(pc, pr, v) in cells {
-                let row = grid.row_off as i64 + pr;
-                if let Some(v) = opts.weight(v * opts.measure.cell_area(row) / area) {
+                if v != 0.0 {
                     e.push((pr as u32, pc as u32, f as u32, v, area));
                 }
             }
         })?;
+        // each overlap's measure, over its face's
+        e.retain_mut(|t| match opts.weight(t.3 * areas[t.0 as usize * grid.ncol + t.1 as usize] / t.4) {
+            Some(v) => {
+                t.3 = v;
+                true
+            }
+            None => false,
+        });
         e.sort_by_key(|t| (t.0, t.1));
         let (r0, c0) = (grid.row_off as u32, grid.col_off as u32);
-        let dst_area = (0..grid.nrow)
-            .flat_map(|r| std::iter::repeat_n(opts.measure.cell_area((grid.row_off + r) as i64), grid.ncol))
-            .collect();
+        let dst_area = areas;
         Ok(Weights {
             dst_row: e.iter().map(|t| r0 + t.0).collect(),
             dst_col: e.iter().map(|t| c0 + t.1).collect(),
@@ -344,35 +379,62 @@ impl PolyMesh {
     /// by face: `f(face, measure, cells)` with `cells` `(col, row,
     /// coverage)` in window pixels, coverage a fraction of the cell's
     /// measure (zeros included). A face that fails has measure `NaN` and
-    /// no cells.
+    /// no cells. Returns each window cell's measure, row-major: under
+    /// `opts.measure` in grid pixels, or its world area for a source with
+    /// world cells (`NaN` in none).
     fn overlaps<T: Transformer>(
         &self,
         inner: &T,
         grid: &GridWindow,
         opts: &WeightOptions,
         mut f: impl FnMut(usize, f64, &[(i64, i64, f64)]),
-    ) -> Result<(), String> {
-        if inner.source_cells().is_some() {
-            return Err("PolyMesh weights are with a grid: a transformer whose source has world cells \
-                        (geolocation arrays, a mesh) isn't supported yet"
-                .into());
-        }
+    ) -> Result<Vec<f64>, String> {
         if let Some(t) = opts.refine_tolerance {
             if t.is_nan() || t <= 0.0 {
                 return Err(format!("the refinement tolerance must be positive, not {t}"));
             }
         }
+        let source = inner.source_cells();
+        if source.is_some() && opts.measure != Measure::Planar {
+            return Err("a source with world cells is measured in its world coordinates: \
+                        WeightOptions::measure must be Measure::Planar"
+                .into());
+        }
+        let mut world = source.map(|c| WorldCells::new(c, (grid.col_off, grid.row_off, grid.ncol, grid.nrow)));
+        let nworld = world.as_ref().map_or(1, |w| w.turn.len());
+        if let (Some(c), Some(w)) = (source, &mut world) {
+            if !w.ok() {
+                return Err("the grid's cells could not be built".into());
+            }
+            if w.multi {
+                w.turn = self.turns(c, nworld);
+            }
+        }
         let d = opts.densify.max(1);
         let edge = MeshEdge { period: self.period, great: self.great };
-        let wrap = inner.source_wrap();
         let size = (grid.ncol as i64, grid.nrow as i64);
-        let (col_off, row_off) = (grid.col_off as f64, grid.row_off as f64);
-        let measure = shift_rows(opts.measure, row_off);
+        let (wrap, col_off, row_off, measure) = match world {
+            Some(_) => (None, 0.0, 0.0, Measure::Planar),
+            None => {
+                let r = grid.row_off as f64;
+                (inner.source_wrap(), grid.col_off as f64, r, shift_rows(opts.measure, r))
+            }
+        };
+        let areas: Vec<f64> = (0..grid.nrow as i64)
+            .flat_map(|r| (0..grid.ncol as i64).map(move |c| (r, c)))
+            .map(|(r, c)| match &world {
+                Some(w) => w.cell_area(c, r),
+                None => opts.measure.cell_area(grid.row_off as i64 + r),
+            })
+            .collect();
         let mut win = CoverageWindow::with_measure(measure);
         let (mut sx, mut pieces, mut cells) = (Vec::new(), Vec::new(), Vec::new());
         let (mut rx, mut ry) = (Vec::new(), Vec::new());
         let mut pts = Points::default();
-        let mut refined = Refined::default();
+        let mut moved: Vec<Points> = (0..nworld).map(|_| Points::default()).collect();
+        let mut refined: Vec<Refined> = (0..nworld).map(|_| Refined::default()).collect();
+        let in_world = world.is_some();
+        let at_world = |k: usize| in_world.then_some(k);
         let nface = self.nface();
         let mut f0 = 0;
         while f0 < nface {
@@ -382,33 +444,67 @@ impl PolyMesh {
                 self.face_points(f1, d, &edge, &mut pts);
                 f1 += 1;
             }
-            pts.transform(inner);
-            if let Some(tol) = opts.refine_tolerance {
-                refined.run(inner, edge, tol, &pts);
+            for k in 0..nworld {
+                let m = &mut moved[k];
+                m.mx.clone_from(&pts.mx);
+                m.my.clone_from(&pts.my);
+                m.at.clone_from(&pts.at);
+                m.transform(inner, at_world(k));
+                if let Some(tol) = opts.refine_tolerance {
+                    refined[k].run(inner, at_world(k), edge, tol, m);
+                }
             }
             for (i, face) in (f0..f1).enumerate() {
                 let r = pts.at[i]..pts.at[i + 1];
                 cells.clear();
-                if !pts.ok[r.clone()].iter().all(|&ok| ok) || refined.failed.get(i).copied().unwrap_or(false) {
-                    f(face, f64::NAN, &cells);
-                    continue;
-                }
-                rx.clear();
-                ry.clear();
-                for j in r {
-                    rx.push(pts.x[j] - col_off);
-                    ry.push(pts.y[j] - row_off);
-                    if let Some(s) = refined.segment(j) {
-                        rx.extend(s.iter().map(|v| v.x - col_off));
-                        ry.extend(s.iter().map(|v| v.y - row_off));
-                    }
-                }
-                let mut scratch = OutlineScratch { win: &mut win, sx: &mut sx, pieces: &mut pieces };
-                let cover = cover_outline(&mut rx, &mut ry, wrap, row_off, size, &mut scratch);
-                let area = match cover {
-                    Cover::Failed => f64::NAN,
-                    _ => measure.ring_area(&rx, &ry).abs(),
+                let held = |k: usize| {
+                    moved[k].ok[r.clone()].iter().all(|&ok| ok) && !refined[k].failed.get(i).copied().unwrap_or(false)
                 };
+                // the face's outline in world k (or grid pixels), into rx, ry
+                let outline = |k: usize, rx: &mut Vec<f64>, ry: &mut Vec<f64>| {
+                    rx.clear();
+                    ry.clear();
+                    for j in r.clone() {
+                        rx.push(moved[k].x[j] - col_off);
+                        ry.push(moved[k].y[j] - row_off);
+                        if let Some(s) = refined[k].segment(j) {
+                            rx.extend(s.iter().map(|v| v.x - col_off));
+                            ry.extend(s.iter().map(|v| v.y - row_off));
+                        }
+                    }
+                };
+                let (cover, area) = match &mut world {
+                    None | Some(WorldCells { multi: false, .. }) if !held(0) => (Cover::Failed, f64::NAN),
+                    None => {
+                        outline(0, &mut rx, &mut ry);
+                        let mut scratch = OutlineScratch { win: &mut win, sx: &mut sx, pieces: &mut pieces };
+                        let cover = cover_outline(&mut rx, &mut ry, wrap, row_off, size, &mut scratch);
+                        (cover, measure.ring_area(&rx, &ry).abs())
+                    }
+                    Some(w) if !w.multi => {
+                        outline(0, &mut rx, &mut ry);
+                        let cover = w.cover_one(&mut rx, &mut ry, size, &mut win, &mut pieces);
+                        (cover, Measure::Planar.ring_area(&rx, &ry).abs())
+                    }
+                    Some(w) => {
+                        let own = self.own_turn(&pts, r.clone());
+                        let mut st = w.begin(&mut pieces);
+                        let mut cover = None;
+                        for k in 0..nworld {
+                            if !held(k) {
+                                continue;
+                            }
+                            outline(k, &mut rx, &mut ry);
+                            if !w.offer(k, own, &rx, &ry, &mut win, &mut pieces, &mut st) {
+                                cover = Some(Cover::Failed);
+                                break;
+                            }
+                        }
+                        let cover = cover.unwrap_or_else(|| w.finish(&st, &mut pieces));
+                        (cover, w.outline)
+                    }
+                };
+                let area = if matches!(cover, Cover::Failed) { f64::NAN } else { area };
                 match cover {
                     Cover::Window { c0, r0, w } => {
                         for (k, &v) in win.coverage().iter().enumerate() {
@@ -422,7 +518,58 @@ impl PolyMesh {
             }
             f0 = f1;
         }
-        Ok(())
+        Ok(areas)
+    }
+
+    /// The sign of face `f`'s turn in the mesh's coordinates, from its
+    /// points `r` in `pts`: unwrapped by the period (and closed along a
+    /// pole, a quarter period from y = 0, if it goes round one), positive
+    /// as for a destination pixel's outline. 0 if it winds round more than
+    /// once.
+    fn own_turn(&self, pts: &Points, r: std::ops::Range<usize>) -> f64 {
+        let (mut x, mut y) = (pts.mx[r.clone()].to_vec(), pts.my[r].to_vec());
+        if let Some(p) = self.period {
+            if !unwrap_outline(&mut x, &mut y, SourceWrap::new(p, [p / 4.0, -p / 4.0]), 0.0) {
+                return 0.0;
+            }
+        }
+        let n = x.len();
+        let a: f64 = (0..n).map(|i| (x[i] - x[0]) * (y[(i + 1) % n] - y[0]) - (x[(i + 1) % n] - x[0]) * (y[i] - y[0])).sum();
+        if a > 0.0 { 1.0 } else if a < 0.0 { -1.0 } else { 0.0 }
+    }
+
+    /// The sign each of the source's `n` worlds gives a positive turn in
+    /// the mesh's coordinates, by a vote of small triangles at the first
+    /// node of up to 81 faces spread over the mesh (0 if none goes).
+    fn turns(&self, cells: &dyn SourceCells, n: usize) -> Vec<f64> {
+        let nf = self.nface();
+        let step = nf.div_ceil(81).max(1);
+        let (mut x0, mut y0) = (Vec::new(), Vec::new());
+        for f in (0..nf).step_by(step) {
+            let v = self.face(f);
+            let (a, b) = (self.node(v[0]), self.node(v[1]));
+            let h = 1e-3 * (b[0] - a[0]).hypot(b[1] - a[1]);
+            let h = if h > 0.0 { h } else { 1e-9 };
+            x0.extend([a[0], a[0] + h, a[0]]);
+            y0.extend([a[1], a[1], a[1] + h]);
+        }
+        (0..n)
+            .map(|k| {
+                let (mut x, mut y) = (x0.clone(), y0.clone());
+                let ok = cells.dst_to_world_in(k, &mut x, &mut y);
+                let mut votes = 0i64;
+                for i in (0..x.len()).step_by(3) {
+                    if !(ok[i] && ok[i + 1] && ok[i + 2]) {
+                        continue;
+                    }
+                    let o = (x[i + 1] - x[i]) * (y[i + 2] - y[i]) - (y[i + 1] - y[i]) * (x[i + 2] - x[i]);
+                    if o.is_finite() && o != 0.0 {
+                        votes += if o > 0.0 { 1 } else { -1 };
+                    }
+                }
+                votes.signum() as f64
+            })
+            .collect()
     }
 
     /// Face `f`'s outline points in the mesh's coordinates, appended to
@@ -608,10 +755,15 @@ impl Points {
         self.at.push(0);
     }
 
-    fn transform<T: Transformer>(&mut self, inner: &T) {
+    /// Through the transformer to the grid's pixels, or into world
+    /// `world` of its source's cells.
+    fn transform<T: Transformer>(&mut self, inner: &T, world: Option<usize>) {
         self.x.clone_from(&self.mx);
         self.y.clone_from(&self.my);
-        let ok = inner.transform(true, &mut self.x, &mut self.y);
+        let ok = match (inner.source_cells(), world) {
+            (Some(c), Some(k)) => c.dst_to_world_in(k, &mut self.x, &mut self.y),
+            _ => inner.transform(true, &mut self.x, &mut self.y),
+        };
         self.ok.clear();
         self.ok.extend((0..self.x.len()).map(|i| ok[i] && self.x[i].is_finite() && self.y[i].is_finite()));
     }
@@ -640,7 +792,7 @@ impl Refined {
     /// to `tol`, one forward call per level. If a midpoint fails, each
     /// face is run again on its own to find which: its points are the
     /// same, since a segment's depend only on its ends.
-    fn run<T: Transformer>(&mut self, inner: &T, edge: MeshEdge, tol: f64, pts: &Points) {
+    fn run<T: Transformer>(&mut self, inner: &T, world: Option<usize>, edge: MeshEdge, tol: f64, pts: &Points) {
         let nf = pts.at.len() - 1;
         self.segs.clear();
         self.seg.clear();
@@ -659,7 +811,7 @@ impl Refined {
             faces.push(self.segs.len());
         }
         let opts = Options::new(tol);
-        let mut rs = Resampler::with_edge(MeshForward { inner, failed: false }, edge, &opts);
+        let mut rs = Resampler::with_edge(MeshForward { inner, world, failed: false }, edge, &opts);
         self.out.clear();
         self.ends.clear();
         rs.edges(&self.segs, &mut self.out, &mut self.ends);
@@ -674,7 +826,7 @@ impl Refined {
             if s.is_empty() {
                 continue;
             }
-            let mut one = Resampler::with_edge(MeshForward { inner, failed: false }, edge, &opts);
+            let mut one = Resampler::with_edge(MeshForward { inner, world, failed: false }, edge, &opts);
             out.clear();
             ends.clear();
             one.edges(s, &mut out, &mut ends);
@@ -694,15 +846,20 @@ impl Refined {
 }
 
 /// The transformer as bigcurve's forward map, from the mesh's
-/// coordinates to the grid's pixels, noting whether any point failed.
+/// coordinates to the grid's pixels (or into world `world` of its
+/// source's cells), noting whether any point failed.
 struct MeshForward<'a, T> {
     inner: &'a T,
+    world: Option<usize>,
     failed: bool,
 }
 
 impl<T: Transformer> ForwardBatch for MeshForward<'_, T> {
     fn forward_batch(&mut self, x: &mut [f64], y: &mut [f64], _near: &[[f64; 2]], ok: &mut [bool]) {
-        let good = self.inner.transform(true, x, y);
+        let good = match (self.inner.source_cells(), self.world) {
+            (Some(c), Some(k)) => c.dst_to_world_in(k, x, y),
+            _ => self.inner.transform(true, x, y),
+        };
         for i in 0..x.len() {
             ok[i] = good[i] && x[i].is_finite() && y[i].is_finite();
             self.failed |= !ok[i];
@@ -835,9 +992,9 @@ mod tests {
         pts.clear();
         m.face_points(0, 1, &edge, &mut pts);
         m.face_points(1, 1, &edge, &mut pts);
-        pts.transform(&Polar);
+        pts.transform(&Polar, None);
         let mut r = Refined::default();
-        r.run(&Polar, edge, 1e-3, &pts);
+        r.run(&Polar, None, edge, 1e-3, &pts);
         let bits = |v: &[Vertex]| v.iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect::<Vec<_>>();
         // face 0's segment 0 runs 0 -> 1, face 1's first (point 3) 1 -> 0
         let (a, mut b) = (bits(r.segment(0).unwrap()), bits(r.segment(3).unwrap()));
@@ -879,9 +1036,9 @@ mod tests {
             let mut b = bits(&pts, at3 + 1..at3 + d);
             b.reverse();
             assert_eq!(a, b, "across the seam, densify {d}");
-            pts.transform(&Polar);
+            pts.transform(&Polar, None);
             let mut r = Refined::default();
-            r.run(&Polar, edge, 1e-4, &pts);
+            r.run(&Polar, None, edge, 1e-4, &pts);
             let refined = |j: usize| r.segment(j).unwrap().iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect::<Vec<_>>();
             if d == 1 {
                 // the segment from (lon A, 90) to A in face 0 is point 1's;
@@ -929,6 +1086,58 @@ mod tests {
             assert_eq!(a, b, "densify {d}");
             assert_eq!(pts.my[d], 0.0, "the cut, densify {d}");
         }
+    }
+
+    /// Two worlds, the second the first mirrored.
+    struct Mirror;
+
+    impl SourceCells for Mirror {
+        fn dst_to_world(&self, x: &mut [f64], _: &mut [f64]) -> Vec<bool> {
+            vec![true; x.len()]
+        }
+        fn mesh(&self, _: usize, _: usize, _: usize, _: usize) -> Result<crate::mesh::QuadMesh, String> {
+            Err("none".into())
+        }
+        fn worlds(&self) -> usize {
+            2
+        }
+        fn dst_to_world_in(&self, k: usize, x: &mut [f64], _: &mut [f64]) -> Vec<bool> {
+            if k == 1 {
+                x.iter_mut().for_each(|v| *v = -*v);
+            }
+            vec![true; x.len()]
+        }
+    }
+
+    /// Each world's turn is found, and a face's own: anticlockwise,
+    /// clockwise, and round a pole either way (closed along it).
+    #[test]
+    fn turns_are_found() {
+        let (x, y) = (vec![0.0, 1.0, 1.0, 0.0], vec![0.0, 0.0, 1.0, 1.0]);
+        let m = PolyMesh::new(x, y, vec![0, 4, 8], vec![0, 1, 2, 3, 3, 2, 1, 0]).unwrap();
+        assert_eq!(m.turns(&Mirror, 2), vec![1.0, -1.0]);
+        let mut pts = Points::default();
+        pts.clear();
+        m.face_points(0, 1, &MeshEdge { period: None, great: false }, &mut pts);
+        m.face_points(1, 1, &MeshEdge { period: None, great: false }, &mut pts);
+        assert_eq!((m.own_turn(&pts, 0..4), m.own_turn(&pts, 4..8)), (1.0, -1.0));
+        // caps round the north pole, east and west, and the south pole
+        let x: Vec<f64> = (0..6).map(|k| -180.0 + 60.0 * k as f64).collect();
+        let (mut xs, mut ys) = (x.clone(), vec![80.0; 6]);
+        xs.extend(&x);
+        ys.extend([-80.0; 6]);
+        let faces = vec![0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0, 6, 7, 8, 9, 10, 11];
+        let m = PolyMesh::new(xs, ys, vec![0, 6, 12, 18], faces).unwrap().with_period(360.0).unwrap();
+        let mut pts = Points::default();
+        pts.clear();
+        for f in 0..3 {
+            m.face_points(f, 1, &MeshEdge { period: m.period, great: false }, &mut pts);
+        }
+        let own: Vec<f64> = (0..3).map(|f| m.own_turn(&pts, pts.at[f]..pts.at[f + 1])).collect();
+        // east along 80 N, up to the pole and back west along it is
+        // anticlockwise with y up; east along 80 S, down to the pole and
+        // back, clockwise
+        assert_eq!(own, vec![1.0, -1.0, -1.0]);
     }
 
     #[test]
