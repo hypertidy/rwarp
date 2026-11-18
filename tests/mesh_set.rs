@@ -331,6 +331,15 @@ fn a_halo_gives_the_same_set() {
     let halo = Halo { cols: [0, 2], rows: [1, 0], ..Halo::NONE };
     let h = MeshSet::from_cf_bounds(fc, fr, &xb, &yb, halo, &bands, Some(&fland)).unwrap();
     assert_eq!(h.size(), [NC, NR]);
+    assert_eq!((h.file_size(), h.halo()), ([fc, fr], halo));
+    // a field in the file's layout to the set's numbering and back; this
+    // halo isn't NEMO's whole, so it isn't filled
+    let field: Vec<u16> = (0..fc * fr).map(|k| (k % fc % NC + 100 * (k / fc)) as u16).collect();
+    let set_field = h.from_file_layout(&field, 1).unwrap();
+    assert!((0..NC * NR).all(|k| set_field[k] == field[(k / NC + 1) * fc + k % NC]));
+    let mut back = h.to_file_layout(&set_field, 1, 9999).unwrap();
+    assert!((0..fc * fr).all(|k| back[k] == if k < fc || k % fc >= NC { 9999 } else { field[k] }));
+    assert!(h.fill_halo(&mut back, 1).unwrap_err().contains("NEMO"));
     assert_eq!(h.dropped(), plain.dropped());
     assert_eq!(h.pieces().len(), plain.pieces().len());
     for (a, b) in h.pieces().iter().zip(plain.pieces()) {

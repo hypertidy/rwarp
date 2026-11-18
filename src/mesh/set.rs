@@ -88,6 +88,10 @@ impl Piece {
 /// - **Burning.** [`MeshSet::burn`] burns polygons and points given in the
 ///   bounds' coordinates onto the set's cells, densified into each band's
 ///   world.
+/// - **The file's layout.** Fields go between the file's grid (halo and
+///   all) and the set's numbering with [`MeshSet::from_file_layout`] and
+///   [`MeshSet::to_file_layout`] (a T-point pivot's halves made one cell
+///   again), and [`MeshSet::fill_halo`] puts NEMO's halo back.
 /// - **Warping.** [`SetTransformer`](crate::mesh::SetTransformer) is the
 ///   set as the source of [`warp`](crate::warp::warp), for every method:
 ///   area methods with the exact footprint walk each destination pixel
@@ -149,6 +153,9 @@ pub struct MeshSet {
     pieces: Vec<Piece>,
     dropped: Vec<(usize, usize)>,
     clips: Vec<Clip>,
+    /// The file's size `[ncol, nrow]`, halo and all, and its halo.
+    file: [usize; 2],
+    halo: Halo,
 }
 
 /// What [`MeshSet::burn`] cuts a band's polygons to, in the bounds'
@@ -448,7 +455,223 @@ impl MeshSet {
             pieces,
             dropped,
             clips,
+            file: [ncol, nrow],
+            halo,
         })
+    }
+
+    /// The file's size `[ncol, nrow]`, halo and all, as the set was built
+    /// from it.
+    pub fn file_size(&self) -> [usize; 2] {
+        self.file
+    }
+
+    /// The halo the set was built with.
+    pub fn halo(&self) -> Halo {
+        self.halo
+    }
+
+    /// A field on the file's grid (`nbands` values a cell, interleaved,
+    /// row-major over [`MeshSet::file_size`]) in the set's numbering: the
+    /// halo's rows and columns dropped, as a source buffer for
+    /// [`SetTransformer`](crate::mesh::SetTransformer) takes it. The set's
+    /// cell `(row, col)` is the file's `(row + halo.rows[0], col +
+    /// halo.cols[0])`. At a T-point pivot each cell of the last row kept
+    /// is two of the set's cells, each with the file's value there; a
+    /// halo-exchanged field has the model's value in both.
+    ///
+    /// Errors when `data` isn't the file's size.
+    pub fn from_file_layout<T: Copy>(&self, data: &[T], nbands: usize) -> Result<Vec<T>, String> {
+        let [fc, fr] = self.file;
+        if data.len() != fc * fr * nbands {
+            return Err(format!(
+                "{} values for a {fc} x {fr} file of {nbands} band(s)",
+                data.len()
+            ));
+        }
+        let (r0, c0) = (self.halo.rows[0], self.halo.cols[0]);
+        let mut out = Vec::with_capacity(self.ncol * self.nrow * nbands);
+        for r in 0..self.nrow {
+            let start = ((r + r0) * fc + c0) * nbands;
+            out.extend_from_slice(&data[start..start + self.ncol * nbands]);
+        }
+        Ok(out)
+    }
+
+    /// A field in the set's numbering (`nbands` values a cell, interleaved,
+    /// row-major over [`MeshSet::size`]) on the file's grid, the halo's
+    /// cells `fill` (as CMIP6 files mask them; [`MeshSet::fill_halo`] puts
+    /// NEMO's copies there).
+    ///
+    /// At a T-point pivot the two cells of the set that halve one model
+    /// cell (found by the fold side they share) give it their mean by
+    /// area, in both of the file's copies of it, leaving out a half that
+    /// is `fill`, NaN or a cell left out. That is the model cell's value
+    /// for what [`Weights::apply`] and [`MeshSet::burn`] give: means and
+    /// fractions of each cell's area.
+    ///
+    /// Errors when `data` isn't the set's size.
+    pub fn to_file_layout<T: crate::warp::Sample>(
+        &self,
+        data: &[T],
+        nbands: usize,
+        fill: T,
+    ) -> Result<Vec<T>, String> {
+        let (nc, nr) = (self.ncol, self.nrow);
+        if data.len() != nc * nr * nbands {
+            return Err(format!(
+                "{} values for a {nc} x {nr} set of {nbands} band(s)",
+                data.len()
+            ));
+        }
+        let [fc, fr] = self.file;
+        let (r0, c0) = (self.halo.rows[0], self.halo.cols[0]);
+        let mut out = vec![fill; fc * fr * nbands];
+        for r in 0..nr {
+            let start = ((r + r0) * fc + c0) * nbands;
+            out[start..start + nc * nbands]
+                .copy_from_slice(&data[r * nc * nbands..(r + 1) * nc * nbands]);
+        }
+        if self.halo.fold_through_centres && nr > 0 {
+            let r = nr - 1;
+            let missing = |v: T| v == fill || v.is_nan();
+            for (c, m) in self.halves() {
+                let area = |c: usize| {
+                    self.locate_cell(r, c)
+                        .map(|(p, pr, pc)| p.mesh.cell_area(pr, pc))
+                };
+                for b in 0..nbands {
+                    let v = |c: usize| data[(r * nc + c) * nbands + b];
+                    let parts: Vec<(f64, f64)> = [c, m]
+                        .into_iter()
+                        .take(if m == c { 1 } else { 2 })
+                        .filter(|&k| !missing(v(k)))
+                        .filter_map(|k| area(k).map(|a| (a, v(k).to_f64())))
+                        .collect();
+                    let total: f64 = parts.iter().map(|p| p.0).sum();
+                    let merged = if parts.is_empty() {
+                        fill
+                    } else if total > 0.0 {
+                        T::from_f64(parts.iter().map(|p| p.0 * p.1).sum::<f64>() / total)
+                    } else {
+                        T::from_f64(parts.iter().map(|p| p.1).sum::<f64>() / parts.len() as f64)
+                    };
+                    for k in [c, m] {
+                        out[((r + r0) * fc + k + c0) * nbands + b] = merged;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The pairs `(c, m)` of the set's last row's cells that halve one
+    /// model cell at a T-point pivot: `c`'s top side is `m`'s reversed (the
+    /// fold between them), to a thousandth of the row's largest cell. Of
+    /// the cells that match, NEMO's mirror `(ncol + 2 - c) % ncol` first
+    /// (cells collapsed to one point all match), then the nearest; a cell
+    /// that matches none but itself, as at a pivot, pairs with itself.
+    fn halves(&self) -> Vec<(usize, usize)> {
+        let (r, nc) = (self.nrow - 1, self.ncol);
+        let top: Vec<Option<[[f64; 2]; 2]>> = (0..nc)
+            .map(|c| {
+                self.locate_cell(r, c).map(|(p, pr, pc)| {
+                    let q = p.mesh.corners(pr, pc);
+                    [q[3], q[2]]
+                })
+            })
+            .collect();
+        let extent = (0..nc)
+            .filter_map(|c| self.locate_cell(r, c))
+            .map(|(p, pr, pc)| {
+                let q = p.mesh.corners(pr, pc);
+                (0..4)
+                    .map(|k| (q[k][0] - q[(k + 1) % 4][0]).hypot(q[k][1] - q[(k + 1) % 4][1]))
+                    .fold(0.0, f64::max)
+            })
+            .fold(0.0, f64::max);
+        let tol = 1e-3 * extent;
+        let d = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        // how far `m`'s top side, reversed, is from `c`'s
+        let gap = |c: usize, m: usize| match (top[c], top[m]) {
+            (Some([a, b]), Some([p, q])) => Some(d(a, q).max(d(b, p))).filter(|&g| g <= tol),
+            _ => None,
+        };
+        let mut pairs = Vec::new();
+        let mut taken = vec![false; nc];
+        for c in 0..nc {
+            if taken[c] || top[c].is_none() {
+                continue;
+            }
+            let mirror = (nc + 2 - c) % nc;
+            let free = |m: usize| m != c && !taken[m];
+            let m = if free(mirror) && gap(c, mirror).is_some() {
+                Some(mirror)
+            } else {
+                (0..nc)
+                    .filter(|&m| free(m))
+                    .filter_map(|m| gap(c, m).map(|g| (g, m)))
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, m)| m)
+                    .or_else(|| gap(c, c).map(|_| c))
+            };
+            if let Some(m) = m {
+                taken[c] = true;
+                taken[m] = true;
+                pairs.push((c, m));
+            }
+        }
+        pairs
+    }
+
+    /// NEMO's halo exchange on a field on the file's grid (as
+    /// [`MeshSet::to_file_layout`] gives it), for a set built with
+    /// [`Halo::NEMO_F_PIVOT`] or [`Halo::NEMO_T_PIVOT`]: the last two
+    /// columns repeat the first two, and the north-fold row repeats the row
+    /// below the fold, mirrored (column `i` from column `ncol - 1 - i` of
+    /// the row before it at an F-point pivot, from column `ncol - i` of the
+    /// row two before at a T-point pivot, where the row before mirrors
+    /// itself too). The first row, which holds no cells, is left. Scalar
+    /// fields only: a vector component would change sign across the fold.
+    ///
+    /// Errors for another halo, or when `file` isn't the file's size.
+    pub fn fill_halo<T: Copy>(&self, file: &mut [T], nbands: usize) -> Result<(), String> {
+        let t_pivot = match self.halo {
+            h if h == Halo::NEMO_F_PIVOT => false,
+            h if h == Halo::NEMO_T_PIVOT => true,
+            h => return Err(format!("only NEMO's halos are filled, not {h:?}")),
+        };
+        let [nx, ny] = self.file;
+        if file.len() != nx * ny * nbands || nx < 4 || ny < 3 {
+            return Err(format!(
+                "{} values for a {nx} x {ny} file of {nbands} band(s)",
+                file.len()
+            ));
+        }
+        let nb = nbands;
+        let copy = |file: &mut [T], (j, i): (usize, usize), (sj, si): (usize, usize)| {
+            let (to, from) = ((j * nx + i) * nb, (sj * nx + si) * nb);
+            file.copy_within(from..from + nb, to);
+        };
+        // a column at or past ncol - 2 is the one ncol - 2 before it
+        let wrap = |i: usize| if i >= nx - 2 { i - (nx - 2) } else { i };
+        for j in 0..ny - 1 {
+            copy(file, (j, nx - 2), (j, 0));
+            copy(file, (j, nx - 1), (j, 1));
+        }
+        if t_pivot {
+            for i in nx / 2..nx {
+                copy(file, (ny - 2, i), (ny - 2, wrap(nx - i)));
+            }
+            for i in 0..nx {
+                copy(file, (ny - 1, i), (ny - 3, wrap(nx - i)));
+            }
+        } else {
+            for i in 0..nx {
+                copy(file, (ny - 1, i), (ny - 2, nx - 1 - i));
+            }
+        }
+        Ok(())
     }
 
     /// The set's size in cells, `[ncol, nrow]`.

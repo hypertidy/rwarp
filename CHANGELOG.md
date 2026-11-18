@@ -155,6 +155,18 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `MeshSet::from_file_layout`, `to_file_layout` and `fill_halo`: fields
+  between the file's grid (halo and all) and the set's numbering.
+  `MeshSet` keeps the file's size and halo (`file_size`, `halo`).
+  - `from_file_layout` drops the halo, for a `SetTransformer`'s source
+    buffer.
+  - `to_file_layout` puts a field back with the halo masked by a fill. A
+    T-point pivot's two halves of a model cell give it their mean by
+    area.
+  - `fill_halo` writes NEMO's halo: the cyclic columns and the mirrored
+    north-fold row, for `Halo::NEMO_F_PIVOT` and `NEMO_T_PIVOT`. On
+    eORCA1 and ORCA2, cell centres taken to the set and back, halo
+    filled, match the file's to 2e-16 in every row but the first.
 - `MeshSet::weights_to_par` and `weights_onto_par`: `weights_to` and
   `weights_onto` on up to `threads` threads, the same tables bit for bit.
   Pieces with at least `1 / threads` of the set's cells are measured one

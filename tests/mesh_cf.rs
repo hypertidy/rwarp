@@ -10,7 +10,8 @@
 //! cell's split triangles, as in `tests/mesh_glued.rs`.
 
 use controlledburn::{BurnOptions, BurnResult, Coord, Geometry, Polygon};
-use rwarp::mesh::{CellMap, Halo, QuadMesh};
+use rwarp::mesh::{Band, CellMap, Halo, MeshSet, QuadMesh};
+use rwarp::CrsTransform;
 use std::f64::consts::TAU;
 
 /// Cell bounds, row-major with the vertex last (CF, SCRIP).
@@ -641,4 +642,106 @@ fn rings_round_the_pivots() {
             assert!(n > 300, "{name}: {n}");
         }
     }
+}
+
+/// The ORCA-like grid as a set of one band in its own plane.
+fn orca_set(b: &Bounds, t_pivot: bool) -> MeshSet {
+    struct Same;
+    impl CrsTransform for Same {
+        fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+            Some((x, y))
+        }
+    }
+    let halo = if t_pivot { Halo::NEMO_T_PIVOT } else { Halo::NEMO_F_PIVOT };
+    let bands = [Band { rows: 0..b.nrow - 2, to_world: &Same }];
+    MeshSet::from_cf_bounds(b.ncol, b.nrow, &b.x, &b.y, halo, &bands, None).unwrap()
+}
+
+/// A field on the file's grid into the set's numbering and back, with
+/// NEMO's halo filled: every cell but the first row's comes back. The
+/// field is each cell's centre, which a halo cell shares with the cell it
+/// copies (at a T pivot, the two cells that halve one model cell do too).
+#[test]
+fn fields_go_to_the_set_and_back_to_the_file() {
+    for t_pivot in [false, true] {
+        let (nc, ny) = (24, 10);
+        let b = orca(nc, ny, t_pivot);
+        let s = orca_set(&b, t_pivot);
+        assert_eq!((s.size(), s.file_size(), s.halo().fold_through_centres), ([nc, ny - 2], [nc + 2, ny], t_pivot));
+        let nx = b.ncol;
+        let centre = |j: usize, i: usize| {
+            let k = (j * nx + i) * 4;
+            [(0..4).map(|v| b.x[k + v]).sum::<f64>() / 4.0, (0..4).map(|v| b.y[k + v]).sum::<f64>() / 4.0]
+        };
+        let file: Vec<f64> = (0..ny).flat_map(|j| (0..nx).flat_map(move |i| centre(j, i))).collect();
+        let field = s.from_file_layout(&file, 2).unwrap();
+        assert_eq!(field.len(), nc * (ny - 2) * 2);
+        // the set's (row, col) is the file's (row + 1, col)
+        assert_eq!(&field[..2], &file[nx * 2..nx * 2 + 2]);
+        let mut back = s.to_file_layout(&field, 2, f64::NAN).unwrap();
+        // the halo masked: the first row, the last two columns, the last row
+        let halo = |j: usize, i: usize| j == 0 || j == ny - 1 || i >= nc;
+        for j in 0..ny {
+            for i in 0..nx {
+                let k = (j * nx + i) * 2;
+                if halo(j, i) {
+                    assert!(back[k].is_nan() && back[k + 1].is_nan(), "({j}, {i}) masked");
+                } else {
+                    assert!((back[k] - file[k]).abs() < 1e-9 && (back[k + 1] - file[k + 1]).abs() < 1e-9, "({j}, {i}): {:?} vs {:?}", &back[k..k + 2], &file[k..k + 2]);
+                }
+            }
+        }
+        s.fill_halo(&mut back, 2).unwrap();
+        let worst = (2 * nx..file.len()).map(|k| (back[k] - file[k]).abs()).fold(0.0, f64::max);
+        assert!(worst < 1e-9, "t_pivot {t_pivot}: the halo filled to {worst:e}");
+        assert!(back[..2 * nx].iter().all(|v| v.is_nan()), "the first row is left");
+    }
+}
+
+/// At a T pivot, the two cells of the set that halve one model cell give
+/// it their mean by area, in both of the file's copies of it; a half that
+/// is the fill, or NaN, is left out.
+#[test]
+fn a_t_pivot_cell_takes_its_halves_mean_by_area() {
+    let (nc, ny) = (24, 10);
+    let b = orca(nc, ny, true);
+    let s = orca_set(&b, true);
+    let (nr, nx) = (ny - 2, nc + 2);
+    let last = nr - 1;
+    // each cell's value its column; one half missing in a pair
+    let mut field: Vec<f64> = (0..nc * nr).map(|k| (k % nc) as f64).collect();
+    field[last * nc + 5] = -1.0;
+    let back = s.to_file_layout(&field, 1, -1.0).unwrap();
+    let area = |c: usize| {
+        let (p, r, col) = s.locate_cell(last, c).unwrap();
+        p.mesh().cell_area(r, col)
+    };
+    for c in 0..nc {
+        let m = (nc + 2 - c) % nc;
+        let got = back[(last + 1) * nx + c];
+        let want = if m == c {
+            c as f64
+        } else if c == 5 || m == 5 {
+            // only the other half's
+            if c == 5 { m as f64 } else { c as f64 }
+        } else {
+            (area(c) * c as f64 + area(m) * m as f64) / (area(c) + area(m))
+        };
+        assert!((got - want).abs() < 1e-12, "col {c} (mirror {m}): {got} vs {want}");
+        assert_eq!(got.to_bits(), back[(last + 1) * nx + m].to_bits(), "col {c}: both copies");
+    }
+    // the rows below keep their own
+    assert!((0..nc).all(|c| back[nr * nx - nx + c] == field[(nr - 2) * nc + c]));
+}
+
+/// The helpers refuse fields of the wrong size, and only NEMO's halos are
+/// filled.
+#[test]
+fn file_layout_refusals() {
+    let b = orca(24, 10, false);
+    let s = orca_set(&b, false);
+    assert!(s.from_file_layout(&[0.0; 10], 1).unwrap_err().contains("26 x 10"));
+    assert!(s.to_file_layout(&[0.0f32; 10], 1, 0.0).unwrap_err().contains("24 x 8"));
+    let mut wrong = vec![0.0; 10];
+    assert!(s.fill_halo(&mut wrong, 1).is_err());
 }

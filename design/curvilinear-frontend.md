@@ -1074,8 +1074,25 @@ with a pair of `CrsTransform`s a band. It borrows the set.
   The lattice's turns are now found over the whole destination window,
   on a grid of up to 9 by 9 pixel centres, when it is built (they were
   found along its first rows), so every band of rows finds the same.
-- **Not built.** A source buffer is the set's size: the caller drops the
-  file's halo.
+- **The file's layout** (2026-11-18): `MeshSet` keeps the file's size and
+  halo. `from_file_layout` drops the halo from a field on the file's
+  grid. `to_file_layout` puts a field in the set's numbering back,
+  masking the halo with a fill. At a T-point pivot it gives each cell of
+  the last row the area mean of its two halves, found by the fold side
+  they share (the top side of one is the other's, reversed), leaving out
+  a half that is the fill, NaN or a cell left out. NEMO's mirror
+  `(ncol + 2 - c) % ncol` is taken first among the cells that match:
+  ORCA2 has 19 cells by its second pivot collapsed to one point, which
+  all match each other. All 170 pairs kept in ORCA2's last row are
+  merged into both copies. `fill_halo` writes
+  NEMO's halo for `NEMO_F_PIVOT` and `NEMO_T_PIVOT`: columns `nx - 2`
+  and `nx - 1` from 0 and 1; the fold row from column `nx - 1 - i` of
+  the row below (F) or column `nx - i` of the row two below, with the
+  row below mirroring itself (T). Those were checked on both CMIP6 files
+  by cell centres, 362 of 362 and 182 of 182 (`areacello` is masked in
+  the halo). Tests: the ORCA-like grids of `tests/mesh_cf.rs`, both
+  pivots, centres back to 1e-9 with the halo filled; a T pivot's halves'
+  area mean, one half missing; refusals.
 
 ### The exact footprint at the antimeridian
 
