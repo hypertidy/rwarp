@@ -41,9 +41,21 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   edge get bitwise the same points on it, so they tile the grid. With a
   period (`with_period`), edges go the shorter way round. Against ESMF
   (Cartesian, hexagons and triangles over part of a grid) the weights
-  agree to 6e-14 both ways. Edges are planar in the mesh's coordinates;
-  great-circle edges, and grids with world cells on the other side, are
+  agree to 6e-14 both ways. Grids with world cells on the other side are
   not built yet.
+- `PolyMesh::with_great_circles`: edges on great circles, as ICON's and
+  MPAS's are, nodes in longitude and latitude (conservative stage 5b,
+  #39). Each edge is cut at `densify` equal angles, or refined by
+  bigcurve's great-circle model; one across the equator is cut there
+  first, where its curve in longitude and latitude turns and refinement
+  can't see it. A node on a pole joins its edges along their meridians,
+  whatever longitude it is written with. Each face's area converges on its
+  spherical excess, at the tolerance's rate (densify's inverse square),
+  and the faces tile a global grid at every tolerance. Against ESMF's
+  spherical maps (a geodesic mesh and its dual, both ways, with a global
+  5 degree grid) the faces' areas agree to 8e-8; the weights differ by
+  the grid's cells, which rwarp bounds by parallels and ESMF by great
+  circles (`S` to 3.8e-3).
 
 ### Fixed
 

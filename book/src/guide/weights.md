@@ -113,8 +113,10 @@ use rwarp::transform::GenImgProjTransformer;
 use rwarp::weights::{lonlat_measure, GridWindow, WeightOptions};
 
 // faces as UGRID's face_node_connectivity: up to 6 nodes a face, 0-based,
-// padded with -1; edges the shorter way round in longitude
+// padded with -1; straight edges, the shorter way round in longitude
 let mesh = PolyMesh::from_padded(lon, lat, &face_nodes, 6, 0)?.with_period(360.0)?;
+// or, for an ICON or MPAS mesh, great circles between the nodes:
+// let mesh = PolyMesh::from_padded(lon, lat, &face_nodes, 6, 0)?.with_great_circles()?;
 
 // from the mesh's coordinates to the grid's pixels
 let t = GenImgProjTransformer::new("EPSG:4326", grid_gt, "EPSG:4326", WORLD_GT)?
@@ -141,13 +143,22 @@ grid cell, its `frac` sums to 1 over the faces, as in
 - **From the mesh**, `src_col` is the face, `src_cell_area` its area, and
   `apply` takes the faces' values as a buffer `nface` wide and 1 high.
 
-Against ESMF (Cartesian, a mesh of hexagons and triangles over part of a
-grid, `tests/esmf_mesh.rs`) the weights agree to 6e-14 both ways. Edges
-are straight in the mesh's coordinates. Great-circle edges, as ICON's and
-MPAS's are, aren't built yet: a face with straight edges in longitude and
-latitude differs from its great-circle version by its edges' bow, which
-shrinks as the square of the face's size. Neither is a grid with world
-cells (geolocation, a `QuadMesh`) on the other side.
+Edges are straight in the mesh's coordinates, or with
+`with_great_circles()` great circles between nodes in longitude and
+latitude, as ICON's and MPAS's are. Great circles need `densify` above 1
+or a `refine_tolerance` to bend (at densify 1 an edge is its chord in the
+grid's pixels). An edge across the equator is cut there first, and a node
+on a pole joins its edges along their meridians, whatever longitude it is
+written with. Each face's area then converges on its spherical excess and
+the faces tile the grid at every tolerance.
+
+Against ESMF, Cartesian (hexagons and triangles over part of a grid,
+`tests/esmf_mesh.rs`), the weights agree to 6e-14 both ways. On the
+sphere (a geodesic mesh and its dual with a global 5° grid) the faces'
+areas agree to 8e-8, and the weights differ by the grid's cells, which
+rwarp bounds by parallels and ESMF by great circles (`S` to 3.8e-3). A
+grid with world cells (geolocation, a `QuadMesh`) on the other side isn't
+supported yet.
 
 ## Densify
 

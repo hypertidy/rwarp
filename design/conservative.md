@@ -406,12 +406,60 @@ coordinates:
     cells; a mixed mesh of quads, triangles and hexagons tiles the grid,
     and `apply` keeps the integral both ways.
 
-Next, as 5b: great-circle edges for meshes on the sphere (ICON, MPAS),
-with bigcurve's great-circle model, against ESMF's spherical maps (whose
-grid cells are great-circle quadrilaterals too, so a difference is
-recorded, as for the regular cases in 5.2). Later: a grid with world cells
-on the other side (geolocation, a `QuadMesh`, a `MeshSet`), and threads.
-Mesh to mesh stays out of scope.
+**Status (2026-11-18): 5b built**, `PolyMesh::with_great_circles`: edges
+on great circles between nodes in longitude and latitude, as ICON's and
+MPAS's are.
+
+- **Points.** With `densify`, each edge is cut at equal angles (slerp)
+  from its canonical end, so shared edges stay bitwise. A meridian (an
+  arc whose ends share a longitude, or one from a pole) keeps its
+  longitude exactly, with latitude in proportion. Refinement uses
+  bigcurve's `GreatCircle` model (its own `align` and `reframe` by 360).
+- **The equator.** In longitude and latitude a great circle across the
+  equator is an S, its curve turning there, and refinement's test (the
+  moved midpoint against the chord) can't see a turn at a piece's middle:
+  a 20 degree edge crossing at its middle was never refined, its overlaps
+  5e-3 out at a tolerance of 1e-6. densify 2 only moves the blind spot
+  to an edge crossing a quarter of the way. So each edge across the
+  equator is cut there first, at the point of its great circle on it
+  (from the canonical ends, so shared). Each piece then curves one way,
+  and the same edges are within 5.5e-7 of densify 2048. For a grid in
+  another projection the turns are elsewhere, and the blind spot is
+  bigcurve's own (its forced split of arcs over 30 degrees covers long
+  ones).
+- **Poles.** A node on a pole (ICON's icosahedron has one on each) is two
+  points on it, at the longitudes of its neighbours, so in longitude and
+  latitude the face runs along the pole between its two meridians, which
+  is its shape there, whatever longitude the node is written with. A face
+  round a pole (MPAS's pentagons) goes once round and is closed along it
+  by the grid, as before.
+- **Measured** (`tests/poly_mesh_sphere.rs`, meshes made in the test: an
+  icosahedron with nodes on the poles cut into 320 triangles, and its
+  dual of 162 hexagons and pentagons, two round the poles):
+  - Triangles from the equator to a pole, bounded by two meridians and
+    the equator, are lon/lat boxes: every overlap is a whole cell, at any
+    densify, refined or not, wherever the pole's node is written.
+  - Onto a global 2 degree grid, refined, each geodesic face is within
+    6.0 to 7.6 tolerances of its spherical excess from 1e-1 to 1e-5
+    pixels, the points growing as the tolerance to the power -0.488; at
+    densify 8, 32 and 128 the error falls as densify to the power -2.00.
+    The dual's faces, the pole pentagons included, converge alike (6 to
+    12 tolerances). The faces tile the grid at every tolerance (every
+    cell's `frac` sums to 1 to 2e-14), and their areas sum to 4 pi to
+    1e-14 even when each is a tolerance out, since neighbours share
+    their edges' errors.
+  - The same faces with each great circle cut into 2048 chords by hand,
+    as a planar mesh, agree to 1.5e-7.
+  - ESMF, spherical (`tests/esmf_mesh.rs`, both meshes both ways with a
+    global 5 degree grid): the faces' areas agree to 8e-8 at a tolerance
+    of 1e-7 pixels (5e-9 at 1e-8: both are the spherical excess), and
+    `frac_b` to 1e-13. The weights differ by the grid's cells, which
+    rwarp bounds by parallels and ESMF by great circles, 1.3e-3 apart in
+    area at 5 degrees: `S` to 6.9e-4 onto the mesh and 3.8e-3 from it,
+    recorded as ceilings.
+
+Later: a grid with world cells on the other side (geolocation, a
+`QuadMesh`, a `MeshSet`), and threads. Mesh to mesh stays out of scope.
 
 ## 8. Stage 6: second order
 

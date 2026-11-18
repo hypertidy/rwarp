@@ -55,6 +55,18 @@ edge is straight on both sides, so rwarp must match it to rounding:
 - mesh_hex_to.cart.txt: mesh to grid (the mesh's elements the source).
 - mesh_hex_onto.cart.txt: grid to mesh.
 
+Two more mesh pairs are on the sphere (spherical, ESMF's great-circle
+edges), against a global 5 degree grid: a geodesic mesh, an icosahedron
+with nodes on the poles and each face cut into 16 triangles (ICON's kind,
+mesh_ico.mesh.txt), and its dual, hexagons and twelve pentagons, two
+round the poles (MPAS's kind, mesh_dual.mesh.txt). Nodes are longitude
+and latitude. rwarp's grid cells are bounded by parallels and ESMF's by
+great circles, so the test records the difference; the faces are the
+same on both sides:
+
+- mesh_ico_to.sph.txt, mesh_ico_onto.sph.txt, mesh_dual_to.sph.txt,
+  mesh_dual_onto.sph.txt.
+
 ESMF splits a polygon into triangles and gives one weight per triangle,
 so a mesh map's weights are summed per (row, col) before they are
 written.
@@ -461,9 +473,9 @@ def hex_mesh():
     return xs, ys, faces
 
 
-def write_mesh(path, xs, ys, faces):
+def write_mesh(path, xs, ys, faces, note="hexagons, every third split into six triangles; nodes in the grid's plane"):
     with open(path, "w") as f:
-        f.write("# mesh hexagons, every third split into six triangles; nodes in the grid's plane\n")
+        f.write(f"# mesh {note}\n")
         f.write(f"{len(xs)} {len(faces)}\n")
         for x, y in zip(xs, ys):
             f.write(f"{x:.17g} {y:.17g}\n")
@@ -472,12 +484,15 @@ def write_mesh(path, xs, ys, faces):
     print(f"{os.path.basename(path)}: {len(xs)} nodes, {len(faces)} faces")
 
 
-def esmf_mesh(xs, ys, faces):
-    m = esmpy.Mesh(parametric_dim=2, spatial_dim=2, coord_sys=esmpy.CoordSys.CART)
+def esmf_mesh(xs, ys, faces, coord_sys=esmpy.CoordSys.CART):
+    m = esmpy.Mesh(parametric_dim=2, spatial_dim=2, coord_sys=coord_sys)
     n = len(xs)
     m.add_nodes(n, np.arange(1, n + 1), np.column_stack([xs, ys]).ravel(), np.zeros(n, dtype=int))
     # element coordinates aren't used by conserve, but ESMF looks for them
-    centroids = [(sum(xs[v] for v in f) / len(f), sum(ys[v] for v in f) / len(f)) for f in faces]
+    if coord_sys == esmpy.CoordSys.CART:
+        centroids = [(sum(xs[v] for v in f) / len(f), sum(ys[v] for v in f) / len(f)) for f in faces]
+    else:
+        centroids = [lonlat(normal(vsum([vec(xs[v], ys[v]) for v in f]))) for f in faces]
     m.add_elements(len(faces), np.arange(1, len(faces) + 1), np.array([len(f) for f in faces]),
                    np.array([v for f in faces for v in f]), element_coords=np.array(centroids).ravel())
     return m
@@ -490,6 +505,121 @@ def summed(result):
     total = np.zeros(len(keys))
     np.add.at(total, inv.ravel(), s)
     return frac_b, area_b, keys[:, 0], keys[:, 1], total
+
+
+# ---- meshes on the sphere -----------------------------------------------------
+
+def vec(lon, lat):
+    lam, phi = math.radians(lon), math.radians(lat)
+    return (math.cos(phi) * math.cos(lam), math.cos(phi) * math.sin(lam), math.sin(phi))
+
+
+def vsum(vs):
+    return tuple(sum(v[k] for v in vs) for k in range(3))
+
+
+def normal(v):
+    n = math.sqrt(sum(c * c for c in v))
+    return tuple(c / n for c in v)
+
+
+def lonlat(v):
+    h = math.hypot(v[0], v[1])
+    if h < 1e-15:
+        return 0.0, math.copysign(90.0, v[2])
+    return math.degrees(math.atan2(v[1], v[0])), math.degrees(math.atan2(v[2], h))
+
+
+def anticlockwise(vs, face):
+    """The face turned anticlockwise seen from outside, if it isn't."""
+    a, b, c = (vs[k] for k in face[:3])
+    u = tuple(b[k] - a[k] for k in range(3))
+    w = tuple(c[k] - a[k] for k in range(3))
+    n = (u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0])
+    return list(face) if sum(a[k] * n[k] for k in range(3)) > 0 else list(reversed(face))
+
+
+def icosahedron(n):
+    """An icosahedron with nodes on both poles, each face cut into n * n
+    triangles through points on the sphere. Returns unit vectors and faces."""
+    lat = math.degrees(math.atan(0.5))
+    corners = [vec(0, 90), vec(0, -90)] + [vec(72 * k, lat) for k in range(5)] \
+        + [vec(36 + 72 * k, -lat) for k in range(5)]
+    u, l = (lambda k: 2 + k % 5), (lambda k: 7 + k % 5)
+    big = []
+    for k in range(5):
+        big += [(0, u(k), u(k + 1)), (u(k), l(k), u(k + 1)), (u(k + 1), l(k), l(k + 1)), (1, l(k + 1), l(k))]
+    index, vs, faces = {}, [], []
+
+    def node(p):
+        key = tuple(round(c * 1e9) for c in p)
+        if key not in index:
+            index[key] = len(vs)
+            vs.append(p)
+        return index[key]
+
+    for a, b, c in big:
+        a, b, c = corners[a], corners[b], corners[c]
+
+        def at(i, j):
+            s, t = i / n, j / n
+            return normal(tuple(a[k] + (b[k] - a[k]) * s + (c[k] - a[k]) * t for k in range(3)))
+
+        for i in range(n):
+            for j in range(n - i):
+                faces.append([node(at(i, j)), node(at(i + 1, j)), node(at(i, j + 1))])
+                if i + j + 1 < n:
+                    faces.append([node(at(i + 1, j)), node(at(i + 1, j + 1)), node(at(i, j + 1))])
+    return vs, [anticlockwise(vs, f) for f in faces]
+
+
+def dual(vs, faces):
+    """A node at each face's centre, and a face round each node through
+    the centres of the faces about it."""
+    centres = [normal(vsum([vs[k] for k in f])) for f in faces]
+    about = [[] for _ in vs]
+    for t, f in enumerate(faces):
+        for k in f:
+            about[k].append(t)
+    out = []
+    for k, ts in enumerate(about):
+        p = vs[k]
+        axis = (0.0, 0.0, 1.0) if abs(p[2]) < 0.9 else (1.0, 0.0, 0.0)
+        e1 = normal((axis[1] * p[2] - axis[2] * p[1], axis[2] * p[0] - axis[0] * p[2], axis[0] * p[1] - axis[1] * p[0]))
+        e2 = (p[1] * e1[2] - p[2] * e1[1], p[2] * e1[0] - p[0] * e1[2], p[0] * e1[1] - p[1] * e1[0])
+        ang = lambda t: math.atan2(sum(centres[t][i] * e2[i] for i in range(3)), sum(centres[t][i] * e1[i] for i in range(3)))
+        out.append(anticlockwise(centres, sorted(ts, key=ang)))
+    return centres, out
+
+
+SPHERE_GRID_GT = [-180.0, 5.0, 0.0, 90.0, 0.0, -5.0]
+SPHERE_GRID_SIZE = (72, 36)
+
+
+def sphere_mesh_cases():
+    vs, faces = icosahedron(4)
+    meshes = [("mesh_ico", "the geodesic mesh (320 triangles, nodes on the poles)", vs, faces),
+              ("mesh_dual", "its dual (162 hexagons and pentagons, two round the poles)", *dual(vs, faces))]
+    size, gt = SPHERE_GRID_SIZE, SPHERE_GRID_GT
+    corner, centre = (pixel_to_geo(gt, *lattice(*size, off)) for off in (False, True))
+    g = grid(corner, centre, esmpy.CoordSys.SPH_DEG)
+    oracle = f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, spherical, great-circle edges (area_b in steradians)"
+    for name, note, vs, faces in meshes:
+        xs, ys = zip(*(lonlat(v) for v in vs))
+        write_mesh(os.path.join(HERE, f"{name}.mesh.txt"), list(xs), list(ys), faces,
+                   "mesh on the sphere; nodes in longitude and latitude, edges great circles")
+        mesh = esmf_mesh(list(xs), list(ys), faces, esmpy.CoordSys.SPH_DEG)
+        common = [
+            f"mesh {name}.mesh.txt",
+            f"grid_gt {' '.join(repr(float(v)) for v in gt)}",
+            f"grid_size {size[0]} {size[1]}",
+        ]
+        for kind, what, res in [
+            ("to", f"{note} to a global 5 degree grid", conserve(mesh, g)),
+            ("onto", f"a global 5 degree grid onto {note}", conserve(g, mesh)),
+        ]:
+            write_map(os.path.join(HERE, f"{name}_{kind}.sph.txt"), [f"case {name}_{kind}: {what}", oracle] + common,
+                      "sph", summed(res))
 
 
 def mesh_cases():
@@ -545,6 +675,7 @@ def main():
         tripolar(names)
     if not names or any("mesh" in n for n in names):
         mesh_cases()
+        sphere_mesh_cases()
 
 
 if __name__ == "__main__":
