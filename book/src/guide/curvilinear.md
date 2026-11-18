@@ -444,14 +444,31 @@ every row but the first, which holds no cells.
 
 Components of a vector in the grid's own directions (along its rows and
 columns, as NEMO's velocities are) on the set's cells, T points, take
-`to_file_layout_vector` and `fill_halo_vector`. The grid turns half round across the fold, so the
-fold's copies change sign (NEMO's `psgn = -1`), and at a T pivot each
-half's value is turned round before the two are averaged. Components
-east and north are scalars here. On both files, components of a smooth
-field along each cell's own directions, worked out from its bounds,
-come back to 1e-16, halo and all; as scalars, the fold row comes back
-with its sign changed. NEMO turns round the T pivot's cells too, which
-are their own mirrors and have no directions.
+`to_file_layout_vector` and `fill_halo_vector`. The grid turns half
+round across the fold, so the fold's copies change sign (NEMO's `psgn =
+-1`), and at a T pivot each half's value is turned round before the two
+are averaged. Components east and north are scalars here. On both
+files, components of a smooth field along each cell's own directions,
+worked out from its bounds, come back to 1e-16, halo and all; as
+scalars, the fold row comes back with its sign changed. NEMO turns
+round the T pivot's cells too, which are their own mirrors and have no
+directions.
+
+Both fills take the point the field is at: `Stagger::T`, or a field of
+the same grid's U, V or F points (the middles of the T cells' east and
+north sides, and their north-east corners), whose folds land on other
+columns and rows. They follow NEMO 4.0's fold (3.6's takes the last
+column of U and F points at an F pivot from the wrong column). On both
+files, the positions of all four points and the components along the
+cells' sides at U and V points, worked out from the T cells' bounds,
+come back exactly with the halo masked and filled.
+
+```rust,ignore
+use rwarp::mesh::Stagger;
+
+// uo_file: a U-point field on the file's grid, its halo masked
+set.fill_halo_vector(&mut uo_file, 1, Stagger::U)?;
+```
 
 `warp_to_par` gives the same values on several threads, each with a
 `SetTransformer` of its own: `|| SetTransformer::new(&set, &crs, gt,

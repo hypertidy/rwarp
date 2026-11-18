@@ -71,6 +71,25 @@ impl Halo {
     };
 }
 
+/// Where a field's values sit on NEMO's grid (an Arakawa C grid), for
+/// [`MeshSet::fill_halo`](crate::mesh::MeshSet::fill_halo): at the T
+/// cells' centres, the middles of their east sides (U), the middles of
+/// their north sides (V), or their north-east corners (F). Each is an
+/// array of the file's size, `(row, col)` the point of T cell `(row,
+/// col)`; NEMO's W points are T points here. The north fold maps each
+/// onto other columns and rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stagger {
+    /// The cell's centre, where a MeshSet's cells are.
+    T,
+    /// The middle of the cell's east side.
+    U,
+    /// The middle of the cell's north side.
+    V,
+    /// The cell's north-east corner.
+    F,
+}
+
 /// The eight orders four vertices can be stored in: `ORDERS[o][s]` is the
 /// stored vertex at CF slot `s` (0 at row `j`, column `i`; 1 at `j`,
 /// `i + 1`; 2 at `j + 1`, `i + 1`; 3 at `j + 1`, `i`). CF's own order

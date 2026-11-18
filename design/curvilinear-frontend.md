@@ -1115,8 +1115,32 @@ with a pair of `CrsTransform`s a band. It borrows the set.
   helpers: 1.9 and 1.8). Tests: NEMO's `lbc_lnk` transcribed from the
   Fortran, both pivots, both signs, cell for cell; the same geometric
   check on the ORCA-like grids; the halves' mean turned round, one half
-  missing. Not built: U, V and F points, whose folds differ (the set's
-  cells are T cells).
+  missing.
+- **U, V and F points** (2026-11-18): `fill_halo` and
+  `fill_halo_vector` take a `Stagger` (T, U, V, F: an Arakawa C grid's
+  points, each an array of the file's size), the set giving the pivot.
+  The fold is NEMO 4.0's `lbc_nfd_generic.h90` on one process,
+  transcribed loop for loop, 0-based and in its order (a row copied
+  onto itself is copied in place). 3.6's `lbcnfd.F90` differs only in
+  the last column of U and F points at an F pivot, which it takes from
+  column 0; its mirror is column `nx - 3`, as 4.0 has it and as the
+  grid's geometry says. Two differences from NEMO: at a T pivot, NEMO's
+  V and F points leave one cell of row `ny - 2` (column 0 at V, `nx - 1`
+  at F) as the cyclic columns had it before the fold, so in a field
+  with its halo masked it stays masked; here it is the cyclic copy of
+  the fold's, the same for a field that agrees with its own halo. And the cyclic
+  columns go from 0 and 1 to `nx - 2` and `nx - 1`, as before (NEMO
+  copies column `nx - 2` to 0). NEMO's in-place order shows at U points
+  at a T pivot: column `nx / 2` of row `ny - 2` is kept and column
+  `nx / 2 - 1` copied from it. Checked on both CMIP6 files: U, V and F
+  positions from the T cells' bounds (east and north side midpoints,
+  north-east corners), and components along the sides at U and V
+  points, come back exactly with the halo masked and filled. Tests:
+  NEMO's `lbc_lnk` transcribed from the Fortran at every point, both
+  pivots, both signs, cell for cell; the same geometric check on the
+  ORCA-like grids. Each of nine rules broken in turn fails both. Not
+  built: sets of U, V or F cells, whose halos differ from the T cells'
+  (`Halo` names the T cells').
 
 ### The exact footprint at the antimeridian
 
