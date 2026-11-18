@@ -1,6 +1,6 @@
-# State and what's next (2026-11-12)
+# State and what's next (2026-11-18)
 
-Where rwarp stands at the end of the 2026-11-05 to 2026-11-12 session,
+Where rwarp stands at the end of the 2026-11-16 to 2026-11-18 session,
 and what to pick up. The long-term framing is in #52 and on the roadmap
 board (<https://github.com/orgs/hypertidy/projects/1>). The open
 decisions, with options and figures, are in [decisions.md](decisions.md).
@@ -10,79 +10,70 @@ This file is a snapshot, so replace it rather than append to it.
 
 | crate | version | date | what |
 |---|---|---|---|
-| rwarp | 0.3.3 | 2026-11-12 | antimeridian split reads two edge windows, not the whole width; `merge_tile` |
-| rwarp | 0.4.0 | 2026-11-12 | controlledburn 0.3.1 (breaking for rwarp: its types are in rwarp's API); N6 recorded |
+| rwarp | 0.5.0 | prepared 2026-11-18, not yet published | `MeshSet` and NEMO's halos, world-coordinate measure for curvilinear sources, threads (see the changelog) |
 | rwarp | 0.4.1 | 2026-11-16 | `QuadMesh::burn_par`, `Rectilinear::burn_par` (#59, #63) |
+| rwarp | 0.4.0 | 2026-11-12 | controlledburn 0.3.1 (breaking for rwarp: its types are in rwarp's API); N6 recorded |
+| rwarp | 0.3.3 | 2026-11-12 | antimeridian split reads two edge windows, not the whole width; `merge_tile` |
 | controlledburn | 0.3.2 | 2026-11-12 | `burn_wkb_par`; burns the same as 0.3.1 |
 | controlledburn | 0.3.1 | 2026-11-12 | `relate_cells` (0.3.0: `burn_par`, `burn_window`, `merge_parts`, `f32` edges kept) |
 | bigcurve (crate) | 0.3.0 | 2026-11-04 | |
 
 `v0.4.0` (on `6a4c337`) and `v0.4.1` (on `e4c3e49`) were tagged on
-2026-11-16, each on the commit its crate was published from.
+2026-11-16, each on the commit its crate was published from; `v0.5.0`
+goes on the commit 0.5.0 is published from.
+
+## Since 0.4.1
+
+Everything from #64 to #98, by the changelog's 0.5.0 section:
+
+- **Curvilinear stage 3 (#36)**: the exact footprint over geolocation
+  sources measures in their world coordinates, across the antimeridian
+  and round the poles (#70, #71, #72).
+- **Stage 4 (#37)**, all of 4a to 4i in `curvilinear-frontend.md`: the
+  walk across seams and folds, CF bounds and halos (N3), ESMF on a
+  tripolar grid, a mesh as a warp source and target, a declared period,
+  `MeshSet` for a whole ocean grid in pieces with weights, burning
+  (serial and threaded, projection on the threads) and `warp()` from it
+  (`SetTransformer`). Then the file's layout and NEMO's halo exchange:
+  `from_file_layout`, `to_file_layout`, `fill_halo` (#95), vector
+  components across the fold (#96), U, V and F points (#97), and sets of
+  U, V and F cells, `Halo::nemo` (#98).
+- **Threads**, bit for bit with one thread: `warp_par` and `warp_to_par`
+  (#91), `warp_chunks_par` (#92), `exact_weights_par` (#93),
+  `MeshSet::weights_to_par` and `weights_onto_par` (#94).
+- **Decisions** N1 (#43), N3 and N4 (#77) decided and built.
+- **rwarp-r**: `warp_buffer()` (#54, #65), the Sentinel-2 vignette
+  (#55), `warp_plan()` with gdalwarp's working-memory rules (#67), and
+  the Get started vignette (#74). It is still on rwarp 0.4.1.
 
 ## Open
 
-- **#59, `burn_par` for `QuadMesh` and `Rectilinear`**, merged
-  2026-11-13 and not yet released; it goes in 0.4.1. Both stages run in
-  parallel: the ring walk into index space, on chunks that threads take
-  in turn, and controlledburn's `burn_par`. Results are record for
-  record the same as `burn`. On Natural Earth 10m land onto a 1440 x 720
-  mesh: 1.16 s serial, 0.31 s on 4 threads, 0.24 s on 8. It goes no
-  faster after that, because the largest polygon takes 0.33 s alone and
-  one geometry is never split. With one thread it stays on the calling
-  thread, so it works on wasm.
-- **#60**, merged 2026-11-16, moved rwarp-r's `Cargo.lock` to rwarp
-  0.3.3. Main's R-CMD-check had failed since 2026-11-08 because the lock
-  pinned 0.3.2 while `Cargo.toml` asked for 0.3.3, and
-  `cargo vendor --locked` refuses that. `tools/vendor.sh` used to discard
-  cargo's error output, so the log showed only exit code 101. Now it
-  keeps the errors. Main's R-CMD-check passes again.
-- **#61**, merged 2026-11-16, and its follow-up: softer landing pages for
-  the book and the R README (the usual tools first, then rwarp's
-  equivalents, then when you might reach for rwarp), and stale pages
-  fixed.
+- **#76**: with `split_antimeridian = TRUE`, the planner skips the
+  fill-ratio split for a full-width window with no jump. The R
+  defaults aren't affected (`min_fill_ratio = 0`).
 
 ## Next, in order
 
-1. **rwarp-r is on rwarp 0.4.1** (with controlledburn 0.3.2, #64). For
-   later bumps: change `rwarp-r/src/rust/Cargo.toml`, run
-   `cargo update -p rwarp`, and commit the lock with it. The lock and the
-   manifest must move together, or `vendor.sh` fails as above.
-2. **The rest of controlledburn 0.3:**
-   - `burn_window` could replace rwarp's own windowed burn in
-     `src/cutline.rs` (`Cutline::burn_window`, which builds a grid for
-     the window). Check that the records are identical first.
-   - `burn_window` could also split one large geometry into tiles, which
-     is the remaining limit on `burn_par`.
-   - `relate_cells` finds cells a polygon only touches along a wall or
-     at a corner, which `burn` gives no record for. GDAL parity doesn't
-     need it; it would help explain cutline edge differences, if any
-     turn up.
-3. **The stages on the board**: curvilinear stage 3 (#36: exact
-   footprint for geolocation sources, antimeridian), then stage 4 (#37:
-   periodic and tripolar grids and CF bounds, which takes the ESMF
-   comparison onto ocean grids). N1 (#43) is decided (coverage uses
-   `EqualArea` on every mesh). #36 is built in two PRs: the antimeridian
-   and pole handling of the exact footprint (#70), then the equal-area
-   footprint for geolocation sources (#71: on by default, falling back
-   where the arrays' cells are not whole). Geolocation sources across the
-   antimeridian (stage 3b, #72) are built too; swaths over a pole stay on
-   the fallback. #37 also waits on N3 and N4.
-4. **Decisions waiting on the maintainer**: N2 to N5 (#44 to #47) and C1
-   to C4 (#48 to #51). N1 (2026-11-16) and N6 (`f32` edges,
-   controlledburn 0.3.0) are decided.
-5. **rwarp-r**: `warp_buffer()` binds `warp()` for one pre-fetched
-   window (#54, #65), and `warp_resample()`, which still calls the
-   deprecated `warp::warp_resample` shim, is deprecated. The Sentinel-2
-   showcase (#55) is the `sentinel2-warp` vignette: two UTM zones, three
-   float bands, onto EPSG:3577, equal to gdalwarp's mosaic to 1e-11.
-   It found that R's `warp_plan()` couldn't describe gdalwarp's working
-   memory, so for several Float64 bands with nodata its chunks, and so
-   its kernel scales, differed from gdalwarp's (93 DN at 50 m). #67 adds
-   `nbands`, `working_type`, `src_nodata`, `dst_nodata`, `memory_limit`
-   and `scale_origin`: with gdalwarp's rules the chunks are gdalwarp's
-   (2 and 2 at 100 m, 15 and 19 at 50 m) and the vignette matches without
-   `-wm`.
+1. **Publish 0.5.0** (the maintainer), and tag `v0.5.0` on that commit.
+2. **rwarp-r onto rwarp 0.5.0**: change `rwarp-r/src/rust/Cargo.toml`,
+   run `cargo update -p rwarp`, and commit the lock with it (the lock
+   and the manifest must move together, or `vendor.sh` fails). A crate
+   release doesn't trigger R-CMD-check, so rerun it by hand.
+3. **Bump main to the next version** with the next PR, with its
+   changelog section (main's version leads the release).
+4. **#76**, the planner's fill-ratio split.
+5. **Stage 4 (#37)** is built; it can close. The one item left out is
+   cheaper libproj copies for the threads (`proj_clone`, which the
+   `proj` crate doesn't expose).
+6. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
+   for reprojected polygons and footprint edges), conservative stage 5
+   (#39, meshes) and 6 (#40, second order).
+7. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
+   C4 (#48 to #51).
+8. **The rest of controlledburn 0.3**: `burn_window` could replace
+   `Cutline::burn_window` (check the records are identical first) and
+   split one large geometry into tiles for `burn_par`; `relate_cells`
+   finds cells a polygon only touches.
 
 ## Parked
 
