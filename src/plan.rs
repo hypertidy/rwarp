@@ -215,7 +215,11 @@ pub struct ChunkOptions {
     /// source edges: they become two chunks on the same target window, one
     /// window at each edge, so nothing reads the whole width. GDAL does not
     /// split (its fill ratio stays high); off by default. Independent of
-    /// the fill ratio split, apart from its minimum chunk size.
+    /// the fill ratio split, apart from its minimum chunk size. Where
+    /// there is no jump (a window that spans the width because the target
+    /// covers it), or splitting at it reads no less (round a pole), the
+    /// chunk is planned by GDAL's rule, memory and fill ratio both, so the
+    /// plan is gdalwarp's plus the splits at jumps.
     pub split_antimeridian: bool,
     /// A round-trip check on the forward probe; `None` (GDAL) checks
     /// nothing.
@@ -556,49 +560,40 @@ impl<'a, T: Transformer> ChunkPlanner<'a, T> {
     /// GDAL's `CollectChunkListInternal`.
     fn collect(&self, off: [i32; 2], size: [i32; 2], out: &mut Vec<Chunk>) {
         let w = self.window(off, size);
-        let (src_size, mut fill, full_width) = match &w {
+        let (src_size, fill, full_width) = match &w {
             Some(w) => (w.size, w.fill, w.full_width),
             None => ([0, 0], 0.0, false),
         };
         let o = &self.opts;
         let [dw, dh] = size;
-        let mut antimeridian = false;
-        if o.split_antimeridian && full_width && src_size[0] > 0 && src_size[1] > 0 {
-            // GDAL's fill ratio stays high when the 90% rule takes the
-            // whole width; mark the window as wasteful instead.
-            fill = 0.01;
-            antimeridian = true;
-        }
         let memory = (o.src_pixel_bits * src_size[0] as f64 * src_size[1] as f64
             + o.dst_pixel_bits * dw as f64 * dh as f64)
             / 8.0;
         let big = o.min_split_size as i32;
-        // The antimeridian split doesn't depend on the fill ratio split:
-        // it is wanted even when that is off (min_fill_ratio 0).
-        let split = (memory > o.memory_limit && (dw > 2 || dh > 2))
-            || (fill > 0.0 && fill < o.min_fill_ratio && (dw > big || dh > big))
-            || (antimeridian && (dw > big || dh > big));
-        if split {
-            if antimeridian {
-                if let Some((c0, c1)) = find_discontinuity_range(self.t, off, size, self.src) {
-                    // Keep the split only if it reads under half of the
-                    // full-width window. Around a pole every longitude is
-                    // needed and splitting at the meridian saves nothing,
-                    // so the chunk stays as GDAL plans it.
-                    let mut parts = Vec::new();
-                    self.split_at_jump(off, size, c0, c1, &mut parts);
-                    let read: usize = parts.iter().map(|c: &Chunk| c.src_size[0] * c.src_size[1]).sum();
-                    if (read as f64) < 0.5 * src_size[0] as f64 * src_size[1] as f64 {
-                        out.extend(parts);
-                        return;
-                    }
-                }
-                // Not worth it: GDAL's plan, which splits only for memory.
-                if !(memory > o.memory_limit && (dw > 2 || dh > 2)) {
-                    self.push(out, off, size, w);
+        let over_memory = memory > o.memory_limit && (dw > 2 || dh > 2);
+        let large = dw > big || dh > big;
+        // rwarp's split at a jump in source x (the antimeridian), where the
+        // 90% rule takes the whole width. It doesn't depend on the fill
+        // ratio split (GDAL's fill ratio stays high at a jump), so it is
+        // wanted even when that is off (min_fill_ratio 0). Kept only if it
+        // reads under half of the full-width window: around a pole every
+        // longitude is needed and splitting at the meridian saves nothing.
+        if o.split_antimeridian && full_width && src_size[0] > 0 && src_size[1] > 0 && (over_memory || large) {
+            if let Some((c0, c1)) = find_discontinuity_range(self.t, off, size, self.src) {
+                let mut parts = Vec::new();
+                self.split_at_jump(off, size, c0, c1, &mut parts);
+                let read: usize = parts.iter().map(|c: &Chunk| c.src_size[0] * c.src_size[1]).sum();
+                if (read as f64) < 0.5 * src_size[0] as f64 * src_size[1] as f64 {
+                    out.extend(parts);
                     return;
                 }
             }
+        }
+        // Otherwise GDAL's rule, with the window's own fill ratio: where
+        // there is no jump (the window takes the whole width because the
+        // target covers it), or splitting at one saves nothing.
+        let split = over_memory || (fill > 0.0 && fill < o.min_fill_ratio && large);
+        if split {
             let [bx, by] = o.dst_block_size.map_or([1, 1], |b| b.map(|v| v as i32));
             let optimize = o.dst_block_size.is_some()
                 && src_size[0] > 0

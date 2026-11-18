@@ -51,22 +51,23 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 
 ## Open
 
-- **#76**: with `split_antimeridian = TRUE`, the planner skips the
-  fill-ratio split for a full-width window with no jump. The R
-  defaults aren't affected (`min_fill_ratio = 0`).
+- **#76** is fixed in the crate (0.5.1, unreleased): with
+  `split_antimeridian`, a full-width window with no jump takes GDAL's
+  fill ratio split again. rwarp-r gets it with its next crate update;
+  its docs already say `split_antimeridian = FALSE` is gdalwarp's plan,
+  which stays true.
 
 ## Next, in order
 
-1. **#76**, the planner's fill-ratio split.
-2. **Stage 4 (#37)** is built; it can close. The one item left out is
+1. **Stage 4 (#37)** is built; it can close. The one item left out is
    cheaper libproj copies for the threads (`proj_clone`, which the
    `proj` crate doesn't expose).
-3. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
+2. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
    for reprojected polygons and footprint edges), conservative stage 5
    (#39, meshes) and 6 (#40, second order).
-4. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
+3. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
    C4 (#48 to #51).
-5. **The rest of controlledburn 0.3**: `burn_window` could replace
+4. **The rest of controlledburn 0.3**: `burn_window` could replace
    `Cutline::burn_window` (check the records are identical first) and
    split one large geometry into tiles for `burn_par`; `relate_cells`
    finds cells a polygon only touches.

@@ -1,6 +1,7 @@
 """Regenerate the gdalwarp oracle fixtures for tests/chunks.rs.
 
-    python3 tests/fixtures/chunks/gen.py
+    python3 tests/fixtures/chunks/gen.py            # every case
+    python3 tests/fixtures/chunks/gen.py NAME ...   # those cases only
 
 Needs the GDAL Python bindings (the fixtures were made with the GDAL named
 in each file's header). Each case warps a whole lon/lat source to a
@@ -68,6 +69,9 @@ GLOBAL360 = ([0, 1, 0, 90, 0, -1], 360, 180)
 GLOBAL361 = ([-180.5, 1, 0, 90, 0, -1], 361, 180)
 LAEA180 = "+proj=laea +lat_0=-20 +lon_0=180 +datum=WGS84 +units=m +no_defs"
 LAEA180_TE = (-1400000, -2000000, 1400000, 2000000)
+# vapour's sst.tif (140..150 E, 40..60 S): a narrow source the target
+# covers whole, so its window spans the source width with no jump
+NARROW = ([140.0, 0.06999999999999994, 0.0, -39.997222067892665, 0.0, -0.0700038891049503], 143, 286)
 
 # name, alg, source, dst crs, dst extent (xmin, ymin, xmax, ymax), dst size,
 # -wm bytes (None: GDAL's default, one chunk), source nodata, target block
@@ -103,6 +107,10 @@ CASES = [
      (-180, -90, 180, 90), (180, 90), None, False, None),
     ("am_g361_geog_te_near", "near", GLOBAL361, "EPSG:4326",
      (90, -90, 270, 90), (180, 90), 100000, False, None),
+    # the fill ratio split of a full-width window (#76): GDAL's default
+    # memory limit, so only the fill ratio splits it
+    ("narrow_stere_bilinear", "bilinear", NARROW, "EPSG:3031",
+     (1660000, -5020000, 3730000, -2550000), (207, 247), None, True, None),
 ]
 
 
@@ -206,5 +214,13 @@ def run(case):
     print(name, len(chunks), "chunks warped, center_long", centre)
 
 
-for case in CASES:
-    run(case)
+if __name__ == "__main__":
+    import sys
+
+    names = set(sys.argv[1:])
+    unknown = names - {c[0] for c in CASES}
+    if unknown:
+        sys.exit("unknown cases: %s" % ", ".join(sorted(unknown)))
+    for case in CASES:
+        if not names or case[0] in names:
+            run(case)

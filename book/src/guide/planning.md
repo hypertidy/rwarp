@@ -101,7 +101,10 @@ width (as at 180 degrees) is split where source x jumps, so a tile
 straddling 180 degrees becomes tiles each side with compact source
 windows rather than one spanning the globe (a 70 times reduction in
 pixels read for a GEBCO tile over Fiji). GDAL reaches a similar result
-only through its memory limit.
+only through its memory limit. A window that spans the width with no
+jump (a narrow source the target covers whole), or one round a pole,
+where splitting at the jump reads no less, is planned by GDAL's rule, so
+the plan is gdalwarp's plus the splits at jumps.
 
 ## Why planning is separate
 

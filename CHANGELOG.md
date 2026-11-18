@@ -4,6 +4,22 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ## 0.5.1 (unreleased)
 
+### Fixed
+
+- `ChunkOptions::split_antimeridian` with the fill ratio split
+  (`with_fill_ratio_split`) no longer loses that split on a window that
+  spans the source width with no jump in source x (#76), such as a
+  narrow source the target covers whole. Such a window was marked for a
+  split at the jump, its fill ratio replaced, and with no jump found it
+  was split for memory only. Now the jump is looked for first, and a
+  window not split at one, for want of a jump or because splitting saves
+  nothing (round a pole), takes GDAL's rule with its own fill ratio. So
+  vapour's `sst.tif` (143 x 286, 140 to 150 E) to EPSG:3031 at 10 km is
+  gdalwarp's 9 chunks, not 1 (a new gdalwarp fixture,
+  `narrow_stere_bilinear`), and every gdalwarp fixture's plan is
+  gdalwarp's with the option on. Plans that split at a jump are
+  unchanged. rwarp-r gets this with its next crate update.
+
 ## 0.5.0 (2026-11-18)
 
 Whole ocean-model grids as `mesh::MeshSet` (regridding to and from them,

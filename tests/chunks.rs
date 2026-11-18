@@ -123,7 +123,7 @@ mod gdal {
     use rwarp::transform::GenImgProjTransformer;
 
     const NODATA: f64 = -9999.0;
-    const CASES: [&str; 16] = [
+    const CASES: [&str; 17] = [
         "merc_lanczos",
         "merc_bilinear",
         "merc_bilinear_tiled",
@@ -141,6 +141,8 @@ mod gdal {
         "am_g360_stere_near",
         "am_g360_geog_near_whole",
         "am_g361_geog_te_near",
+        // a narrow source the target covers whole: full width, no jump
+        "narrow_stere_bilinear",
     ];
 
     /// The exact transformer as gdalwarp builds it: the source size (and
@@ -225,6 +227,23 @@ mod gdal {
             // the chunks tile the target
             let area: usize = plan.chunks.iter().map(|k| k.dst_size[0] * k.dst_size[1]).sum();
             assert_eq!(area, c.dst_size[0] * c.dst_size[1], "{name}: coverage");
+        }
+    }
+
+    /// `split_antimeridian` adds a split where source x jumps, and nothing
+    /// else. No window of these cases is split at a jump, so with it on
+    /// every plan is still gdalwarp's, fill ratio split and all: the
+    /// narrow source's too, whose window spans the source width with no
+    /// jump (#76; the split at a jump is `split_antimeridian_reads_compact_windows`).
+    #[test]
+    fn split_antimeridian_without_a_jump_is_gdalwarps_plan() {
+        for name in CASES {
+            let c = read_case(name);
+            let opts = options(&c).with_split_antimeridian(true);
+            let plan = plan_chunks(&transformer(&c), c.src_size, c.dst_size, &opts);
+            let got: Vec<_> = plan.live().map(|k| (k.src_off, k.src_size, k.dst_off, k.dst_size)).collect();
+            let want: Vec<_> = c.chunks.iter().map(|k| (k.0, k.1, k.2, k.3)).collect();
+            assert_eq!(got, want, "{name}");
         }
     }
 
