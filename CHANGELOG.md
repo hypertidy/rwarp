@@ -173,6 +173,12 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     their mean. Components east and north are scalars here. On both
     files, components along each cell's own directions come back to
     1e-16, halo and all.
+  - Both fills take a `Stagger`: a field at the grid's T, U, V or F
+    points, whose folds land on other columns and rows, as NEMO 4.0
+    writes them (3.6 takes the last column of U and F points at an F
+    pivot from the wrong column). On both files, the positions of all
+    four points from the T cells' bounds come back exactly, halo masked
+    and filled.
 - `MeshSet::weights_to_par` and `weights_onto_par`: `weights_to` and
   `weights_onto` on up to `threads` threads, the same tables bit for bit.
   Pieces with at least `1 / threads` of the set's cells are measured one

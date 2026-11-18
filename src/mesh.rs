@@ -350,7 +350,7 @@ mod source;
 mod target;
 mod walk;
 
-pub use cf::Halo;
+pub use cf::{Halo, Stagger};
 pub use period::{unwrap_bounds, unwrap_grid};
 pub(crate) use period::Period;
 pub use rect::Rectilinear;

@@ -10,7 +10,7 @@ use controlledburn::{
     BurnMode, BurnOptions, BurnResult, Coord, Geometry, GridEdge, GridPoint, GridRun, Note, Polygon,
 };
 
-use super::cf::{cf_corners, Halo};
+use super::cf::{cf_corners, Halo, Stagger};
 use super::period::range_of;
 use super::walk::{burn_plane, map_geoms, vertex_chunks, vertices};
 use super::{bow_tie, orient, shoelace2, CellMap, MeshTarget, MeshTransformer, QuadMesh};
@@ -667,42 +667,65 @@ impl MeshSet {
         pairs
     }
 
-    /// NEMO's halo exchange on a field on the file's grid (as
-    /// [`MeshSet::to_file_layout`] gives it), for a set built with
-    /// [`Halo::NEMO_F_PIVOT`] or [`Halo::NEMO_T_PIVOT`]: the last two
-    /// columns repeat the first two, and the north-fold row repeats the row
-    /// below the fold, mirrored (column `i` from column `ncol - 1 - i` of
-    /// the row before it at an F-point pivot, from column `ncol - i` of the
-    /// row two before at a T-point pivot, where the row before mirrors
-    /// itself too). The first row, which holds no cells, is left. For
-    /// scalar fields (components east and north are scalars here); for
-    /// components in the grid's directions, [`MeshSet::fill_halo_vector`].
+    /// NEMO's halo exchange on a field on the file's grid at `point`s (at
+    /// T points as [`MeshSet::to_file_layout`] gives it, or at U, V or F
+    /// points of the same grid), for a set built with
+    /// [`Halo::NEMO_F_PIVOT`] or [`Halo::NEMO_T_PIVOT`], as NEMO 4.0's
+    /// `lbc_nfd_generic.h90` writes it on one process. Columns `nx - 2`
+    /// and `nx - 1` repeat columns 0 and 1 (`nx` by `ny` the file's size),
+    /// and the north fold's rows repeat rows below them, mirrored, column
+    /// `i` from column
+    ///
+    /// | point | F-point pivot | T-point pivot |
+    /// |-------|---------------|---------------|
+    /// | T, V  | `nx - 1 - i`  | `nx - i`      |
+    /// | U, F  | `nx - 2 - i`  | `nx - 1 - i`  |
+    ///
+    /// (on the cyclic columns past either end: column -1 is `nx - 3`) of
+    /// the rows
+    ///
+    /// | point | F-point pivot | T-point pivot |
+    /// |-------|---------------|---------------|
+    /// | T | `ny - 1` from `ny - 2` | `ny - 1` from `ny - 3`; `ny - 2` from itself, columns `nx / 2..nx` |
+    /// | U | `ny - 1` from `ny - 2` | `ny - 1` from `ny - 3`; `ny - 2` from itself, columns `nx / 2 - 1..nx - 1` |
+    /// | V | `ny - 1` from `ny - 3`; `ny - 2` from itself, columns `nx / 2..nx` | `ny - 1` from `ny - 4`; `ny - 2` from `ny - 3` |
+    /// | F | `ny - 1` from `ny - 3`; `ny - 2` from itself, columns `nx / 2..nx - 1` | `ny - 1` from `ny - 4`; `ny - 2` from `ny - 3` |
+    ///
+    /// A row from itself is copied in place, in order: at a T pivot, U
+    /// points keep column `nx / 2` of row `ny - 2` and copy column
+    /// `nx / 2 - 1` from it. There V and F points leave one cell of row
+    /// `ny - 2` as the cyclic columns had it before the fold (column 0 at
+    /// V, `nx - 1` at F): here it is the cyclic copy of the fold's. The
+    /// first row, which holds no cells, is left but for its cyclic
+    /// columns. For scalar fields (components east and north are scalars
+    /// here); for components in the grid's directions,
+    /// [`MeshSet::fill_halo_vector`].
     ///
     /// Errors for another halo, or when `file` isn't the file's size.
-    pub fn fill_halo<T: Copy>(&self, file: &mut [T], nbands: usize) -> Result<(), String> {
-        self.fill_nemo(file, nbands, |v| v)
+    pub fn fill_halo<T: Copy>(&self, file: &mut [T], nbands: usize, point: Stagger) -> Result<(), String> {
+        self.fill_nemo(file, nbands, point, |v| v)
     }
 
     /// [`MeshSet::fill_halo`] for components of a vector in the grid's own
     /// directions (along its rows or its columns, as NEMO's velocities
-    /// are), every band a component, on T points as the set's cells are
-    /// (NEMO's U, V and F points fold onto other columns and rows, and
-    /// aren't done here). The grid turns half round across the north fold,
-    /// so the fold's copies change sign (NEMO's `psgn = -1`); the cyclic
-    /// columns' don't. At a T-point pivot, as NEMO leaves it,
-    /// the cell at column `ncol / 2` of the row below the fold, its own
-    /// mirror, changes sign, and column `ncol - 1` of that row is column 1
-    /// (the other pivot) with its sign changed. The grid has no directions
-    /// at a pivot, and a component that agrees with its own halo is zero
-    /// there.
+    /// are), every band a component. The grid turns half round across the
+    /// north fold, so the fold's copies change sign (NEMO's `psgn = -1`);
+    /// the cyclic columns' don't. As NEMO leaves them: at a T pivot, T
+    /// points' column `nx / 2` of row `ny - 2`, its own mirror, changes
+    /// sign, and column `nx - 1` of that row is column 1 (the other pivot)
+    /// with its sign changed, though the cyclic columns say column 1; at an
+    /// F pivot, F points' column `nx - 2` of row `ny - 2` is column 0 (a
+    /// pivot) with its sign changed. The grid has no directions at a
+    /// pivot, and a component that agrees with its own halo is zero there.
     ///
     /// Errors for another halo, or when `file` isn't the file's size.
     pub fn fill_halo_vector<T: Copy + Neg<Output = T>>(
         &self,
         file: &mut [T],
         nbands: usize,
+        point: Stagger,
     ) -> Result<(), String> {
-        self.fill_nemo(file, nbands, |v: T| -v)
+        self.fill_nemo(file, nbands, point, |v: T| -v)
     }
 
     /// NEMO's `lbc_lnk` without the closed south: the cyclic columns, then
@@ -711,6 +734,7 @@ impl MeshSet {
         &self,
         file: &mut [T],
         nbands: usize,
+        point: Stagger,
         turn: impl Fn(T) -> T,
     ) -> Result<(), String> {
         let t_pivot = match self.halo {
@@ -719,7 +743,7 @@ impl MeshSet {
             h => return Err(format!("only NEMO's halos are filled, not {h:?}")),
         };
         let [nx, ny] = self.file;
-        if file.len() != nx * ny * nbands || nx < 4 || ny < 3 {
+        if file.len() != nx * ny * nbands || nx < 4 || ny < 4 {
             return Err(format!(
                 "{} values for a {nx} x {ny} file of {nbands} band(s)",
                 file.len()
@@ -733,22 +757,80 @@ impl MeshSet {
                 file[to + b] = if across { turn(v) } else { v };
             }
         };
-        // a column at or past ncol - 2 is the one ncol - 2 before it
-        let wrap = |i: usize| if i >= nx - 2 { i - (nx - 2) } else { i };
         for j in 0..ny - 1 {
             copy(file, (j, nx - 2), (j, 0), false);
             copy(file, (j, nx - 1), (j, 1), false);
         }
-        if t_pivot {
-            for i in nx / 2..nx {
-                copy(file, (ny - 2, i), (ny - 2, wrap(nx - i)), true);
+        // lbc_nfd_generic.h90's loops, 0-based, in its order (a row copied
+        // onto itself is copied in place): `a` the last row, `b`, `c` and
+        // `d` the ones below it
+        let n = nx;
+        let (a, b, c, d) = (ny - 1, ny - 2, ny - 3, ny - 4);
+        let put = |file: &mut [T], to: (usize, usize), from: (usize, usize)| copy(file, to, from, true);
+        match (t_pivot, point) {
+            (true, Stagger::T) => {
+                for i in 1..n {
+                    put(file, (a, i), (c, n - i));
+                }
+                put(file, (a, 0), (c, 2));
+                for i in n / 2..n {
+                    put(file, (b, i), (b, n - i));
+                }
             }
-            for i in 0..nx {
-                copy(file, (ny - 1, i), (ny - 3, wrap(nx - i)), true);
+            (true, Stagger::U) => {
+                for i in 0..n - 1 {
+                    put(file, (a, i), (c, n - 1 - i));
+                }
+                put(file, (a, 0), (c, 1));
+                put(file, (a, n - 1), (c, n - 2));
+                for i in n / 2 - 1..n - 1 {
+                    put(file, (b, i), (b, n - 1 - i));
+                }
             }
-        } else {
-            for i in 0..nx {
-                copy(file, (ny - 1, i), (ny - 2, nx - 1 - i), true);
+            (true, Stagger::V) => {
+                for i in 1..n {
+                    put(file, (b, i), (c, n - i));
+                    put(file, (a, i), (d, n - i));
+                }
+                put(file, (a, 0), (d, 2));
+                copy(file, (b, 0), (b, n - 2), false);
+            }
+            (true, Stagger::F) => {
+                for i in 0..n - 1 {
+                    put(file, (b, i), (c, n - 1 - i));
+                    put(file, (a, i), (d, n - 1 - i));
+                }
+                put(file, (a, 0), (d, 1));
+                put(file, (a, n - 1), (d, n - 2));
+                copy(file, (b, n - 1), (b, 1), false);
+            }
+            (false, Stagger::T) => {
+                for i in 0..n {
+                    put(file, (a, i), (b, n - 1 - i));
+                }
+            }
+            (false, Stagger::U) => {
+                for i in 0..n - 1 {
+                    put(file, (a, i), (b, n - 2 - i));
+                }
+                put(file, (a, n - 1), (b, n - 3));
+            }
+            (false, Stagger::V) => {
+                for i in 0..n {
+                    put(file, (a, i), (c, n - 1 - i));
+                }
+                for i in n / 2..n {
+                    put(file, (b, i), (b, n - 1 - i));
+                }
+            }
+            (false, Stagger::F) => {
+                for i in 0..n - 1 {
+                    put(file, (a, i), (c, n - 2 - i));
+                }
+                put(file, (a, n - 1), (c, n - 3));
+                for i in n / 2..n - 1 {
+                    put(file, (b, i), (b, n - 2 - i));
+                }
             }
         }
         Ok(())

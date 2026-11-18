@@ -10,7 +10,7 @@
 //! cell's split triangles, as in `tests/mesh_glued.rs`.
 
 use controlledburn::{BurnOptions, BurnResult, Coord, Geometry, Polygon};
-use rwarp::mesh::{Band, CellMap, Halo, MeshSet, QuadMesh};
+use rwarp::mesh::{Band, CellMap, Halo, MeshSet, QuadMesh, Stagger};
 use rwarp::CrsTransform;
 use std::f64::consts::TAU;
 
@@ -691,7 +691,7 @@ fn fields_go_to_the_set_and_back_to_the_file() {
                 }
             }
         }
-        s.fill_halo(&mut back, 2).unwrap();
+        s.fill_halo(&mut back, 2, Stagger::T).unwrap();
         let worst = (2 * nx..file.len()).map(|k| (back[k] - file[k]).abs()).fold(0.0, f64::max);
         assert!(worst < 1e-9, "t_pivot {t_pivot}: the halo filled to {worst:e}");
         assert!(back[..2 * nx].iter().all(|v| v.is_nan()), "the first row is left");
@@ -757,38 +757,107 @@ fn a_t_pivot_cell_takes_its_halves_mean_by_area() {
     assert!((0..nc).all(|c| back[nr * nx - nx + c] == field[(nr - 2) * nc + c]));
 }
 
-/// NEMO 3.6's `lbc_lnk` for a T-point field, transcribed from `lbclnk.F90`
-/// and `lbcnfd.F90` (1-based, `jpiglo` columns, `ijpj` rows, the fold's
-/// copies times `psgn`), without the closed south.
-fn nemo_lbc_lnk(f: &mut [i32], nx: usize, ny: usize, t_pivot: bool, psgn: i32) {
+/// NEMO's `lbc_lnk` on one process, transcribed from 3.6's `lbclnk.F90`
+/// (the cyclic columns) and 4.0's `lbc_nfd_generic.h90` (the fold; 3.6's
+/// `lbcnfd.F90` is the same but for the last column of U and F points at
+/// an F pivot), 1-based, `jpiglo` columns, `ipj` rows, the fold's copies
+/// times `psgn`, without the closed south.
+fn nemo_lbc_lnk(f: &mut [i32], nx: usize, ny: usize, t_pivot: bool, point: Stagger, psgn: i32) {
     let at = |ji: usize, jj: usize| (jj - 1) * nx + ji - 1;
-    let (jpiglo, ijpj) = (nx, ny);
-    for jj in 1..=ijpj {
+    let (jpiglo, ipj) = (nx, ny);
+    let ipjm1 = ipj - 1;
+    for jj in 1..=ipj {
         f[at(1, jj)] = f[at(jpiglo - 1, jj)];
         f[at(jpiglo, jj)] = f[at(2, jj)];
     }
-    if t_pivot {
-        for ji in 2..=jpiglo {
-            let ijt = jpiglo - ji + 2;
-            f[at(ji, ijpj)] = psgn * f[at(ijt, ijpj - 2)];
+    // ARRAY_IN(ji, jj) = SGN_IN * ARRAY_IN(si, sj)
+    let mut p = |ji: usize, jj: usize, si: usize, sj: usize| f[at(ji, jj)] = psgn * f[at(si, sj)];
+    match (t_pivot, point) {
+        (true, Stagger::T) => {
+            for ji in 2..=jpiglo {
+                let ijt = jpiglo - ji + 2;
+                p(ji, ipj, ijt, ipj - 2);
+            }
+            p(1, ipj, 3, ipj - 2);
+            for ji in jpiglo / 2 + 1..=jpiglo {
+                let ijt = jpiglo - ji + 2;
+                p(ji, ipjm1, ijt, ipjm1);
+            }
         }
-        f[at(1, ijpj)] = psgn * f[at(3, ijpj - 2)];
-        for ji in jpiglo / 2 + 1..=jpiglo {
-            let ijt = jpiglo - ji + 2;
-            f[at(ji, ijpj - 1)] = psgn * f[at(ijt, ijpj - 1)];
+        (true, Stagger::U) => {
+            for ji in 1..=jpiglo - 1 {
+                let iju = jpiglo - ji + 1;
+                p(ji, ipj, iju, ipj - 2);
+            }
+            p(1, ipj, 2, ipj - 2);
+            p(jpiglo, ipj, jpiglo - 1, ipj - 2);
+            for ji in jpiglo / 2..=jpiglo - 1 {
+                let iju = jpiglo - ji + 1;
+                p(ji, ipjm1, iju, ipjm1);
+            }
         }
-    } else {
-        for ji in 1..=jpiglo {
-            let ijt = jpiglo - ji + 1;
-            f[at(ji, ijpj)] = psgn * f[at(ijt, ijpj - 1)];
+        (true, Stagger::V) => {
+            for ji in 2..=jpiglo {
+                let ijt = jpiglo - ji + 2;
+                p(ji, ipj - 1, ijt, ipj - 2);
+                p(ji, ipj, ijt, ipj - 3);
+            }
+            p(1, ipj, 3, ipj - 3);
+        }
+        (true, Stagger::F) => {
+            for ji in 1..=jpiglo - 1 {
+                let iju = jpiglo - ji + 1;
+                p(ji, ipj - 1, iju, ipj - 2);
+                p(ji, ipj, iju, ipj - 3);
+            }
+            p(1, ipj, 2, ipj - 3);
+            p(jpiglo, ipj, jpiglo - 1, ipj - 3);
+        }
+        (false, Stagger::T) => {
+            for ji in 1..=jpiglo {
+                let ijt = jpiglo - ji + 1;
+                p(ji, ipj, ijt, ipj - 1);
+            }
+        }
+        (false, Stagger::U) => {
+            for ji in 1..=jpiglo - 1 {
+                let iju = jpiglo - ji;
+                p(ji, ipj, iju, ipj - 1);
+            }
+            p(jpiglo, ipj, jpiglo - 2, ipj - 1);
+        }
+        (false, Stagger::V) => {
+            for ji in 1..=jpiglo {
+                let ijt = jpiglo - ji + 1;
+                p(ji, ipj, ijt, ipj - 2);
+            }
+            for ji in jpiglo / 2 + 1..=jpiglo {
+                let ijt = jpiglo - ji + 1;
+                p(ji, ipjm1, ijt, ipjm1);
+            }
+        }
+        (false, Stagger::F) => {
+            for ji in 1..=jpiglo - 1 {
+                let iju = jpiglo - ji;
+                p(ji, ipj, iju, ipj - 2);
+            }
+            p(jpiglo, ipj, jpiglo - 2, ipj - 2);
+            for ji in jpiglo / 2 + 1..=jpiglo - 1 {
+                let iju = jpiglo - ji;
+                p(ji, ipjm1, iju, ipjm1);
+            }
         }
     }
 }
 
+const POINTS: [Stagger; 4] = [Stagger::T, Stagger::U, Stagger::V, Stagger::F];
+
 /// `fill_halo` and `fill_halo_vector` are NEMO's exchange with `psgn` 1
-/// and -1, cell for cell, on a field that is anything in the set's cells.
-/// NEMO copies the cyclic columns the other way (its first column from
-/// the last but one), so its field has them repeated first.
+/// and -1, cell for cell, at every point, on a field that is anything in
+/// the set's cells. NEMO copies the cyclic columns the other way (its
+/// first column from the last but one), so its field has them repeated
+/// first. The one cell NEMO's fold leaves at V and F points at a T pivot
+/// is the cyclic copy of the fold's.
 #[test]
 fn the_halo_is_nemos_exchange() {
     for t_pivot in [false, true] {
@@ -803,16 +872,133 @@ fn the_halo_is_nemos_exchange() {
             theirs[j * nx + nc] = theirs[j * nx];
             theirs[j * nx + nc + 1] = theirs[j * nx + 1];
         }
-        for psgn in [1, -1] {
-            let (mut a, mut b) = (ours.clone(), theirs.clone());
-            if psgn == 1 {
-                s.fill_halo(&mut a, 1).unwrap();
-            } else {
-                s.fill_halo_vector(&mut a, 1).unwrap();
+        for point in POINTS {
+            // the cell left, and its cyclic partner
+            let left = match (t_pivot, point) {
+                (true, Stagger::V) => Some(((ny - 2) * nx, (ny - 2) * nx + nx - 2)),
+                (true, Stagger::F) => Some(((ny - 2) * nx + nx - 1, (ny - 2) * nx + 1)),
+                _ => None,
+            };
+            for psgn in [1, -1] {
+                let (mut a, mut b) = (ours.clone(), theirs.clone());
+                if psgn == 1 {
+                    s.fill_halo(&mut a, 1, point).unwrap();
+                } else {
+                    s.fill_halo_vector(&mut a, 1, point).unwrap();
+                }
+                nemo_lbc_lnk(&mut b, nx, ny, t_pivot, point, psgn);
+                let name = format!("t_pivot {t_pivot}, {point:?}, psgn {psgn}");
+                for k in nx..nx * ny {
+                    if left.is_some_and(|(c, _)| c == k) {
+                        continue;
+                    }
+                    assert_eq!(a[k], b[k], "{name}: ({}, {})", k / nx, k % nx);
+                }
+                if let Some((c, partner)) = left {
+                    assert_eq!(a[c], a[partner], "{name}: the cell left");
+                    assert_ne!(a[c], 77_777);
+                }
+                assert_eq!(&a[..nc], &ours[..nc], "the first row's cells are left");
             }
-            nemo_lbc_lnk(&mut b, nx, ny, t_pivot, psgn);
-            assert_eq!(&a[nx..], &b[nx..], "t_pivot {t_pivot}, psgn {psgn}");
-            assert_eq!(&a[..nc], &ours[..nc], "the first row's cells are left");
+        }
+    }
+}
+
+/// The halo's cells at each point, from the halo NEMO's fold writes (at T
+/// points the pivots copy themselves, so aren't halo).
+fn halo_cells(nx: usize, ny: usize, t_pivot: bool, point: Stagger) -> Vec<bool> {
+    let below: Vec<usize> = match (t_pivot, point) {
+        (true, Stagger::T) => (nx / 2 + 1..nx).collect(),
+        (true, Stagger::U) => std::iter::once(nx / 2 - 1).chain(nx / 2 + 1..nx).collect(),
+        (true, _) => (0..nx).collect(),
+        (false, Stagger::V) => (nx / 2..nx).collect(),
+        (false, Stagger::F) => (nx / 2..nx).collect(),
+        (false, _) => vec![],
+    };
+    (0..nx * ny)
+        .map(|k| {
+            let (j, i) = (k / nx, k % nx);
+            i >= nx - 2 || j == ny - 1 || (j == ny - 2 && below.contains(&i))
+        })
+        .collect()
+}
+
+/// The ORCA-like grid's U, V and F points (and T), from its T cells'
+/// bounds: the middles of their east and north sides, and their
+/// north-east corners. A halo cell is its mirror turned half round, so
+/// its east side is the mirror's west side, and so on. With the halo
+/// masked, `fill_halo` gives each point's position back at every point,
+/// and `fill_halo_vector` the components of a vector field along the
+/// sides at U and V points (east side going north, north side going
+/// east, and those turned a quarter round).
+#[test]
+fn every_point_comes_back_from_its_mirror() {
+    for t_pivot in [false, true] {
+        let (nc, ny) = (24, 10);
+        let b = orca(nc, ny, t_pivot);
+        let s = orca_set(&b, t_pivot);
+        let nx = nc + 2;
+        let wind = |p: [f64; 2]| [1.0 + 0.004 * p[1], 0.3 - 0.003 * p[0]];
+        for point in POINTS {
+            let mut at = vec![0.0; nx * ny * 2];
+            let mut along = vec![0.0; nx * ny * 2];
+            for k in 0..nx * ny {
+                let q: Vec<[f64; 2]> = (0..4).map(|v| [b.x[k * 4 + v], b.y[k * 4 + v]]).collect();
+                let mid = |a: usize, c: usize| [(q[a][0] + q[c][0]) / 2.0, (q[a][1] + q[c][1]) / 2.0];
+                let p = match point {
+                    Stagger::T => [(q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4.0, (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4.0],
+                    Stagger::U => mid(1, 2),
+                    Stagger::V => mid(2, 3),
+                    Stagger::F => q[2],
+                };
+                at[k * 2..k * 2 + 2].copy_from_slice(&p);
+                // the side through the point, east (U: turned from north)
+                let (e, n) = match point {
+                    Stagger::U => {
+                        let n = [q[2][0] - q[1][0], q[2][1] - q[1][1]];
+                        ([n[1], -n[0]], n)
+                    }
+                    Stagger::V => {
+                        let e = [q[2][0] - q[3][0], q[2][1] - q[3][1]];
+                        (e, [-e[1], e[0]])
+                    }
+                    _ => ([0.0; 2], [0.0; 2]),
+                };
+                let (w, len) = (wind(p), e[0].hypot(e[1]).max(1e-300));
+                along[k * 2] = (w[0] * e[0] + w[1] * e[1]) / len;
+                along[k * 2 + 1] = (w[0] * n[0] + w[1] * n[1]) / len;
+            }
+            let halo = halo_cells(nx, ny, t_pivot, point);
+            let masked = |f: &[f64]| -> Vec<f64> {
+                (0..f.len()).map(|c| if halo[c / 2] { f64::NAN } else { f[c] }).collect()
+            };
+            let check = |got: &[f64], want: &[f64], what: &str| {
+                for k in nx..nx * ny {
+                    for c in [k * 2, k * 2 + 1] {
+                        assert!(
+                            (got[c] - want[c]).abs() < 1e-9,
+                            "t_pivot {t_pivot}, {point:?}, {what} ({}, {}): {} vs {}",
+                            k / nx,
+                            k % nx,
+                            got[c],
+                            want[c]
+                        );
+                    }
+                }
+            };
+            let mut got = masked(&at);
+            s.fill_halo(&mut got, 2, point).unwrap();
+            check(&got, &at, "position");
+            if matches!(point, Stagger::U | Stagger::V) {
+                let mut got = masked(&along);
+                s.fill_halo_vector(&mut got, 2, point).unwrap();
+                check(&got, &along, "components");
+                // as scalars, the fold comes back turned round
+                let mut got = masked(&along);
+                s.fill_halo(&mut got, 2, point).unwrap();
+                let f = ((ny - 1) * nx + 3) * 2;
+                assert!((got[f] + along[f]).abs() < 1e-9 && along[f].abs() > 0.1, "{point:?}");
+            }
         }
     }
 }
@@ -855,7 +1041,7 @@ fn vector_components_turn_round_across_the_fold() {
                 assert!((back[c] - file[c]).abs() < 1e-9, "t_pivot {t_pivot}, before the halo: column {}", k % nx);
             }
         }
-        s.fill_halo_vector(&mut back, 2).unwrap();
+        s.fill_halo_vector(&mut back, 2, Stagger::T).unwrap();
         for k in (nx..nx * ny).filter(|&k| !pivot(k)) {
             for c in [k * 2, k * 2 + 1] {
                 assert!((back[c] - file[c]).abs() < 1e-9, "t_pivot {t_pivot}, ({}, {}): {} vs {}", k / nx, k % nx, back[c], file[c]);
@@ -872,7 +1058,7 @@ fn vector_components_turn_round_across_the_fold() {
         // as scalars, the fold row comes back turned round
         let field = s.from_file_layout(&file, 2).unwrap();
         let mut scalar = s.to_file_layout(&field, 2, f64::NAN).unwrap();
-        s.fill_halo(&mut scalar, 2).unwrap();
+        s.fill_halo(&mut scalar, 2, Stagger::T).unwrap();
         let f = ((ny - 1) * nx + 3) * 2;
         assert!((scalar[f] + file[f]).abs() < 1e-9 && file[f].abs() > 0.1);
     }
@@ -888,6 +1074,6 @@ fn file_layout_refusals() {
     assert!(s.to_file_layout(&[0.0f32; 10], 1, 0.0).unwrap_err().contains("24 x 8"));
     assert!(s.to_file_layout_vector(&[0.0f32; 10], 1, 0.0).unwrap_err().contains("24 x 8"));
     let mut wrong = vec![0.0; 10];
-    assert!(s.fill_halo(&mut wrong, 1).is_err());
-    assert!(s.fill_halo_vector(&mut wrong, 1).is_err());
+    assert!(s.fill_halo(&mut wrong, 1, Stagger::T).is_err());
+    assert!(s.fill_halo_vector(&mut wrong, 1, Stagger::U).is_err());
 }

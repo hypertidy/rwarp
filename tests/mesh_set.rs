@@ -339,9 +339,9 @@ fn a_halo_gives_the_same_set() {
     assert!((0..NC * NR).all(|k| set_field[k] == field[(k / NC + 1) * fc + k % NC]));
     let mut back = h.to_file_layout(&set_field, 1, 9999).unwrap();
     assert!((0..fc * fr).all(|k| back[k] == if k < fc || k % fc >= NC { 9999 } else { field[k] }));
-    assert!(h.fill_halo(&mut back, 1).unwrap_err().contains("NEMO"));
+    assert!(h.fill_halo(&mut back, 1, rwarp::mesh::Stagger::T).unwrap_err().contains("NEMO"));
     let mut signed: Vec<i32> = back.iter().map(|&v| v as i32).collect();
-    assert!(h.fill_halo_vector(&mut signed, 1).unwrap_err().contains("NEMO"));
+    assert!(h.fill_halo_vector(&mut signed, 1, rwarp::mesh::Stagger::V).unwrap_err().contains("NEMO"));
     assert_eq!(h.dropped(), plain.dropped());
     assert_eq!(h.pieces().len(), plain.pieces().len());
     for (a, b) in h.pieces().iter().zip(plain.pieces()) {
