@@ -20,7 +20,9 @@ This file is a snapshot, so replace it rather than append to it.
 
 `v0.4.0` (on `6a4c337`) and `v0.4.1` (on `e4c3e49`) were tagged on
 2026-11-16, each on the commit its crate was published from; `v0.5.0`
-(on `67eb7c4`, #99's merge) on 2026-11-18.
+(on `67eb7c4`, #99's merge) on 2026-11-18. Main is now 0.5.1
+(unreleased, #100); a breaking change before the next release makes it
+0.6.0.
 
 ## Since 0.4.1
 
@@ -55,18 +57,16 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 
 ## Next, in order
 
-1. **Bump main to the next version** with the next PR, with its
-   changelog section (main's version leads the release).
-2. **#76**, the planner's fill-ratio split.
-3. **Stage 4 (#37)** is built; it can close. The one item left out is
+1. **#76**, the planner's fill-ratio split.
+2. **Stage 4 (#37)** is built; it can close. The one item left out is
    cheaper libproj copies for the threads (`proj_clone`, which the
    `proj` crate doesn't expose).
-4. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
+3. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
    for reprojected polygons and footprint edges), conservative stage 5
    (#39, meshes) and 6 (#40, second order).
-5. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
+4. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
    C4 (#48 to #51).
-6. **The rest of controlledburn 0.3**: `burn_window` could replace
+5. **The rest of controlledburn 0.3**: `burn_window` could replace
    `Cutline::burn_window` (check the records are identical first) and
    split one large geometry into tiles for `burn_par`; `relate_cells`
    finds cells a polygon only touches.
