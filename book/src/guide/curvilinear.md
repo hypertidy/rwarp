@@ -410,7 +410,8 @@ any method:
 use rwarp::mesh::SetTransformer;
 use rwarp::warp::{warp, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
 
-// tos: the file's field less its halo, one value per cell of the set, NaN on land
+// tos_file: the file's field, halo and all (182 x 149 for ORCA2), NaN on land
+let tos = set.from_file_layout(&tos_file, 1)?;
 let t = SetTransformer::new(&set, &crs, gt, "+proj=longlat +R=6371229")?;
 let [ncol, nrow] = set.size();
 let src = SourceBuffer { data: &tos, ncol, nrow, nbands: 1, col_off: 0, row_off: 0 };
@@ -430,6 +431,16 @@ can't hold its far pole: a pixel round the South Pole comes out round
 the whole north band there, turned the other way. An outline turned
 against its band isn't measured in it, so an Antarctic grid takes
 nothing from the north band.
+
+The other way, onto the set (`weights_onto` and `apply`, or `burn`),
+gives a value per cell of the set. `to_file_layout` puts them back on the
+file's grid, its halo masked as CMIP6 files have it, and `fill_halo`
+writes NEMO's halo: the last two columns repeat the first two, and the
+north-fold row repeats the row below the fold, mirrored. At ORCA2's
+T-point pivot, each cell of the last row is two of the set's cells, and
+`to_file_layout` gives it their mean by area. On both files, cell
+centres taken to the set and back, halo filled, come back to 2e-16 in
+every row but the first, which holds no cells.
 
 `warp_to_par` gives the same values on several threads, each with a
 `SetTransformer` of its own: `|| SetTransformer::new(&set, &crs, gt,

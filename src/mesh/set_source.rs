@@ -17,7 +17,8 @@ use crate::weights::GridWindow;
 /// Source pixel `(col, row)` is the set's cell `(row, col)`, in the set's
 /// numbering (the file's rows and columns less the halo's), so a source
 /// buffer holds one value per cell, row-major over
-/// [`MeshSet::size`]. Each band's world is in its own CRS; the
+/// [`MeshSet::size`]: [`MeshSet::from_file_layout`] takes a field on the
+/// file's grid to it. Each band's world is in its own CRS; the
 /// destination is a grid with geotransform `dst_gt` in `dst_crs`.
 ///
 /// - **Area methods.** The transformer reports the set's pieces as the
