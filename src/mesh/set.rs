@@ -16,7 +16,7 @@ use super::walk::{burn_plane, map_geoms, vertex_chunks, vertices};
 use super::{bow_tie, orient, shoelace2, CellMap, MeshTarget, MeshTransformer, QuadMesh};
 use crate::crs::CrsTransform;
 use crate::transform::Transformer;
-use crate::weights::{exact_weights, GridWindow, WeightOptions, Weights};
+use crate::weights::{exact_weights, exact_weights_par, GridWindow, WeightOptions, Weights};
 
 /// A band of rows of a [`MeshSet`] and the projection it's held in: from
 /// the bounds' coordinates (longitude and latitude, say) to the band's
@@ -83,7 +83,8 @@ impl Piece {
 /// - **Weights.** [`MeshSet::weights_to`] gives conservative weights from
 ///   the set to a grid, [`MeshSet::weights_onto`] from a source onto the
 ///   set, each as one [`Weights`] in the set's numbering, from
-///   [`exact_weights`] on every piece.
+///   [`exact_weights`] on every piece; [`MeshSet::weights_to_par`] and
+///   [`MeshSet::weights_onto_par`] on several threads.
 /// - **Burning.** [`MeshSet::burn`] burns polygons and points given in the
 ///   bounds' coordinates onto the set's cells, densified into each band's
 ///   world.
@@ -509,50 +510,60 @@ impl MeshSet {
         opts: &WeightOptions,
     ) -> Result<Weights, String> {
         let full = [opts.dst_col_off, opts.dst_row_off, dst_ncol, dst_nrow];
-        let mut out = Weights {
-            dst_off: [full[0], full[1]],
-            dst_size: [dst_ncol, dst_nrow],
-            dst_area: vec![f64::NAN; dst_ncol * dst_nrow],
-            measure: opts.measure,
-            ..Weights::default()
-        };
-        let mut best = vec![f64::NEG_INFINITY; dst_ncol * dst_nrow];
+        let mut out = ToGrid::new(full, opts);
         for p in &self.pieces {
             let t = transformer(p.world, p.mesh.clone())?;
-            let mut win = reach(&t, &p.mesh, full, 2);
-            let w = loop {
-                let w = exact_weights(
-                    &t,
-                    &t.source_window(),
-                    win[2],
-                    win[3],
-                    &opts.with_dst_offset(win[0], win[1]),
-                );
-                let sides = touched(&w, win, full);
-                if !sides.contains(&true) {
-                    break w;
-                }
-                win = grow(win, full, sides);
-            };
-            let covered = w.dst_covered();
-            for (k, &a) in w.dst_area.iter().enumerate() {
-                let (r, c) = (win[1] + k / win[2], win[0] + k % win[2]);
-                let at = (r - full[1]) * dst_ncol + (c - full[0]);
-                if a.is_finite() && covered[k] > best[at] {
-                    out.dst_area[at] = a;
-                    best[at] = covered[k];
-                }
-            }
-            out.dst_row.extend_from_slice(&w.dst_row);
-            out.dst_col.extend_from_slice(&w.dst_col);
-            out.src_row
-                .extend(w.src_row.iter().map(|&r| r + p.row_off as u32));
-            out.src_col
-                .extend(w.src_col.iter().map(|&c| c + p.col_off as u32));
-            out.frac.extend_from_slice(&w.frac);
-            out.src_cell_area.extend_from_slice(&w.src_cell_area);
+            let (w, win) = to_window(&t, &p.mesh, full, |win| {
+                let o = opts.with_dst_offset(win[0], win[1]);
+                Ok(exact_weights(&t, &t.source_window(), win[2], win[3], &o))
+            })?;
+            out.add(p, &w, win);
         }
-        Ok(out)
+        Ok(out.w)
+    }
+
+    /// [`MeshSet::weights_to`] on up to `threads` threads (0 for all
+    /// available), with the same [`Weights`], entry for entry and bit for
+    /// bit.
+    ///
+    /// - **Large pieces** (at least `1 / threads` of the set's cells, such
+    ///   as the main body of each band) are measured one after another,
+    ///   each on every thread through
+    ///   [`exact_weights_par`](crate::weights::exact_weights_par), with a
+    ///   transformer of its own on each thread from `transformer(world,
+    ///   mesh)`.
+    /// - **The others** are measured at the same time, one a thread, the
+    ///   most cells first, each through a transformer built on its thread.
+    /// - **Merged** in the pieces' order, as [`MeshSet::weights_to`] merges
+    ///   them. Errors with the first piece's error, in that order.
+    pub fn weights_to_par(
+        &self,
+        transformer: impl Fn(usize, QuadMesh) -> Result<MeshTransformer, String> + Sync,
+        dst_ncol: usize,
+        dst_nrow: usize,
+        opts: &WeightOptions,
+        threads: usize,
+    ) -> Result<Weights, String> {
+        let full = [opts.dst_col_off, opts.dst_row_off, dst_ncol, dst_nrow];
+        let measured = self.by_piece(threads, |i, threads| {
+            let p = &self.pieces[i];
+            let t = transformer(p.world, p.mesh.clone())?;
+            to_window(&t, &p.mesh, full, |win| {
+                let o = opts.with_dst_offset(win[0], win[1]);
+                if threads > 1 {
+                    let make = || transformer(p.world, p.mesh.clone());
+                    exact_weights_par(make, &t.source_window(), win[2], win[3], &o, threads)
+                } else {
+                    Ok(exact_weights(&t, &t.source_window(), win[2], win[3], &o))
+                }
+            })
+        })?;
+        let mut out = ToGrid::new(full, opts);
+        for (p, m) in self.pieces.iter().zip(measured) {
+            let (w, win) = m?;
+            out.add(p, &w, win);
+        }
+        Ok(out.w)
     }
 
     /// Conservative weights from a source onto the set's cells:
@@ -570,33 +581,110 @@ impl MeshSet {
         opts: &WeightOptions,
     ) -> Result<Weights, String> {
         let opts = opts.with_dst_offset(0, 0);
-        let mut out = Weights {
+        let mut out = self.onto_empty(&opts);
+        for p in &self.pieces {
+            let t = MeshTarget::new(p.mesh.clone(), inner(p.world)?);
+            let w = exact_weights(&t, src, p.mesh.ncol(), p.mesh.nrow(), &opts);
+            self.onto_add(&mut out, p, &w);
+        }
+        Ok(out)
+    }
+
+    /// [`MeshSet::weights_onto`] on up to `threads` threads (0 for all
+    /// available), with the same [`Weights`], entry for entry and bit for
+    /// bit: large pieces one after another on every thread, the others at
+    /// the same time, one a thread, as [`MeshSet::weights_to_par`] does,
+    /// each thread with an inner transformer of its own from
+    /// `inner(world)`. Merged in the pieces' order.
+    pub fn weights_onto_par<T: Transformer>(
+        &self,
+        inner: impl Fn(usize) -> Result<T, String> + Sync,
+        src: &GridWindow,
+        opts: &WeightOptions,
+        threads: usize,
+    ) -> Result<Weights, String> {
+        let opts = opts.with_dst_offset(0, 0);
+        let measured = self.by_piece(threads, |i, threads| {
+            let p = &self.pieces[i];
+            let make = || inner(p.world).map(|t| MeshTarget::new(p.mesh.clone(), t));
+            let (pw, ph) = (p.mesh.ncol(), p.mesh.nrow());
+            if threads > 1 {
+                exact_weights_par(make, src, pw, ph, &opts, threads)
+            } else {
+                Ok(exact_weights(&make()?, src, pw, ph, &opts))
+            }
+        })?;
+        let mut out = self.onto_empty(&opts);
+        for (p, w) in self.pieces.iter().zip(measured) {
+            self.onto_add(&mut out, p, &w?);
+        }
+        Ok(out)
+    }
+
+    /// `f(i, threads)` for each piece `i`, in the pieces' order, on up to
+    /// `threads` threads (0 for all available): pieces with at least `1 /
+    /// threads` of the set's cells one after another, each given every
+    /// thread, then the others at the same time, each given one, the most
+    /// cells first.
+    fn by_piece<T: Send>(
+        &self,
+        threads: usize,
+        f: impl Fn(usize, usize) -> T + Sync,
+    ) -> Result<Vec<T>, String> {
+        let threads = match threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        };
+        let cells = |i: usize| self.pieces[i].mesh.ncol() * self.pieces[i].mesh.nrow();
+        let total: usize = (0..self.pieces.len()).map(cells).sum();
+        let large = |i: usize| threads > 1 && cells(i) * threads >= total;
+        let mut done: Vec<Option<T>> = (0..self.pieces.len()).map(|_| None).collect();
+        for i in (0..self.pieces.len()).filter(|&i| large(i)) {
+            done[i] = Some(f(i, threads));
+        }
+        let small: Vec<usize> = (0..self.pieces.len()).filter(|&i| !large(i)).collect();
+        let mut order: Vec<usize> = (0..small.len()).collect();
+        order.sort_by_key(|&j| std::cmp::Reverse(cells(small[j])));
+        for (j, r) in in_parallel(small.len(), &order, threads, |j| f(small[j], 1))?
+            .into_iter()
+            .enumerate()
+        {
+            done[small[j]] = Some(r);
+        }
+        Ok(done
+            .into_iter()
+            .map(|d| d.expect("every piece is measured"))
+            .collect())
+    }
+
+    /// A table onto the set's cells with no entries yet.
+    fn onto_empty(&self, opts: &WeightOptions) -> Weights {
+        Weights {
             dst_off: [0, 0],
             dst_size: [self.ncol, self.nrow],
             dst_area: vec![f64::NAN; self.ncol * self.nrow],
             measure: opts.measure,
             ..Weights::default()
-        };
-        for p in &self.pieces {
-            let t = MeshTarget::new(p.mesh.clone(), inner(p.world)?);
-            let (pw, ph) = (p.mesh.ncol(), p.mesh.nrow());
-            let w = exact_weights(&t, src, pw, ph, &opts);
-            for r in 0..ph {
-                for c in 0..pw {
-                    out.dst_area[(r + p.row_off) * self.ncol + c + p.col_off] =
-                        w.dst_area[r * pw + c];
-                }
-            }
-            out.dst_row
-                .extend(w.dst_row.iter().map(|&r| r + p.row_off as u32));
-            out.dst_col
-                .extend(w.dst_col.iter().map(|&c| c + p.col_off as u32));
-            out.src_row.extend_from_slice(&w.src_row);
-            out.src_col.extend_from_slice(&w.src_col);
-            out.frac.extend_from_slice(&w.frac);
-            out.src_cell_area.extend_from_slice(&w.src_cell_area);
         }
-        Ok(out)
+    }
+
+    /// Piece `p`'s weights onto its cells, `w`, into `out` in the set's
+    /// numbering.
+    fn onto_add(&self, out: &mut Weights, p: &Piece, w: &Weights) {
+        let (pw, ph) = (p.mesh.ncol(), p.mesh.nrow());
+        for r in 0..ph {
+            for c in 0..pw {
+                out.dst_area[(r + p.row_off) * self.ncol + c + p.col_off] = w.dst_area[r * pw + c];
+            }
+        }
+        out.dst_row
+            .extend(w.dst_row.iter().map(|&r| r + p.row_off as u32));
+        out.dst_col
+            .extend(w.dst_col.iter().map(|&c| c + p.col_off as u32));
+        out.src_row.extend_from_slice(&w.src_row);
+        out.src_col.extend_from_slice(&w.src_col);
+        out.frac.extend_from_slice(&w.frac);
+        out.src_cell_area.extend_from_slice(&w.src_cell_area);
     }
 
     /// Burn polygons and points onto the set's cells: controlledburn's
@@ -1848,6 +1936,75 @@ fn winds(r: &[[f64; 2]], p: [f64; 2]) -> bool {
         }
     }
     w != 0
+}
+
+/// A piece's weights to a grid `full` (`[col_off, row_off, ncol, nrow]`)
+/// over the target window it reaches, with the window: `measure(win)`
+/// over the window [`reach`] starts from, grown on each side its cover
+/// touches ([`touched`], [`grow`]) until it touches none.
+fn to_window(
+    t: &MeshTransformer,
+    m: &QuadMesh,
+    full: [usize; 4],
+    mut measure: impl FnMut([usize; 4]) -> Result<Weights, String>,
+) -> Result<(Weights, [usize; 4]), String> {
+    let mut win = reach(t, m, full, 2);
+    loop {
+        let w = measure(win)?;
+        let sides = touched(&w, win, full);
+        if !sides.contains(&true) {
+            return Ok((w, win));
+        }
+        win = grow(win, full, sides);
+    }
+}
+
+/// [`MeshSet::weights_to`]'s table as the pieces go in: each target
+/// pixel's `dst_area` from the piece that covers most of it (`best`).
+struct ToGrid {
+    w: Weights,
+    best: Vec<f64>,
+    full: [usize; 4],
+}
+
+impl ToGrid {
+    fn new(full: [usize; 4], opts: &WeightOptions) -> Self {
+        let n = full[2] * full[3];
+        ToGrid {
+            w: Weights {
+                dst_off: [full[0], full[1]],
+                dst_size: [full[2], full[3]],
+                dst_area: vec![f64::NAN; n],
+                measure: opts.measure,
+                ..Weights::default()
+            },
+            best: vec![f64::NEG_INFINITY; n],
+            full,
+        }
+    }
+
+    /// Piece `p`'s weights `w` over target window `win`, sources in the
+    /// set's numbering.
+    fn add(&mut self, p: &Piece, w: &Weights, win: [usize; 4]) {
+        let (full, out) = (self.full, &mut self.w);
+        let covered = w.dst_covered();
+        for (k, &a) in w.dst_area.iter().enumerate() {
+            let (r, c) = (win[1] + k / win[2], win[0] + k % win[2]);
+            let at = (r - full[1]) * full[2] + (c - full[0]);
+            if a.is_finite() && covered[k] > self.best[at] {
+                out.dst_area[at] = a;
+                self.best[at] = covered[k];
+            }
+        }
+        out.dst_row.extend_from_slice(&w.dst_row);
+        out.dst_col.extend_from_slice(&w.dst_col);
+        out.src_row
+            .extend(w.src_row.iter().map(|&r| r + p.row_off as u32));
+        out.src_col
+            .extend(w.src_col.iter().map(|&c| c + p.col_off as u32));
+        out.frac.extend_from_slice(&w.frac);
+        out.src_cell_area.extend_from_slice(&w.src_cell_area);
+    }
 }
 
 /// The target window `[col_off, row_off, ncol, nrow]` (full-grid pixels)

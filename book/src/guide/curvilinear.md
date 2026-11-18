@@ -394,6 +394,14 @@ On IPSL's CMIP6 files (checked in scratch, not in CI), split at 20 S:
 The worst cells covered are 0.03 km² slivers next to the grid poles,
 where 5e-10 is rounding on a cell a millionth of a source pixel.
 
+`weights_to_par` and `weights_onto_par` take the same closures and a
+thread count, and give the same tables bit for bit. A piece with at
+least its share of the set's cells (the main body of each band) is
+measured on every thread, through `exact_weights_par`. The strips and
+other small pieces are measured at the same time, one a thread. To 1°
+at densify 8, eORCA1's `weights_to` takes 3.0 s on one thread and 0.42 s
+on 8, ORCA2's 3.6 s and 0.52 s.
+
 `SetTransformer` makes the set the source of a warp, so `warp()` takes a
 field on the whole grid, one value per cell in the set's numbering, with
 any method:

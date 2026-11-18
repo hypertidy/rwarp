@@ -719,6 +719,12 @@ and `Piece`.
   (0.9998 without the halved fold row), shared out to 8e-14 (1.2 s),
   covered to 1e-9 (0.1 s). The worst covered are 0.03 km² slivers by the
   grid poles.
+- **On threads** (2026-11-18): `weights_to_par` and `weights_onto_par`,
+  the same tables bit for bit. Pieces with at least `1 / threads` of the
+  cells (on eORCA1 the main piece of each band took 0.45 s and 0.24 s of
+  1.1 s) are measured one after another on every thread through
+  `exact_weights_par`; the rest at once, one a thread. To 1 degree at
+  densify 8: eORCA1 3.0 s to 0.42 s on 8 threads, ORCA2 3.6 s to 0.52 s.
 - **Not built here.** Burning came in 4h, `warp()` from a set in 4i.
 
 ### Burning onto a set (built, 4h)

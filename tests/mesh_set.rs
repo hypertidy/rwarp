@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use controlledburn::{BurnMode, BurnResult, Coord, Geometry, Polygon};
-use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, SetTransformer, WORLD_GT};
+use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, QuadMesh, SetTransformer, WORLD_GT};
 use rwarp::transform::{CenterLong, GenImgProjTransformer};
 use rwarp::warp::{warp_to, warp_to_par, DstNodata, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::weights::{exact_weights, exact_weights_par, lonlat_measure, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
@@ -980,4 +980,44 @@ fn exact_weights_par_from_the_set() {
         assert!(one.dst_row == par.dst_row && one.dst_col == par.dst_col && one.src_row == par.src_row && one.src_col == par.src_col);
         assert!(bits(&one.frac) == bits(&par.frac) && bits(&one.dst_area) == bits(&par.dst_area) && bits(&one.src_cell_area) == bits(&par.src_cell_area));
     }
+}
+
+/// The same table bit for bit, NaN areas included.
+fn same_weights(a: &Weights, b: &Weights) -> bool {
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    (a.dst_row == b.dst_row && a.dst_col == b.dst_col && a.src_row == b.src_row && a.src_col == b.src_col)
+        && bits(&a.frac) == bits(&b.frac)
+        && bits(&a.dst_area) == bits(&b.dst_area)
+        && bits(&a.src_cell_area) == bits(&b.src_cell_area)
+        && (a.dst_off, a.dst_size) == (b.dst_off, b.dst_size)
+}
+
+/// `weights_to_par` and `weights_onto_par` give `weights_to`'s and
+/// `weights_onto`'s tables bit for bit, on thread counts that measure the
+/// bands' main pieces on every thread and the strips one a thread; the
+/// first piece's error comes back.
+#[test]
+fn set_weights_on_threads() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let mt = |w: usize, mesh: QuadMesh| MeshTransformer::with_backend(mesh, GT, Box::new(World(w, false)), Box::new(World(w, true)));
+    let gw = GridWindow::new(GW, GH);
+    for densify in [1, 4] {
+        let opts = WeightOptions::new(densify);
+        let to = s.weights_to(mt, GW, GH, &opts).unwrap();
+        let onto_opts = opts.with_measure(lonlat_measure(GT).unwrap());
+        let inner = |w: usize| {
+            GenImgProjTransformer::with_backend(GT, WORLD_GT, Box::new(World(w, true)), Box::new(World(w, false)))
+                .map(|t| t.with_center_long(CenterLong::At(0.0)).with_source_size([GW, GH]))
+        };
+        let onto = s.weights_onto(inner, &gw, &onto_opts).unwrap();
+        for threads in [0, 2, 3, 8] {
+            assert!(same_weights(&to, &s.weights_to_par(mt, GW, GH, &opts, threads).unwrap()), "to, densify {densify}, {threads} threads");
+            assert!(same_weights(&onto, &s.weights_onto_par(inner, &gw, &onto_opts, threads).unwrap()), "onto, densify {densify}, {threads} threads");
+        }
+    }
+    // a transformer that fails for band 1: its first piece's error
+    let fails = |w: usize, mesh: QuadMesh| if w == 1 { Err(format!("band {w}")) } else { mt(w, mesh) };
+    assert_eq!(s.weights_to(fails, GW, GH, &WeightOptions::new(1)).unwrap_err(), "band 1");
+    assert_eq!(s.weights_to_par(fails, GW, GH, &WeightOptions::new(1), 3).unwrap_err(), "band 1");
 }
