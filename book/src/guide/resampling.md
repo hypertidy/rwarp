@@ -36,6 +36,36 @@ when matching on the enums.
 | `dst_col_off`, `dst_row_off` | offset of this tile in a larger target | the chunk's destination offset |
 | `cutline` | a `Cutline` (see [Cutlines](cutline.md)) | `-cutline`, `-cblend`, `-wo CUTLINE_ALL_TOUCHED=` |
 
+## Threads
+
+`warp_par` and `warp_to_par` give `warp`'s and `warp_to`'s values bit for
+bit, on up to `threads` threads (0 for all available). They take a
+closure that builds the transformer instead of the transformer:
+
+```rust,ignore
+let make = || GenImgProjTransformer::new(src_crs, src_gt, dst_crs, dst_gt)
+    .map(|t| ApproxTransformer::new(t, 0.125));
+let out = warp_par(make, &src, dst_ncol, dst_nrow, &opts, 8)?;
+```
+
+As with GDAL's `-wo NUM_THREADS`, each thread warps bands of the
+target's rows through a transformer of its own, since a libproj
+transformer can't be shared between threads. A `Sync` one can serve them
+all as `|| Ok(&t)`. What a warp works out once is still worked out once:
+the cutline's density over the source, and the kernel scale over the
+whole target. So every row comes from the same steps as on one thread.
+With one thread nothing is spawned.
+
+A 0.1° global grid to 2000 by 2000 pixels of south polar stereographic,
+through libproj and the approximate transformer, on a 32-core machine:
+
+| | 1 thread | 8 | 32 |
+|---|---|---|---|
+| Bilinear | 0.48 s | 0.08 s | 0.04 s |
+| Cubic | 0.89 s | 0.15 s | 0.06 s |
+| Average | 0.86 s | 0.14 s | 0.05 s |
+| Average, `Exact { densify: 2 }` | 3.44 s | 0.45 s | 0.15 s |
+
 ## Kernel widening when downsampling
 
 When the output is coarser than the source, GDAL widens the bilinear, cubic

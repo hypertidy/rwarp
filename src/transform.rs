@@ -167,6 +167,26 @@ pub trait Transformer {
     }
 }
 
+/// A borrowed transformer is a transformer: one that is `Sync` can serve
+/// every thread of [`warp_to_par`](crate::warp::warp_to_par) as `|| Ok(&t)`.
+impl<T: Transformer + ?Sized> Transformer for &T {
+    fn transform(&self, dst_to_src: bool, x: &mut [f64], y: &mut [f64]) -> Vec<bool> {
+        (**self).transform(dst_to_src, x, y)
+    }
+
+    fn source_wrap(&self) -> Option<SourceWrap> {
+        (**self).source_wrap()
+    }
+
+    fn source_cells(&self) -> Option<&dyn SourceCells> {
+        (**self).source_cells()
+    }
+
+    fn jacobian(&self, dst_to_src: bool, x: f64, y: f64) -> Option<[[f64; 2]; 2]> {
+        (**self).jacobian(dst_to_src, x, y)
+    }
+}
+
 /// A source that wraps in longitude, in its own pixels; see
 /// [`Transformer::source_wrap`].
 #[derive(Debug, Clone, Copy, PartialEq)]

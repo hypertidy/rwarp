@@ -422,7 +422,7 @@ pub fn exact_weights_with(
     if dst_ncol == 0 || dst_nrow == 0 { return; }
     let mut lat = Lattice::new(
         transformer, dst_ncol, opts.densify.max(1), (opts.dst_col_off, opts.dst_row_off),
-        (src.col_off, src.row_off, src.ncol, src.nrow),
+        (src.col_off, src.row_off, src.ncol, src.nrow), (opts.dst_row_off, dst_nrow),
     );
     assert!(
         !lat.in_world() || opts.measure == Measure::Planar,
