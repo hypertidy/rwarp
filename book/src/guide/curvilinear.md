@@ -187,6 +187,21 @@ centres of the row before that one, so each of its cells is the same
 ground as its mirror. The mesh keeps the half of each below the fold, and
 a model cell there is two mesh cells, one half each.
 
+The cells round the grid's other points meet the fold elsewhere. U
+cells (centred on U points, their corners V points), V cells (corners U
+points) and F cells (corners T points) take `Halo::nemo(pivot, point)`,
+of which `NEMO_F_PIVOT` and `NEMO_T_PIVOT` are the T cells':
+
+| cells | F-point pivot | T-point pivot |
+|-------|---------------|---------------|
+| T, U  | the last row | the last row, the fold through the centres of the one below |
+| V, F  | the last row, the fold through the centres of the one below | the last two rows |
+
+The halo also records which grid it is, so a `MeshSet` pairs a fold
+row's halves by NEMO's mirror for its point and knows the pivot for
+`fill_halo`. U cells at a T pivot and V cells at an F pivot have a side
+through each pivot, its own mirror, which is cut at its lower end.
+
 A wrong layout is refused rather than counted twice. Neighbours that
 don't share corners are refused, and so are cells that overlap, which is
 what a halo left in gives (`QuadMesh::find_overlap`). The flag for the
@@ -469,6 +484,15 @@ use rwarp::mesh::Stagger;
 // uo_file: a U-point field on the file's grid, its halo masked
 set.fill_halo_vector(&mut uo_file, 1, Stagger::U)?;
 ```
+
+A set of U, V or F cells (`Halo::nemo`) takes its own point's fields the
+same way. On both files, sets of each point's cells, their corners
+worked out from the T cells' bounds (V points the middles of the T
+cells' north sides, U points of their east sides, T points their
+centres), cover the cap north of 60 N to 2e-7 of its area. Fields of
+their cells' centres come back to 2e-16 through the set with the halo
+filled, and every kept cell of a fold row through centres pairs with
+NEMO's mirror.
 
 `warp_to_par` gives the same values on several threads, each with a
 `SetTransformer` of its own: `|| SetTransformer::new(&set, &crs, gt,

@@ -179,6 +179,14 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     pivot from the wrong column). On both files, the positions of all
     four points from the T cells' bounds come back exactly, halo masked
     and filled.
+  - Sets of U, V and F cells: `Halo::nemo(pivot, cells)`, with `Pivot`
+    and the cells' `Stagger` (`NEMO_F_PIVOT` and `NEMO_T_PIVOT` are the
+    T cells'). V and F cells at a T pivot drop the last two rows; the
+    fold runs through the centres of the last row kept for T and U cells
+    at a T pivot and for V and F cells at an F pivot. `Halo` records the
+    grid (`nemo: Option<Nemo>`), for `fill_halo`'s pivot and to pair a
+    fold row's halves by NEMO's mirror for the cells' point. On both
+    files, each point's cells cover the cap north of 60 N to 2e-7.
 - `MeshSet::weights_to_par` and `weights_onto_par`: `weights_to` and
   `weights_onto` on up to `threads` threads, the same tables bit for bit.
   Pieces with at least `1 / threads` of the set's cells are measured one

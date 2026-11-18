@@ -10,11 +10,12 @@
 //! cell's split triangles, as in `tests/mesh_glued.rs`.
 
 use controlledburn::{BurnOptions, BurnResult, Coord, Geometry, Polygon};
-use rwarp::mesh::{Band, CellMap, Halo, MeshSet, QuadMesh, Stagger};
+use rwarp::mesh::{Band, CellMap, Halo, MeshSet, Nemo, Pivot, QuadMesh, Stagger};
 use rwarp::CrsTransform;
 use std::f64::consts::TAU;
 
 /// Cell bounds, row-major with the vertex last (CF, SCRIP).
+#[derive(Clone)]
 struct Bounds {
     ncol: usize,
     nrow: usize,
@@ -65,27 +66,42 @@ impl Bounds {
 /// through that row's centres. The pivots are where NEMO has them: column
 /// line 1 (F), or column 1's centre (T), and half way round.
 fn orca(nc: usize, ny: usize, t_pivot: bool) -> Bounds {
+    orca_at(nc, ny, t_pivot, Stagger::T)
+}
+
+/// [`orca`]'s grid, its cells round its `point`s: a T cell's corners are
+/// where its row and column lines cross, a U cell's half a column east of
+/// them, a V cell's half a row north, an F cell's both (so an F cell's
+/// corners are T cells' centres). The first row is collapsed at each.
+fn orca_at(nc: usize, ny: usize, t_pivot: bool, point: Stagger) -> Bounds {
     let p0 = if t_pivot { 1.5 } else { 1.0 };
     let h = 1.0 / (ny as f64 - if t_pivot { 2.5 } else { 2.0 });
-    let corner = |s: usize, j: usize| -> [f64; 2] {
-        let a = (s as f64 - p0) / nc as f64 * TAU;
-        let tau = 1.0 - (j as f64 - 1.0) * h;
+    let (ox, oy) = match point {
+        Stagger::T => (0.0, 0.0),
+        Stagger::U => (0.5, 0.0),
+        Stagger::V => (0.0, 0.5),
+        Stagger::F => (0.5, 0.5),
+    };
+    let corner = |s: f64, j: f64| -> [f64; 2] {
+        let a = (s - p0) / nc as f64 * TAU;
+        let tau = 1.0 - (j - 1.0) * h;
         [
             (tau.abs() * 200.0 + (1.0 - tau.abs()) * 60.0) * a.cos(),
             tau * 200.0 * a.sin(),
         ]
     };
     Bounds::from_cells(nc + 2, ny, |i, j| {
+        let (x, y) = (i as f64 + ox, j as f64 + oy);
         if j == 0 {
             // the first row: each cell collapsed to a point beyond the disk
-            let q = corner(i, 1);
+            let q = corner(x, 1.0 + oy);
             [[q[0] * 1.1, q[1] * 1.1]; 4]
         } else {
             [
-                corner(i, j),
-                corner(i + 1, j),
-                corner(i + 1, j + 1),
-                corner(i, j + 1),
+                corner(x, y),
+                corner(x + 1.0, y),
+                corner(x + 1.0, y + 1.0),
+                corner(x, y + 1.0),
             ]
         }
     })
@@ -341,6 +357,7 @@ fn orca_grids_with_their_halos_match_the_world_clip() {
                 cols,
                 rows: [1, 1],
                 fold_through_centres: t_pivot,
+                ..Halo::NONE
             };
             let m = b.mesh(halo).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!((m.ncol(), m.nrow()), (nc, ny - 2), "{name}");
@@ -622,6 +639,7 @@ fn rings_round_the_pivots() {
                     cols,
                     rows: [1, 1],
                     fold_through_centres: t_pivot,
+                    ..Halo::NONE
                 })
                 .unwrap();
             let sn = snaps(&m);
@@ -646,14 +664,19 @@ fn rings_round_the_pivots() {
 
 /// The ORCA-like grid as a set of one band in its own plane.
 fn orca_set(b: &Bounds, t_pivot: bool) -> MeshSet {
+    orca_set_with(b, if t_pivot { Halo::NEMO_T_PIVOT } else { Halo::NEMO_F_PIVOT })
+}
+
+/// The grid as a set of one band in its own plane, with `halo`.
+fn orca_set_with(b: &Bounds, halo: Halo) -> MeshSet {
     struct Same;
     impl CrsTransform for Same {
         fn convert(&self, x: f64, y: f64) -> Option<(f64, f64)> {
             Some((x, y))
         }
     }
-    let halo = if t_pivot { Halo::NEMO_T_PIVOT } else { Halo::NEMO_F_PIVOT };
-    let bands = [Band { rows: 0..b.nrow - 2, to_world: &Same }];
+    let nr = b.nrow - halo.rows[0] - halo.rows[1];
+    let bands = [Band { rows: 0..nr, to_world: &Same }];
     MeshSet::from_cf_bounds(b.ncol, b.nrow, &b.x, &b.y, halo, &bands, None).unwrap()
 }
 
@@ -1061,6 +1084,184 @@ fn vector_components_turn_round_across_the_fold() {
         s.fill_halo(&mut scalar, 2, Stagger::T).unwrap();
         let f = ((ny - 1) * nx + 3) * 2;
         assert!((scalar[f] + file[f]).abs() < 1e-9 && file[f].abs() > 0.1);
+    }
+}
+
+/// The cells round each of the grid's points, with `Halo::nemo`'s halo,
+/// tile the disk once at either pivot: no overlap, the disk's area, and
+/// polygons round the fold and over the whole disk covered as the world
+/// clip has them. Each other halo of that shape (one row dropped or two,
+/// the fold through the last row's centres or not) is refused or leaves
+/// the disk short.
+#[test]
+fn cells_round_every_point_tile_the_disk_once() {
+    let (nc, ny) = (24, 10);
+    for t_pivot in [false, true] {
+        let pivot = if t_pivot { Pivot::T } else { Pivot::F };
+        for point in POINTS {
+            let name = format!("{pivot:?} pivot, {point:?} cells");
+            let b = orca_at(nc, ny, t_pivot, point);
+            let halo = Halo::nemo(pivot, point);
+            assert_eq!(halo.nemo, Some(Nemo { pivot, cells: point }));
+            let m = b.mesh(halo).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((m.ncol(), m.nrow()), (nc, ny - 1 - halo.rows[1]), "{name}");
+            assert_eq!(m.find_overlap(), None, "{name}");
+            let rim: Vec<[f64; 2]> = (0..nc).map(|c| m.corners(0, c)[0]).collect();
+            let rim_area = shoelace(&rim).abs();
+            assert!((mesh_area(&m) - rim_area).abs() < 1e-9 * rim_area, "{name}: {} vs {rim_area}", mesh_area(&m));
+            let mut n = 0;
+            for (i, rings) in cases(&m, 20261118, 60).iter().enumerate() {
+                if simple(rings) {
+                    check(&format!("{name} case {i}"), &m, rings);
+                    n += 1;
+                }
+            }
+            assert!(n > 40, "{name}: {n} cases");
+            check(&format!("{name} round the fold"), &m, &[circle([0.0, 0.0], 100.0, 37)]);
+            check(&format!("{name} the whole disk"), &m, &[circle([0.0, 0.0], 250.0, 37)]);
+            for rows in [1, 2] {
+                for fold in [false, true] {
+                    if (rows, fold) == (halo.rows[1], halo.fold_through_centres) {
+                        continue;
+                    }
+                    let other = Halo { rows: [1, rows], fold_through_centres: fold, ..halo };
+                    if let Ok(m) = b.mesh(other) {
+                        let short = rim_area - mesh_area(&m);
+                        assert!(short > 1e-3 * rim_area, "{name}: {rows} rows, fold {fold} tiles the disk ({short})");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// U cells at a T pivot and V cells at an F pivot have a side through each
+/// pivot, its own mirror, its two ends one point. Here the ends at column
+/// line 1 meet exactly, so their top end is moved by rounding (1e-9, up or
+/// down): cut at its midpoint, one of the two halved cells beside it
+/// would be inside out; cut at its lower end, the disk is tiled once.
+#[test]
+fn a_pivots_side_apart_by_rounding_is_cut_at_its_end() {
+    let (nc, ny) = (24, 10);
+    for (pivot, point) in [(Pivot::T, Stagger::U), (Pivot::F, Stagger::V)] {
+        for eps in [1e-9, -1e-9] {
+            let name = format!("{pivot:?} pivot, {point:?} cells, {eps:e}");
+            let mut b = orca_at(nc, ny, pivot == Pivot::T, point);
+            let base = b.clone();
+            let nx = b.ncol;
+            // the top end of column line 1 on the last row kept, as the
+            // two cells beside it have it
+            for (i, v) in [(0, 2), (1, 3)] {
+                b.y[((ny - 2) * nx + i) * 4 + v] += eps;
+            }
+            let m = b.mesh(Halo::nemo(pivot, point)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let rim: Vec<[f64; 2]> = (0..nc).map(|c| m.corners(0, c)[0]).collect();
+            let rim_area = shoelace(&rim).abs();
+            assert!((mesh_area(&m) - rim_area).abs() < 1e-9 * rim_area, "{name}");
+            assert_eq!(m.find_overlap(), None, "{name}");
+            assert!(base.mesh(Halo::nemo(pivot, point)).is_ok());
+        }
+    }
+}
+
+/// Sets of each point's cells: a field of each cell's centre to the set
+/// and back, `fill_halo` at the set's own points putting the halo back,
+/// at either pivot. Where the fold runs through the last row's centres,
+/// its halves are paired by NEMO's mirror for the point and give the
+/// model cell their mean by area.
+#[test]
+fn sets_of_every_points_cells_go_to_the_file_and_back() {
+    let (nc, ny) = (24, 10);
+    for t_pivot in [false, true] {
+        let pivot = if t_pivot { Pivot::T } else { Pivot::F };
+        for point in POINTS {
+            let name = format!("{pivot:?} pivot, {point:?} cells");
+            let b = orca_at(nc, ny, t_pivot, point);
+            let halo = Halo::nemo(pivot, point);
+            let s = orca_set_with(&b, halo);
+            let nx = b.ncol;
+            let nr = ny - 1 - halo.rows[1];
+            assert_eq!((s.size(), s.file_size(), s.halo()), ([nc, nr], [nx, ny], halo), "{name}");
+            let centre = |k: usize| {
+                [(0..4).map(|v| b.x[k * 4 + v]).sum::<f64>() / 4.0, (0..4).map(|v| b.y[k * 4 + v]).sum::<f64>() / 4.0]
+            };
+            let file: Vec<f64> = (0..nx * ny).flat_map(centre).collect();
+            let field = s.from_file_layout(&file, 2).unwrap();
+            let mut back = s.to_file_layout(&field, 2, f64::NAN).unwrap();
+            s.fill_halo(&mut back, 2, point).unwrap();
+            for k in 2 * nx..file.len() {
+                assert!((back[k] - file[k]).abs() < 1e-9, "{name}: ({}, {}) {} vs {}", k / 2 / nx, k / 2 % nx, back[k], file[k]);
+            }
+            if halo.fold_through_centres {
+                let k = match point {
+                    Stagger::T => 2,
+                    Stagger::U | Stagger::V => 1,
+                    Stagger::F => 0,
+                };
+                let last = nr - 1;
+                let field: Vec<f64> = (0..nc * nr).map(|c| (c % nc) as f64).collect();
+                let back = s.to_file_layout(&field, 1, -1.0).unwrap();
+                let area = |c: usize| {
+                    let (p, r, col) = s.locate_cell(last, c).unwrap();
+                    p.mesh().cell_area(r, col)
+                };
+                let mut selves = 0;
+                for c in 0..nc {
+                    let m = (k + nc - c) % nc;
+                    let got = back[(last + 1) * nx + c];
+                    let want = if m == c {
+                        selves += 1;
+                        c as f64
+                    } else {
+                        (area(c) * c as f64 + area(m) * m as f64) / (area(c) + area(m))
+                    };
+                    assert!((got - want).abs() < 1e-12, "{name}: col {c} (mirror {m}): {got} vs {want}");
+                }
+                // the pivots are their own mirrors at T and F cells
+                assert_eq!(selves, if k == 1 { 0 } else { 2 }, "{name}");
+            }
+        }
+    }
+}
+
+/// A fold row whose cells all collapse to one point (a polar cap: rings in
+/// to the centre, the last row and its halo at it): every cell matches
+/// every other, and only NEMO's mirror for the cells' point pairs them,
+/// the pivots with themselves. With no area, a pair's mean is the plain
+/// one, so each cell's value says which it was paired with.
+#[test]
+fn collapsed_fold_cells_pair_by_nemos_mirror() {
+    let (nc, ny) = (24, 7);
+    let nx = nc + 2;
+    let ring = |j: usize, i: usize| -> [f64; 2] {
+        let r = 200.0 * (ny as f64 - 2.0 - j as f64).max(0.0) / (ny as f64 - 3.0);
+        let a = i as f64 / nc as f64 * TAU;
+        [r * a.cos(), r * a.sin()]
+    };
+    let b = Bounds::from_cells(nx, ny, |i, j| {
+        if j == 0 {
+            let q = ring(1, i);
+            [[q[0] * 1.1, q[1] * 1.1]; 4]
+        } else {
+            [ring(j, i), ring(j, i + 1), ring(j + 1, i + 1), ring(j + 1, i)]
+        }
+    });
+    for (pivot, point, k) in [(Pivot::T, Stagger::T, 2), (Pivot::T, Stagger::U, 1), (Pivot::F, Stagger::V, 1), (Pivot::F, Stagger::F, 0)] {
+        let name = format!("{pivot:?} pivot, {point:?} cells");
+        let halo = Halo::nemo(pivot, point);
+        assert!(halo.fold_through_centres, "{name}");
+        let s = orca_set_with(&b, halo);
+        let nr = ny - 2;
+        let field: Vec<f64> = (0..nc * nr).map(|c| (c % nc) as f64).collect();
+        let back = s.to_file_layout(&field, 1, -1.0).unwrap();
+        let vector = s.to_file_layout_vector(&field, 1, -1.0).unwrap();
+        for c in 0..nc {
+            let m = (k + nc - c) % nc;
+            let got = back[nr * nx + c];
+            assert_eq!(got, (c + m) as f64 / 2.0, "{name}: col {c} paired with {}, not {m}", 2.0 * got - c as f64);
+            let want = if m == c { c as f64 } else { (c as f64 - m as f64) / 2.0 };
+            assert_eq!(vector[nr * nx + c], want, "{name}: col {c}, vector");
+        }
     }
 }
 
