@@ -213,6 +213,8 @@
 //! only when its sample point lands on a source pixel at least half
 //! covered (nearest likewise). There is no blending with the destination.
 
+use std::sync::Mutex;
+
 use crate::cutline::{Cutline, CutlineRule, BAND_DENSITY_THRESHOLD, SRC_DENSITY_THRESHOLD};
 use crate::mesh::{QuadMesh, Tiles};
 use crate::transform::{transform_scanline, SourceSheet, SourceWrap, Transformer};
@@ -1742,61 +1744,221 @@ pub fn warp_to<S: Sample, D: Sample>(
     dst_nrow: usize,
     opts: &WarpOptions,
 ) -> Vec<D> {
-    let nbands = src.nbands;
-    assert_eq!(src.data.len(), src.ncol * src.nrow * nbands, "source buffer size mismatch");
-    assert!(opts.mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
+    let prep = Prep::<D>::new(src, opts);
+    if prep.outside {
+        return prep.out_spec.filled(dst_ncol * dst_nrow);
+    }
+    let img = prep.img(src, opts);
+    let scale = kernel_scale(transformer, dst_ncol, dst_nrow, opts);
+    let mut out = prep.out_spec.filled(dst_ncol * dst_nrow);
+    let rows = Rows { ncol: dst_ncol, nrow: dst_nrow, scale };
+    warp_rows(transformer, src, &img, &prep.out_spec, rows, 0..dst_nrow, opts, &mut out, &mut None);
+    out
+}
 
-    let out_spec = Output::<D>::new(S::DATA_TYPE, nbands, opts);
+/// [`warp`] on up to `threads` threads; see [`warp_to_par`].
+pub fn warp_par<T: Sample + Sync + Send, X: Transformer>(
+    transformer: impl Fn() -> Result<X, String> + Sync,
+    src: &SourceBuffer<'_, T>,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions,
+    threads: usize,
+) -> Result<Vec<T>, String> {
+    warp_to_par::<T, T, X>(transformer, src, dst_ncol, dst_nrow, opts, threads)
+}
 
-    // The cutline's density over the source buffer (GDAL's
-    // pafUnifiedSrcDensity). A buffer entirely inside needs none, as in
-    // GDAL; one entirely outside gives no values.
-    let mut density = Vec::new();
-    let mut cut = None;
-    if let Some(c) = &opts.cutline {
-        c.density_into(src.col_off, src.row_off, src.ncol, src.nrow, &mut density);
-        if density.iter().all(|&d| d == 0.0) {
-            return out_spec.filled(dst_ncol * dst_nrow);
+/// [`warp_to`] on up to `threads` threads (0 for all available), with the
+/// same values, bit for bit.
+///
+/// - **A transformer per thread.** A [`Transformer`] needn't be `Sync`
+///   (one over libproj isn't), so `transformer()` builds one on each
+///   thread, the calling thread's first. A `Sync` one serves every thread
+///   borrowed: `|| Ok(&t)`.
+/// - **Bands of rows.** The destination's rows are cut into about four
+///   bands a thread, and the threads take them in turn, each band warped
+///   as [`warp_to`] warps those rows. Everything a warp works out once is
+///   worked out once here, on the calling thread: the cutline's density
+///   over the source, and the kernel scale over the whole destination
+///   ([`KernelScaling::WidenWhenDownsampling`]). The exact footprint's
+///   lattice is built once a thread and moved to each band's first row.
+/// - **The same values.** Each row is computed from the same points by the
+///   same steps as on one thread.
+///
+/// With `threads = 1` (or one row) nothing is spawned, as on wasm, and
+/// this is [`warp_to`] through one `transformer()`. Errors with the first
+/// `transformer()` error, or if a thread panicked.
+pub fn warp_to_par<S: Sample + Sync, D: Sample + Send + Sync, X: Transformer>(
+    transformer: impl Fn() -> Result<X, String> + Sync,
+    src: &SourceBuffer<'_, S>,
+    dst_ncol: usize,
+    dst_nrow: usize,
+    opts: &WarpOptions,
+    threads: usize,
+) -> Result<Vec<D>, String> {
+    let threads = match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+    let first = transformer()?;
+    if threads <= 1 || dst_nrow <= 1 || dst_ncol == 0 {
+        return Ok(warp_to(&first, src, dst_ncol, dst_nrow, opts));
+    }
+    let prep = Prep::<D>::new(src, opts);
+    if prep.outside {
+        return Ok(prep.out_spec.filled(dst_ncol * dst_nrow));
+    }
+    let img = prep.img(src, opts);
+    let rows = Rows { ncol: dst_ncol, nrow: dst_nrow, scale: kernel_scale(&first, dst_ncol, dst_nrow, opts) };
+    let mut out = prep.out_spec.filled(dst_ncol * dst_nrow);
+    let per = dst_nrow.div_ceil(threads * 4).max(1);
+    let bands: Vec<(usize, &mut [D])> = out.chunks_mut(per * dst_ncol * src.nbands).enumerate().rev().collect();
+    let n = bands.len();
+    let bands = Mutex::new(bands);
+    // take bands in turn, warping each through `t`
+    let work = |t: &X| {
+        let mut lat = None;
+        loop {
+            let Some((i, band)) = bands.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
+            let r0 = i * per;
+            warp_rows(t, src, &img, &prep.out_spec, rows, r0..(r0 + per).min(dst_nrow), opts, band, &mut lat);
         }
-        if !density.iter().all(|&d| d >= 1.0) {
-            cut = Some(Cut { density: &density[..], exact: c.rule == CutlineRule::Exact });
+    };
+    let (failed, panicked) = std::thread::scope(|s| {
+        let hs: Vec<_> = (1..threads.min(n))
+            .map(|_| {
+                s.spawn(|| -> Result<(), String> {
+                    let t = transformer()?;
+                    work(&t);
+                    Ok(())
+                })
+            })
+            .collect();
+        // the calling thread works too; every thread is joined, so the
+        // scope has none left to panic over
+        let mut panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&first))).is_err();
+        let mut failed = None;
+        for h in hs {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => { failed.get_or_insert(e); }
+                Err(_) => panicked = true,
+            }
         }
+        (failed, panicked)
+    });
+    if panicked {
+        return Err("a warp thread panicked".into());
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    Ok(out)
+}
+
+/// What a warp works out once for all its rows: how values are written,
+/// and the cutline's density over the source buffer (GDAL's
+/// pafUnifiedSrcDensity). A buffer entirely inside needs none, as in
+/// GDAL; one entirely outside (`outside`) gives no values.
+struct Prep<D> {
+    out_spec: Output<D>,
+    density: Vec<f32>,
+    /// With a cutline the buffer is partly inside: whether its rule is
+    /// [`CutlineRule::Exact`].
+    cut: Option<bool>,
+    outside: bool,
+}
+
+impl<D: Sample> Prep<D> {
+    fn new<S: Sample>(src: &SourceBuffer<'_, S>, opts: &WarpOptions) -> Self {
+        let nbands = src.nbands;
+        assert_eq!(src.data.len(), src.ncol * src.nrow * nbands, "source buffer size mismatch");
+        assert!(opts.mask_band.map_or(true, |a| a < nbands), "mask_band out of range");
+        let out_spec = Output::<D>::new(S::DATA_TYPE, nbands, opts);
+        let mut density = Vec::new();
+        let (mut cut, mut outside) = (None, false);
+        if let Some(c) = &opts.cutline {
+            c.density_into(src.col_off, src.row_off, src.ncol, src.nrow, &mut density);
+            if density.iter().all(|&d| d == 0.0) {
+                outside = true;
+            } else if !density.iter().all(|&d| d >= 1.0) {
+                cut = Some(c.rule == CutlineRule::Exact);
+            }
+        }
+        Prep { out_spec, density, cut, outside }
     }
 
-    let img = Interleaved {
-        src: src.data, ncol: src.ncol, nrow: src.nrow, nb: nbands,
-        mask: opts.mask_band, nodata: out_spec.src_nodata::<S>(), rule: opts.band_nodata,
-        cut,
-    };
-    let alg = opts.alg;
-    let (sx, sy) = match opts.scaling {
+    /// The source buffer as the kernels read it.
+    fn img<'a, S: Sample>(&'a self, src: &SourceBuffer<'a, S>, opts: &WarpOptions) -> Interleaved<'a, S> {
+        Interleaved {
+            src: src.data, ncol: src.ncol, nrow: src.nrow, nb: src.nbands,
+            mask: opts.mask_band, nodata: self.out_spec.src_nodata::<S>(), rule: opts.band_nodata,
+            cut: self.cut.map(|exact| Cut { density: &self.density[..], exact }),
+        }
+    }
+}
+
+/// The kernel scale `(sx, sy)` of a warp of the whole destination window
+/// ([`WarpOptions::scaling`]).
+fn kernel_scale(transformer: &impl Transformer, dst_ncol: usize, dst_nrow: usize, opts: &WarpOptions) -> (f64, f64) {
+    match opts.scaling {
         KernelScaling::Point => (1.0, 1.0),
         KernelScaling::WidenWhenDownsampling => {
             estimate_scale(transformer, dst_ncol, dst_nrow, opts.dst_col_off, opts.dst_row_off)
         }
         KernelScaling::Fixed { x, y } => (x, y),
-    };
-    if alg.is_area() {
-        return warp_area(transformer, &img, (src.col_off as f64, src.row_off as f64), dst_ncol, dst_nrow, opts, (sx, sy), &out_spec);
     }
+}
+
+/// The whole destination window a band of rows is part of: its size, and
+/// the kernel scale worked out over it.
+#[derive(Clone, Copy)]
+struct Rows {
+    ncol: usize,
+    nrow: usize,
+    scale: (f64, f64),
+}
+
+/// Rows `band` of the destination window `rows` (at the offset in
+/// `opts`), into `out`, those rows of the output, filled. The exact
+/// footprint's lattice is kept in `lat` for the thread's next band.
+#[allow(clippy::too_many_arguments)]
+fn warp_rows<S: Sample, D: Sample>(
+    transformer: &impl Transformer,
+    src: &SourceBuffer<'_, S>,
+    img: &Interleaved<'_, S>,
+    out_spec: &Output<D>,
+    rows: Rows,
+    band: std::ops::Range<usize>,
+    opts: &WarpOptions,
+    out: &mut [D],
+    lat: &mut Option<Lattice>,
+) {
+    let (dst_ncol, nbands, alg) = (rows.ncol, src.nbands, opts.alg);
+    let (sx, sy) = rows.scale;
+    if alg.is_area() {
+        let src_off = (src.col_off as f64, src.row_off as f64);
+        warp_area(transformer, img, src_off, rows, band, opts, out_spec, out, lat);
+        return;
+    }
+    let rows = band;
     let widened = Widened::new(alg, sx, sy);
     // GDAL blends a partial-density result with the destination
     // (GWKSetPixelValueRealT); see the module documentation.
-    let blend = cut.is_some_and(|c| !c.exact);
+    let blend = img.cut.is_some_and(|c| !c.exact);
 
-    let mut out = out_spec.filled(dst_ncol * dst_nrow);
     let mut sc = Scratch::new(nbands);
     // GWKOneSourceCornerFailsToReproject, on first need.
     let mut corner_fails: Option<bool> = None;
     let mut on_edge = |p: usize| -> Option<usize> {
         if *corner_fails.get_or_insert_with(|| one_source_corner_fails(transformer, src)) {
-            adjust_on_edge(transformer, src, &img, p)
+            adjust_on_edge(transformer, src, img, p)
         } else {
             None
         }
     };
 
-    for dst_row in 0..dst_nrow {
+    for dst_row in rows.clone() {
         let (mut src_x, mut src_y, mut ok) =
             transform_scanline(transformer, dst_row, dst_ncol, opts.dst_col_off, opts.dst_row_off);
 
@@ -1808,7 +1970,7 @@ pub fn warp_to<S: Sample, D: Sample>(
             }
             let buf_x = src_x[dst_col] - src.col_off as f64;
             let buf_y = src_y[dst_col] - src.row_off as f64;
-            let o = (dst_row * dst_ncol + dst_col) * nbands;
+            let o = ((dst_row - rows.start) * dst_ncol + dst_col) * nbands;
 
             if alg == ResampleAlg::NearestNeighbour {
                 // Test before casting, as GDAL does, so (-1, 0) is not
@@ -1875,7 +2037,6 @@ pub fn warp_to<S: Sample, D: Sample>(
             }
         }
     }
-    out
 }
 
 /// Writing results: the working type, the destination nodata per band, and
@@ -2743,41 +2904,42 @@ fn warp_area<T: Sample, D: Sample>(
     transformer: &impl Transformer,
     img: &Interleaved<'_, T>,
     src_off: (f64, f64),
-    dst_ncol: usize,
-    dst_nrow: usize,
+    rows: Rows,
+    band: std::ops::Range<usize>,
     opts: &WarpOptions,
-    scale: (f64, f64),
     out_spec: &Output<D>,
-) -> Vec<D> {
+    out: &mut [D],
+    lat: &mut Option<Lattice>,
+) {
     let nb = img.nb;
     match opts.alg {
         ResampleAlg::Min | ResampleAlg::Max => {
             let red = AreaExtreme { max: opts.alg == ResampleAlg::Max, best: vec![None; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
+            warp_area_with(transformer, img, src_off, rows, band, opts, red, out_spec, out, lat)
         }
         ResampleAlg::Med | ResampleAlg::Q1 | ResampleAlg::Q3 => {
             let q = match opts.alg { ResampleAlg::Q1 => 0.25, ResampleAlg::Q3 => 0.75, _ => 0.5 };
             let red = AreaQuantile { q, vals: vec![Vec::new(); nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
+            warp_area_with(transformer, img, src_off, rows, band, opts, red, out_spec, out, lat)
         }
         ResampleAlg::Rms => {
             let red = AreaRms { sumsq: vec![0.0; nb], total: vec![0.0; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
+            warp_area_with(transformer, img, src_off, rows, band, opts, red, out_spec, out, lat)
         }
         ResampleAlg::Mode => {
             let red = AreaMode { ties: opts.mode_ties, bins: vec![Vec::new(); nb], mode: vec![None; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
+            warp_area_with(transformer, img, src_off, rows, band, opts, red, out_spec, out, lat)
         }
         _ if opts.average.active() => {
             let red = AreaMeanThresholds {
                 th: &opts.average, invalid: 0.0, excluded: 0.0, regular: 0.0,
                 excluded_counts: vec![0; opts.average.excluded_values.len()], mean: vec![0.0; nb],
             };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
+            warp_area_with(transformer, img, src_off, rows, band, opts, red, out_spec, out, lat)
         }
         _ => {
             let red = AreaMean { mean: vec![0.0; nb], total: vec![0.0; nb] };
-            warp_area_with(transformer, img, src_off, dst_ncol, dst_nrow, opts, scale, red, out_spec)
+            warp_area_with(transformer, img, src_off, rows, band, opts, red, out_spec, out, lat)
         }
     }
 }
@@ -2787,38 +2949,48 @@ fn warp_area_with<T: Sample, D: Sample, R: AreaReducer<T>>(
     transformer: &impl Transformer,
     img: &Interleaved<'_, T>,
     src_off: (f64, f64),
-    dst_ncol: usize,
-    dst_nrow: usize,
+    rows: Rows,
+    band: std::ops::Range<usize>,
     opts: &WarpOptions,
-    scale: (f64, f64),
     mut red: R,
     out_spec: &Output<D>,
-) -> Vec<D> {
-    let nb = img.nb;
-    let mut out = out_spec.filled(dst_ncol * dst_nrow);
+    out: &mut [D],
+    lat: &mut Option<Lattice>,
+) {
+    let (nb, dst_ncol) = (img.nb, rows.ncol);
     let mut row_res: Vec<Res<T>> = vec![Res::None; dst_ncol * nb];
-    let mut exact = match opts.footprint {
+    let exact = match opts.footprint {
         Footprint::Exact { densify } => {
-            let src = (src_off.0 as usize, src_off.1 as usize, img.ncol, img.nrow);
-            Some(Lattice::new(transformer, dst_ncol, densify.max(1), (opts.dst_col_off, opts.dst_row_off), src))
+            // the band's lattice starts at its first row; turns are found
+            // over the whole window, so every band finds the same
+            let at = (opts.dst_col_off, opts.dst_row_off + band.start);
+            match lat {
+                Some(l) => l.start(transformer, at.1),
+                None => {
+                    let src = (src_off.0 as usize, src_off.1 as usize, img.ncol, img.nrow);
+                    *lat = Some(Lattice::new(transformer, dst_ncol, densify.max(1), at, src, (opts.dst_row_off, rows.nrow)));
+                }
+            }
+            lat.as_mut()
         }
         Footprint::GdalBox => None,
     };
-    for dst_row in 0..dst_nrow {
+    let mut exact = exact;
+    for dst_row in band.clone() {
         row_res.fill(Res::None);
-        match exact.as_mut() {
-            None => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, scale, &mut red, &mut row_res),
+        match exact.as_deref_mut() {
+            None => area_row_gdal_box(transformer, img, src_off, dst_row, dst_ncol, opts, rows.scale, &mut red, &mut row_res),
             Some(lat) => {
-                lat.row(transformer, dst_row);
+                lat.row(transformer, dst_row - band.start);
                 area_row_exact(lat, img, src_off, dst_ncol, &mut red, &mut row_res);
             }
         }
-        let row_out = &mut out[dst_row * dst_ncol * nb..(dst_row + 1) * dst_ncol * nb];
+        let r = dst_row - band.start;
+        let row_out = &mut out[r * dst_ncol * nb..(r + 1) * dst_ncol * nb];
         for (i, (o, &r)) in row_out.iter_mut().zip(row_res.iter()).enumerate() {
             if let Some(v) = out_spec.result(r, i % nb) { *o = v; }
         }
     }
-    out
 }
 
 /// One destination row under GDAL's box footprint (`GWKAverageOrModeThread`
@@ -3065,10 +3237,14 @@ impl Lattice {
     /// The lattice of a destination window `ncol` pixels wide at offset
     /// `(dst_col_off, dst_row_off)`, against the source window `src`
     /// (`col_off, row_off, ncol, nrow` in the full source), ready for
-    /// [`Lattice::row`]`(0)`.
+    /// [`Lattice::row`]`(0)`. `window` is the first row and the row count
+    /// of the whole destination window the lattice is part of: with cells
+    /// in several worlds, each world's turn is found over it
+    /// ([`Lattice::find_turns`]), so a band of its rows finds the same.
     pub(crate) fn new(
         transformer: &impl Transformer, ncol: usize, densify: usize,
         (dst_col_off, dst_row_off): (usize, usize), src: (usize, usize, usize, usize),
+        window: (usize, usize),
     ) -> Self {
         let cells = transformer.source_cells();
         let worlds = cells.map_or(1, |cells| cells.worlds().max(1));
@@ -3123,12 +3299,22 @@ impl Lattice {
             sheets, multi, areas, areas_ncol: src.2, turn: vec![0.0; worlds], outline: f64::NAN,
             mesh_x, world: Vec::new(), ix: Vec::new(), iy: Vec::new(),
         };
-        let world = lat.in_world();
-        for k in 0..worlds {
-            lat.lines[k].bot.fill_row((lat.xoff, lat.yoff), ncol, densify, 0);
-            lat.lines[k].bot.transform(transformer, world.then_some(k));
+        if lat.multi {
+            lat.find_turns(transformer, window);
         }
+        lat.start(transformer, dst_row_off);
         lat
+    }
+
+    /// Move to the destination row `dst_row_off` of the window, ready for
+    /// [`Lattice::row`]`(0)` there: its row line transformed in each world.
+    pub(crate) fn start(&mut self, transformer: &impl Transformer, dst_row_off: usize) {
+        self.yoff = dst_row_off as f64;
+        let world = self.in_world();
+        for k in 0..self.lines.len() {
+            self.lines[k].bot.fill_row((self.xoff, self.yoff), self.ncol, self.densify, 0);
+            self.lines[k].bot.transform(transformer, world.then_some(k));
+        }
     }
 
     /// Whether outlines are measured in source world coordinates, against
@@ -3192,32 +3378,31 @@ impl Lattice {
                 }
             }
         }
-        if self.multi {
-            self.find_turns(transformer, row);
-        }
     }
 
-    /// For each world whose turn isn't known yet: the sign of a small
-    /// triangle's area at pixel centres along destination row `row`, by
-    /// majority. A destination pixel's outline in that world has the same
+    /// Each world's turn: the sign of a small triangle's area at pixel
+    /// centres on a grid of up to 9 by 9 over the destination window
+    /// `(row_off, nrow)` (the lattice's columns), by majority; 0 when none
+    /// transforms. A destination pixel's outline in that world has the same
     /// sign unless it winds round a point the world can't hold (the far
     /// pole of a polar projection), where it comes out inside out.
-    fn find_turns(&mut self, transformer: &impl Transformer, row: usize) {
+    fn find_turns(&mut self, transformer: &impl Transformer, (row_off, nrow): (usize, usize)) {
         let Some(cells) = transformer.source_cells() else { return };
         const H: f64 = 1e-3;
-        let n = self.ncol.min(9);
+        let (n, m) = (self.ncol.min(9), nrow.min(9));
         for k in 0..self.turn.len() {
-            if self.turn[k] != 0.0 { continue; }
-            let (mut x, mut y) = (Vec::with_capacity(3 * n), Vec::with_capacity(3 * n));
-            for i in 0..n {
-                let px = self.xoff + (i as f64 + 0.5) * self.ncol as f64 / n as f64;
-                let py = self.yoff + row as f64 + 0.5;
-                x.extend([px, px + H, px]);
-                y.extend([py, py, py + H]);
+            let (mut x, mut y) = (Vec::with_capacity(3 * n * m), Vec::with_capacity(3 * n * m));
+            for j in 0..m {
+                for i in 0..n {
+                    let px = self.xoff + (i as f64 + 0.5) * self.ncol as f64 / n as f64;
+                    let py = row_off as f64 + (j as f64 + 0.5) * nrow as f64 / m as f64;
+                    x.extend([px, px + H, px]);
+                    y.extend([py, py, py + H]);
+                }
             }
             let ok = cells.dst_to_world_in(k, &mut x, &mut y);
             let mut votes = 0i64;
-            for i in 0..n {
+            for i in 0..n * m {
                 let j = 3 * i;
                 if !(ok[j] && ok[j + 1] && ok[j + 2]) { continue; }
                 let o = (x[j + 1] - x[j]) * (y[j + 2] - y[j]) - (y[j + 1] - y[j]) * (x[j + 2] - x[j]);

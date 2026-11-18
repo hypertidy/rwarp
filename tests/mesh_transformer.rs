@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use rwarp::mesh::{CellMap, MeshTransformer, QuadMesh};
-use rwarp::warp::{warp_to, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{warp_to, warp_to_par, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::weights::{
     exact_weights, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights,
 };
@@ -153,6 +153,9 @@ fn warp_exact_average_is_apply_frac_area() {
         eprintln!("densify {densify}: {computed} pixels computed, {differ} differ");
         assert_eq!(differ, 0);
         assert!(computed > 1000, "only {computed} pixels computed");
+        // on threads, a transformer (and its mesh) each: the same values
+        let par = warp_to_par::<f64, f64, _>(|| Ok(transformer(GT)), &buf, DW, DH, &opts, 4).unwrap();
+        assert!(warped.iter().zip(&par).all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 }
 

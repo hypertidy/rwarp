@@ -1062,9 +1062,14 @@ with a pair of `CrsTransform`s a band. It borrows the set.
   weights) and 1.98 s (2.60); ORCA2 0.88 s (1.21) and 2.28 s (3.58).
   Bilinear and nearest 0.02 s, `Mode` 0.9 s. A 50 km south-polar LAEA
   grid, 160 x 160 pixels round the pole: no pixel takes the north band.
-- **Not built.** Threads: `warp()` is one pass on the calling thread; a
-  plan's chunks are separate calls. A source buffer is the set's size:
-  the caller drops the file's halo.
+- **Threads** came after (2026-11-18): `warp_to_par` takes a closure
+  that builds a `SetTransformer` on each thread. ORCA2's `Average` at
+  densify 8: 2.3 s on one thread, 0.34 s on 8, 0.14 s on 32, bit for bit.
+  The lattice's turns are now found over the whole destination window,
+  on a grid of up to 9 by 9 pixel centres, when it is built (they were
+  found along its first rows), so every band of rows finds the same.
+- **Not built.** A source buffer is the set's size: the caller drops the
+  file's halo.
 
 ### The exact footprint at the antimeridian
 

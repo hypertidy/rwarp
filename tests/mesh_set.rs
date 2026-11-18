@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use controlledburn::{BurnMode, BurnResult, Coord, Geometry, Polygon};
 use rwarp::mesh::{Band, Halo, MeshSet, MeshTransformer, SetTransformer, WORLD_GT};
 use rwarp::transform::{CenterLong, GenImgProjTransformer};
-use rwarp::warp::{warp_to, DstNodata, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
+use rwarp::warp::{warp_to, warp_to_par, DstNodata, Footprint, ResampleAlg, SourceBuffer, WarpOptions};
 use rwarp::weights::{exact_weights, lonlat_measure, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
 use rwarp::{CrsTransform, Transformer};
 
@@ -941,5 +941,26 @@ fn a_set_of_one_piece_is_its_mesh() {
         eprintln!("{alg:?}: {computed} pixels computed, {differ} differ");
         assert_eq!(differ, 0, "{alg:?}");
         assert!(computed > 72 * 18 / 3, "{alg:?}: {computed}");
+    }
+}
+
+/// On several threads, each with a transformer of its own over the set:
+/// `warp_to`'s values bit for bit, area methods and point kernels, and
+/// the target round the far pole too.
+#[test]
+fn warp_par_from_the_set_is_warp() {
+    let land = land();
+    let s = set(&MOVED, Some(&land)).unwrap();
+    let t = set_transformer(&s, GT);
+    let data: Vec<f64> = (0..NC * NR).map(|k| 10.0 + ((k % NC) as f64 * 0.4).sin() * ((k / NC) as f64 * 0.3).cos()).collect();
+    let buf = SourceBuffer { data: &data, ncol: NC, nrow: NR, nbands: 1, col_off: 0, row_off: 0 };
+    for alg in [ResampleAlg::Average, ResampleAlg::Mode, ResampleAlg::Max, ResampleAlg::Bilinear, ResampleAlg::NearestNeighbour] {
+        let opts = WarpOptions::new(alg).with_footprint(Footprint::Exact { densify: 2 }).with_dst_nodata(DstNodata::Value(-1.0));
+        let one = warp_to::<f64, f64>(&t, &buf, GW, GH, &opts);
+        for threads in [0, 3] {
+            let par = warp_to_par::<f64, f64, _>(|| Ok(set_transformer(&s, GT)), &buf, GW, GH, &opts, threads).unwrap();
+            let differ = one.iter().zip(&par).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(differ, 0, "{alg:?}, {threads} threads");
+        }
     }
 }

@@ -155,6 +155,19 @@ All notable changes to rwarp. Dates are when the change reached `main`.
       1 m and 0.92 s at 0.01 m (2.2 s with `burn_par`).
   - New dependency: bigcurve 0.3 (pure Rust, no dependencies of its own,
     builds for wasm).
+- `warp::warp_par` and `warp_to_par`: `warp` and `warp_to` on up to
+  `threads` threads, with the same values bit for bit.
+  - Each thread builds its own transformer with a closure, as GDAL's
+    `-wo NUM_THREADS` clones one a thread (a libproj transformer can't be
+    shared). It takes bands of the target's rows from one queue.
+  - What a warp works out once (the cutline's density over the source,
+    the kernel scale over the whole target) is worked out once. The exact
+    footprint's lattice is built once a thread and moved to each band.
+  - A 0.1 degree global grid to 2000 x 2000 south polar stereographic
+    pixels through libproj: bilinear 0.48 s on one thread, 0.08 s on 8;
+    the exact-footprint average 3.4 s and 0.45 s.
+  - `Transformer` for `&T`, so a `Sync` transformer serves every thread
+    as `|| Ok(&t)`.
 - `mesh::SetTransformer`: a `MeshSet` as a warp source (stage 4i of
   `design/curvilinear-frontend.md`, #37), for `warp()` and
   `exact_weights` from a whole ocean grid in pieces with every method.
