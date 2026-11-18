@@ -49,6 +49,17 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
   the Get started vignette (#74). It moved to rwarp 0.5.0 on
   2026-11-18, its tests unchanged.
 
+## Since 0.5.0
+
+In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
+
+- **Curvilinear stage 5 (#38, closed 2026-11-18)**, 5a and 5b in
+  `curvilinear-frontend.md`: `Footprint::Adaptive` and
+  `WeightOptions::refine_tolerance`, the exact footprint's edges refined
+  by bigcurve (#103), and `burn_from` on a `QuadMesh` or `Rectilinear`
+  for polygons in another CRS (#104).
+- **#76** fixed (#101); Open says what rwarp-r needs for it.
+
 ## Open
 
 - **Left out of stage 4** (#37's closing comment), each an issue if
@@ -56,6 +67,10 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
   TempestRemap is an oracle only for regular grids), and cheaper libproj
   copies for the threads (`proj_clone`, which the `proj` crate doesn't
   expose).
+- **Left out of stage 5** (#38's closing comment), each an issue if
+  wanted: great-circle polygon edges for `burn_from` (close to #41), a
+  tolerance in cells rather than world units, and bilinear cells
+  through bigcurve.
 - **#76** is fixed in the crate (#101; 0.5.1, unreleased): with
   `split_antimeridian`, a full-width window with no jump takes GDAL's
   fill ratio split again. rwarp-r gets it with its next crate update;
@@ -64,9 +79,8 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 
 ## Next, in order
 
-1. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
-   for reprojected polygons and footprint edges), conservative stage 5
-   (#39, meshes) and 6 (#40, second order).
+1. **The next stages on the board**: conservative stage 5 (#39,
+   meshes) and 6 (#40, second order).
 2. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
    C4 (#48 to #51).
 3. **The rest of controlledburn 0.3**: `burn_window` could replace
