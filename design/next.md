@@ -31,9 +31,9 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 - **Curvilinear stage 3 (#36)**: the exact footprint over geolocation
   sources measures in their world coordinates, across the antimeridian
   and round the poles (#70, #71, #72).
-- **Stage 4 (#37)**, all of 4a to 4i in `curvilinear-frontend.md`: the
-  walk across seams and folds, CF bounds and halos (N3), ESMF on a
-  tripolar grid, a mesh as a warp source and target, a declared period,
+- **Stage 4 (#37, closed 2026-11-18)**, all of 4a to 4i in
+  `curvilinear-frontend.md`: the walk across seams and folds, CF bounds
+  and halos (N3), ESMF on a tripolar grid, a mesh as a warp source and target, a declared period,
   `MeshSet` for a whole ocean grid in pieces with weights, burning
   (serial and threaded, projection on the threads) and `warp()` from it
   (`SetTransformer`). Then the file's layout and NEMO's halo exchange:
@@ -51,7 +51,12 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 
 ## Open
 
-- **#76** is fixed in the crate (0.5.1, unreleased): with
+- **Left out of stage 4** (#37's closing comment), each an issue if
+  wanted: TempestRemap on the tripolar grid (ESMF was run there;
+  TempestRemap is an oracle only for regular grids), and cheaper libproj
+  copies for the threads (`proj_clone`, which the `proj` crate doesn't
+  expose).
+- **#76** is fixed in the crate (#101; 0.5.1, unreleased): with
   `split_antimeridian`, a full-width window with no jump takes GDAL's
   fill ratio split again. rwarp-r gets it with its next crate update;
   its docs already say `split_antimeridian = FALSE` is gdalwarp's plan,
@@ -59,15 +64,12 @@ Everything from #64 to #98, by the changelog's 0.5.0 section:
 
 ## Next, in order
 
-1. **Stage 4 (#37)** is built; it can close. The one item left out is
-   cheaper libproj copies for the threads (`proj_clone`, which the
-   `proj` crate doesn't expose).
-2. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
+1. **The next stages on the board**: curvilinear stage 5 (#38, bigcurve
    for reprojected polygons and footprint edges), conservative stage 5
    (#39, meshes) and 6 (#40, second order).
-3. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
+2. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
    C4 (#48 to #51).
-4. **The rest of controlledburn 0.3**: `burn_window` could replace
+3. **The rest of controlledburn 0.3**: `burn_window` could replace
    `Cutline::burn_window` (check the records are identical first) and
    split one large geometry into tiles for `burn_par`; `relate_cells`
    finds cells a polygon only touches.
