@@ -75,6 +75,34 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   and 0.25 s. `weights_to` now groups its entries by cell with a counting
   sort (same order, faster).
 
+- Second-order conservative remapping (conservative stage 6a, #40):
+  ESMF's `conserve_2nd`.
+  - **What it does:** each source cell's value becomes a plane over the
+    cell, and each overlap takes the plane's mean over it.
+  - **The API:** `WeightOptions::with_moments(true)` records each
+    overlap's first moments (`Weights::moment`), from controlledburn's
+    `CoverageWindow::set_moments`. `Weights::apply_second_order` remaps
+    a field with them, and `Weights::second_order` folds the gradients
+    into one table, as ESMF's weight files hold it.
+  - **As ESMF does it:** the gradient comes from the cell's eight
+    neighbours by Green's theorem, zero where they don't surround the
+    cell. It is centred on the part of the cell the table covers, so the
+    integral is conserved exactly under `DestArea`. `apply_second_order`
+    takes the gradients from the field, so neighbours without data drop
+    out of them.
+  - **Checks:** fields linear in source pixels come out exact to 1e-14,
+    planar and on the sphere. Halving the cell size quarters the error
+    on a quadratic. The folded table is ESMF's to 6e-14 for a grid onto a
+    grid (new fixtures `<case>.cart2.txt`).
+  - **One difference from ESMF:** ESMF centres each overlap on the mean of
+    its polygon's vertices, not its centroid. So where a projected grid
+    cuts general polygons from a lon/lat one, ESMF is off by up to 0.035
+    on a linear field and rwarp is exact. Given ESMF's vertex means,
+    rwarp gives ESMF's table to 1e-12.
+  - **Scope:** for sources measured in their pixels; geolocation, mesh
+    and `PolyMesh` sources are refused for now.
+  - **Dependency:** needs controlledburn with `set_moments` (0.3.3).
+
 ### Changed
 
 - Decision N2 (#44): the equal-area split's fallback for a non-convex

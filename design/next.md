@@ -97,7 +97,10 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
 ## Next, in order
 
 1. **The next stage on the board**: conservative stage 6 (#40, second
-   order).
+   order). 6a is built for sources measured in their pixels (section 8 of
+   conservative.md); it needs controlledburn's release with
+   `CoverageWindow::set_moments` (controlledburn-rs #51). Left: world-cell
+   and mesh sources.
 2. **Decisions**: none waiting. N2, N5 and C1 to C4 were decided on
    2026-11-19 (#111). N5 (#47) is built, and adaptive predicates weren't
    needed (see N5 in decisions.md).

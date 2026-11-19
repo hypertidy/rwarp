@@ -35,7 +35,7 @@ on a small core of it:
 | ESMF | Use | Take? |
 |---|---|---|
 | `conserve` (first order) | fluxes, precipitation, anything whose integral must be kept | **yes, the centre of this note** |
-| `conserve_2nd` | smoother conservative fields | later (stage 6) |
+| `conserve_2nd` | smoother conservative fields | **yes** (stage 6; 6a built, section 8) |
 | Weight files (SCRIP/ESMF netCDF: `col`, `row`, `S`, plus areas and fractions) | compute once, apply anywhere: CDO, NCO `ncremap`, xESMF | **yes, as values here; files in wxylib** |
 | Normalisation `destarea` / `fracarea`, masks | partial coverage and land/sea masks | **yes** |
 | Great-circle cell edges, spherical areas | the definition of "conserve" on the globe | **yes, as an option** (stage 3) |
@@ -530,6 +530,69 @@ also depend on the overlap's centroid. Centroids are Green's-theorem integrals
 too (`∮ x² dy`, `∮ y² dx`), so the same window machinery returns them. Gradient
 estimation needs neighbouring source cells. It's a reconstruction step on top
 of stage 1's weights, and doesn't change the coverage engine.
+
+**Decided (2026-11-19, the maintainer, each at the recommendation):**
+
+- **The moments live in controlledburn.** `CoverageWindow::set_moments`
+  books each cell's first moments beside its coverage, planar and
+  `CosLatitude` (controlledburn-rs #51; rwarp needs the release with it).
+- **ESMF's centre for each source cell:** the centroid of the part of the
+  cell the table covers, not the whole cell. It gives ESMF parity, and
+  the mapped part is conserved exactly. Where a grid's edge or a mask cuts
+  a source cell, the plane is centred off the cell's middle, which is less
+  accurate there.
+- **The table keeps the moments and `apply` takes the gradients from the
+  field** (SCRIP's second and third weights, in effect). So a neighbour
+  without data drops out per field, as nodata does in first order.
+  `Weights::second_order` folds them into ESMF's single matrix, given the
+  cells with data, for weight files.
+
+**Status (2026-11-19): 6a built** (`src/weights/second_order.rs`).
+
+- **What's built:** `WeightOptions::with_moments`, `Weights::moment`,
+  `Weights::apply_second_order` and `Weights::second_order`, for sources
+  measured in their pixels: regular grids, planar or under
+  `lonlat_measure`, across the seam and on threads.
+- **The method is ESMF's.** The gradient is Green's theorem round the
+  centres of the cell's eight neighbours (fewer where some have no data),
+  sorted anticlockwise round the covered centre. It is zero where there
+  are fewer than three, the centre is outside their polygon by more than
+  1e-14, or the polygon has no area.
+- **Neighbour centres** are each cell's centroid under the measure: ESMF's
+  corner mean for the planar measure, and towards the equator on the
+  sphere, so fields linear in longitude and latitude come out exactly
+  there too. ESMF's spherical method works in 3D instead, so on the
+  sphere the two are different second-order methods.
+- **One finding: ESMF centres an overlap on the mean of its polygon's
+  vertices** (`_calc_centroid_2D_2D_cart`, ESMCI_SM.C), not its centroid.
+  The two agree for rectangles, triangles and parallelograms, and not for
+  the general polygons a projected grid cuts from a lon/lat one. So:
+  - For a grid onto a grid, rwarp's folded table is ESMF's to 6e-14
+    (`regular_coarser`, and `regular_overhang` over the source's corner).
+  - Projected (`lonlat_3031`), S differs by up to 0.022. On a field linear
+    in source pixels ESMF is off by up to 0.035 there, and rwarp by 1e-14.
+  - Given ESMF's vertex means in place of the moments, rwarp's table is
+    ESMF's to 1.1e-12 over 26,507 weights. It differs only next to the 60
+    destination cells with a corner exactly on a source wall, where a
+    vertex mean depends on how the clip lists the vertices on the wall.
+- **Checks** (`tests/second_order.rs`):
+  - A linear field is exact to 1e-14, planar and on the sphere (first
+    order is off by 0.16).
+  - On a quadratic, halving the cell size quarters the error exactly. On
+    a sine, second order is 57 times closer than first.
+  - Under `DestArea` the integral is conserved to 1e-12, with cells cut by
+    the edge and without data.
+  - The folded table applied by `apply` is `apply_second_order` to 1e-12,
+    with and without a mask.
+  - Moments survive the seam's pieces, threads and tiles bit for bit.
+  - World-cell sources are refused.
+- **Not built:**
+  - second order from geolocation, mesh (`MeshTransformer`, `MeshSet`) and
+    `PolyMesh` sources, which need their neighbours and centroids in world
+    coordinates;
+  - a gradient limiter (ESMF has none), so a second-order value can lie
+    outside its sources' range next to a sharp front;
+  - spherical ESMF fixtures for second order.
 
 ## 9. Interfaces and where things live
 

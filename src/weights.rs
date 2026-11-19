@@ -87,6 +87,18 @@
 //! compare with ESMF or xESMF's `conservative`, ask for
 //! [`Normalization::DestArea`] (decision C2, `design/decisions.md`).
 //!
+//! # Second order
+//!
+//! With [`WeightOptions::with_moments`] each entry also records its
+//! overlap's first moments ([`Weights::moment`]), and
+//! [`Weights::apply_second_order`] remaps a field to second order, ESMF's
+//! `conserve_2nd`: each source cell's value is a plane over the cell, its
+//! gradient from the cell's neighbours, and each overlap takes the plane's
+//! mean over it. [`Weights::second_order`] folds the gradients into one
+//! table, as ESMF's weight files hold it. See the
+//! `weights::second_order` module (`src/weights/second_order.rs`) for the
+//! method and how it differs from ESMF's.
+//!
 //! # ESMF and SCRIP weight files
 //!
 //! Writing files is wxylib's job; the columns map directly. With full-grid
@@ -143,6 +155,8 @@
 //! `tests/esmf.rs` for the size of the difference.
 
 pub use controlledburn::Measure;
+
+mod second_order;
 
 use crate::transform::Transformer;
 use crate::warp::{AreaMean, AreaReducer, BandNodata, Cover, DstNodata, Edges, Interleaved, Lattice, Nodata, Output, Res, Sample, SourceBuffer, WarpOptions};
@@ -232,6 +246,12 @@ pub struct WeightOptions {
     /// How area is measured, over the full source grid's pixel space.
     /// Default [`Measure::Planar`]; see [`lonlat_measure`].
     pub measure: Measure,
+    /// Also record each overlap's first moments ([`Weights::moment`]), for
+    /// second-order remapping ([`Weights::apply_second_order`],
+    /// [`Weights::second_order`]). Default false. For sources measured in
+    /// their pixels: [`exact_weights`] panics for a source with world cells.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub moments: bool,
 }
 
 impl Default for WeightOptions {
@@ -246,7 +266,7 @@ impl WeightOptions {
         WeightOptions {
             densify, refine_tolerance: None, dst_col_off: 0, dst_row_off: 0,
             drop_tolerance: 0.0, snap_tolerance: 0.0, round_to_f32: false,
-            measure: Measure::Planar,
+            measure: Measure::Planar, moments: false,
         }
     }
 
@@ -301,6 +321,13 @@ impl WeightOptions {
         self
     }
 
+    /// Record each overlap's first moments, for second-order remapping;
+    /// see [`WeightOptions::moments`].
+    pub fn with_moments(mut self, moments: bool) -> Self {
+        self.moments = moments;
+        self
+    }
+
     /// The stored weight for a raw coverage `f`, or `None` to drop it.
     #[inline]
     pub(crate) fn weight(&self, f: f64) -> Option<f64> {
@@ -347,6 +374,9 @@ pub struct CellWeights<'a> {
     pub frac: &'a [f64],
     /// The measure of each entry's source cell (as [`Weights::src_area`]).
     pub src_area: &'a [f64],
+    /// Each entry's first moments, as [`Weights::moment`]; empty unless
+    /// [`WeightOptions::moments`].
+    pub moment: &'a [[f64; 2]],
 }
 
 /// Overlap of each destination cell with each source cell, from the exact
@@ -383,6 +413,16 @@ pub struct Weights {
     /// cell measures follow from `measure`.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub src_cell_area: Vec<f64>,
+    /// With [`WeightOptions::moments`]: each entry's overlap's first
+    /// moments about its source cell's top-left corner, in source pixels,
+    /// over the source cell's measure (as `frac` is the overlap's measure
+    /// over the cell's). The overlap's centroid is at column `src_col +
+    /// moment[0] / frac` and row `src_row + moment[1] / frac`. Unrounded,
+    /// whatever `frac`'s snapping or rounding. Empty otherwise. What
+    /// second-order remapping centres each source cell's gradient term on
+    /// ([`Weights::apply_second_order`]).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub moment: Vec<[f64; 2]>,
 }
 
 /// Options for [`Weights::apply`]: nodata and validity, as in
@@ -474,6 +514,10 @@ fn check_indices(src: &GridWindow, dst_ncol: usize, dst_nrow: usize, opts: &Weig
 const WORLD_MEASURE: &str = "a source with world cells (Transformer::source_cells) is measured in its world coordinates: \
      WeightOptions::measure must be Measure::Planar";
 
+/// The message for moments from a source with world cells.
+const WORLD_MOMENTS: &str = "first moments (WeightOptions::moments) are for sources measured in their pixels, \
+     not yet for a source with world cells (Transformer::source_cells)";
+
 /// [`exact_weights_with`] for rows `band` of the `dst_ncol` by `dst_nrow`
 /// window, with the lattice kept in `lat` for the thread's next band.
 #[allow(clippy::too_many_arguments)]
@@ -489,7 +533,7 @@ fn weights_rows(
 ) {
     let (ncol, nrow) = (src.ncol as i64, src.nrow as i64);
     let src_off = (src.col_off as f64, src.row_off as f64);
-    let (mut sr, mut sc, mut fr, mut sa) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut sr, mut sc, mut fr, mut sa, mut mo) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     // The window works in source window pixels.
     let measure = shift_rows(opts.measure, src.row_off as f64);
     let lat = match lat {
@@ -503,7 +547,9 @@ fn weights_rows(
                 (src.col_off, src.row_off, src.ncol, src.nrow), (opts.dst_row_off, dst_nrow),
             );
             assert!(!l.in_world() || opts.measure == Measure::Planar, "{WORLD_MEASURE}");
+            assert!(!l.in_world() || !opts.moments, "{WORLD_MOMENTS}");
             l.win.set_measure(measure);
+            l.win.set_moments(opts.moments);
             lat.insert(l)
         }
     };
@@ -515,6 +561,7 @@ fn weights_rows(
             sc.clear();
             fr.clear();
             sa.clear();
+            mo.clear();
             let cover = lat.cover(c, src_off, (ncol, nrow));
             let dst_area = match cover {
                 Cover::Failed => f64::NAN,
@@ -529,16 +576,19 @@ fn weights_rows(
             };
             match cover {
                 Cover::Window { c0, r0, w } => {
+                    let (mx, my) = (lat.win.moment_x(), lat.win.moment_y());
                     for (k, &v) in lat.win.coverage().iter().enumerate() {
                         if let Some(v) = opts.weight(v) {
                             push(c0 + (k % w) as i64, r0 + (k / w) as i64, v);
+                            if opts.moments { mo.push([mx[k], my[k]]); }
                         }
                     }
                 }
                 Cover::Pieces => {
-                    for &(pc, pr, v) in &lat.pieces {
+                    for (i, &(pc, pr, v)) in lat.pieces.iter().enumerate() {
                         if let Some(v) = opts.weight(v) {
                             push(pc, pr, v);
+                            if opts.moments { mo.push(lat.piece_moments[i].2); }
                         }
                     }
                 }
@@ -546,7 +596,7 @@ fn weights_rows(
             }
             f(CellWeights {
                 dst_row, dst_col: (opts.dst_col_off + c) as u32, dst_area,
-                src_row: &sr, src_col: &sc, frac: &fr, src_area: &sa,
+                src_row: &sr, src_col: &sc, frac: &fr, src_area: &sa, moment: &mo,
             });
         }
     }
@@ -612,6 +662,7 @@ pub fn exact_weights_par<X: Transformer>(
     check_indices(src, dst_ncol, dst_nrow, opts);
     let world = first.source_cells().is_some();
     assert!(!world || opts.measure == Measure::Planar, "{WORLD_MEASURE}");
+    assert!(!world || !opts.moments, "{WORLD_MOMENTS}");
     let per = dst_nrow.div_ceil(threads * 4).max(1);
     let n = dst_nrow.div_ceil(per);
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -684,6 +735,7 @@ impl Weights {
         self.src_row.extend_from_slice(cell.src_row);
         self.src_col.extend_from_slice(cell.src_col);
         self.frac.extend_from_slice(cell.frac);
+        self.moment.extend_from_slice(cell.moment);
         self.dst_area.push(cell.dst_area);
     }
 
@@ -694,6 +746,7 @@ impl Weights {
         self.src_row.append(&mut part.src_row);
         self.src_col.append(&mut part.src_col);
         self.frac.append(&mut part.frac);
+        self.moment.append(&mut part.moment);
         self.dst_area.append(&mut part.dst_area);
         self.src_cell_area.append(&mut part.src_cell_area);
     }

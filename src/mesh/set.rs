@@ -1084,6 +1084,7 @@ impl MeshSet {
         out.src_row.extend_from_slice(&w.src_row);
         out.src_col.extend_from_slice(&w.src_col);
         out.frac.extend_from_slice(&w.frac);
+        out.moment.extend_from_slice(&w.moment);
         out.src_cell_area.extend_from_slice(&w.src_cell_area);
     }
 
@@ -2442,6 +2443,7 @@ impl ToGrid {
         out.src_col
             .extend(w.src_col.iter().map(|&c| c + p.col_off as u32));
         out.frac.extend_from_slice(&w.frac);
+        out.moment.extend_from_slice(&w.moment);
         out.src_cell_area.extend_from_slice(&w.src_cell_area);
     }
 }
