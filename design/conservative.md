@@ -568,7 +568,7 @@ of stage 1's weights, and doesn't change the coverage engine.
 Built in three steps: 6b the world-cell grids and grids onto meshes, 6c
 the faces as sources, 6d the limiter and spherical ESMF fixtures.
 
-**Status (2026-11-19): 6a and 6b built** (`src/weights/second_order.rs`).
+**Status (2026-11-19): 6a, 6b and 6c built** (`src/weights/second_order.rs`).
 
 - **What's built:** `WeightOptions::with_moments`, `Weights::moment`,
   `Weights::apply_second_order` and `Weights::second_order`, for sources
@@ -631,8 +631,37 @@ the faces as sources, 6d the limiter and spherical ESMF fixtures.
     middles; threads keep the moments bit for bit.
   - Without moments every table and warp is as before, bit for bit
     (ORCA2 hashes).
+- **6c, a `PolyMesh`'s faces as sources** (`tests/second_order_faces.rs`):
+  `PolyMesh::weights_to` records each overlap's moments about its grid
+  cell's corner (the source has none), over the face's measure, and
+  `PolyMesh::apply_second_order` and `PolyMesh::second_order` take the
+  mesh for its adjacency. The apply and fold loops are 6a's, with the
+  stencil passed in, so 6a's and 6b's output is bit for bit as before.
+  - A face's centre is the centroid of its covered part (from the table),
+    and its neighbours are the faces sharing a node, centred the same
+    way. A neighbour with no entries has no centre, so isn't one.
+  - **The seam.** The grid's period isn't in the table, and a world-cell
+    grid's index seam (ORCA's) has none anyway, so the stencil judges
+    from the cells. A face whose cells (slivers under 1e-12 of it aside)
+    aren't one 8-connected piece is first order: the seam cuts it, and
+    its centre is in the middle of the grid. A neighbour whose cells'
+    bounding box isn't next to the face's is left out: it is across the
+    seam. So at a seam the gradients are one-sided, as a grid's are at
+    its edge. Carrying the period would give two-sided gradients for a
+    lon/lat grid only; not done.
+  - Checks: the moments are `weights_onto`'s, turned round, to 1e-12. A
+    field linear in the grid's space is exact on faces off the mesh's
+    edge and whole in the window, with their neighbours: in pixels to
+    2.5e-14 (327 cells, first order off by 2.3), on the sphere to 2.8e-14
+    (1,033 cells), in a curved grid's indices to 1.4e-14 (408 cells).
+    On a quadratic, halving mesh and grid divides the error by 3.95 then
+    3.90 (first order's by 1.7). Conserved to 1e-15 with faces without
+    data; the folded table applied is the same to 1e-12. Either side of
+    a global grid's seam (faces sharing nodes on it) a field linear
+    across it is exact; in a face the seam cuts, the value is the face's.
+    Each guard (connected, next to, slivers) has a test that fails
+    without it. Threads keep the moments bit for bit.
 - **Not built:**
-  - second order from a `PolyMesh`'s faces as sources (6c);
   - a gradient limiter (6d; ESMF has none), so a second-order value can
     lie outside its sources' range next to a sharp front;
   - spherical ESMF fixtures for second order (6d).

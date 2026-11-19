@@ -5,8 +5,8 @@ use bigcurve::{Edge, ForwardBatch, GreatCircle, Options, Resampler, Span, Vertex
 use controlledburn::{CoverageWindow, Measure};
 
 use crate::transform::{SourceCells, SourceWrap, Transformer};
-use crate::warp::{cover_outline, unwrap_outline, Cover, OutlineScratch, WorldCells};
-use crate::weights::{shift_rows, to_u32, GridWindow, WeightOptions, Weights};
+use crate::warp::{cover_outline, unwrap_outline, Cover, OutlineScratch, Sample, SourceBuffer, WorldCells};
+use crate::weights::{shift_rows, to_u32, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
 
 /// Points of the faces transformed at once, at most (a chunk ends after
 /// the face that reaches it).
@@ -379,13 +379,21 @@ impl PolyMesh {
     /// - [`Weights::apply`] takes one value per face, as a source buffer
     ///   `nface` wide and 1 high, and gives the grid's.
     ///
+    /// With [`WeightOptions::moments`], each entry's [`Weights::moment`] is
+    /// its overlap's first moments about its grid cell's top-left corner,
+    /// over the face's measure: the centroid is at column `dst_col +
+    /// moment[0] / frac` and row `dst_row + moment[1] / frac`, in the
+    /// grid's pixels (or, with world cells, their index space). That is for
+    /// second order from the faces, [`PolyMesh::apply_second_order`] and
+    /// [`PolyMesh::second_order`], not [`Weights::apply_second_order`],
+    /// whose sources are a grid's cells.
+    ///
     /// Errors and panics as [`PolyMesh::weights_onto`].
     pub fn weights_to<T: Transformer>(&self, inner: &T, grid: &GridWindow, opts: &WeightOptions) -> Result<Weights, String> {
         check_indices(grid, self.nface());
-        no_moments_from_faces(opts)?;
         let mut m = Measurer::new(self, inner, grid, opts)?;
         let mut part = ToPart::default();
-        m.run(self, inner, 0..self.nface(), &mut |f, area, cells, _| part.add(f, area, cells));
+        m.run(self, inner, 0..self.nface(), &mut |f, area, cells, mo| part.add(f, area, cells, mo));
         let areas = std::mem::take(&mut m.areas);
         Ok(to_weights(vec![part], areas, grid, opts))
     }
@@ -401,10 +409,86 @@ impl PolyMesh {
         threads: usize,
     ) -> Result<Weights, String> {
         check_indices(grid, self.nface());
-        no_moments_from_faces(opts)?;
         let (parts, areas, _) =
-            self.in_ranges(inner, grid, opts, threads, |p: &mut ToPart, f, area, cells, _| p.add(f, area, cells))?;
+            self.in_ranges(inner, grid, opts, threads, |p: &mut ToPart, f, area, cells, mo| p.add(f, area, cells, mo))?;
         Ok(to_weights(parts, areas, grid, opts))
+    }
+
+    /// Second-order conservative remapping from the faces to the grid
+    /// ([`Weights::apply_second_order`] with the faces as the source
+    /// cells), through a table from [`PolyMesh::weights_to`] (or `_par`)
+    /// made with [`WeightOptions::moments`]. `src` holds one value per
+    /// face, as for [`Weights::apply`]: a buffer `nface` wide and 1 high
+    /// (or a window of it).
+    ///
+    /// Each face's value becomes a plane over it in the grid's space, where
+    /// its overlaps are measured: the grid's pixels under its measure, or
+    /// for a grid with world cells their index space under the walk's
+    /// equal-area map (as for such a grid as the source, in
+    /// [`Weights::second_order`]'s module). As for a grid's cells:
+    ///
+    /// - the plane is centred on the part of the face the table covers, so
+    ///   under [`Normalization::DestArea`] the integral is conserved
+    ///   exactly (to rounding);
+    /// - the gradient is Green's theorem round the centres of the faces
+    ///   sharing a node with it (ESMF's neighbours), each centred on the
+    ///   part of it the table covers. It is zero (first order for that
+    ///   face) where there are fewer than three, or the face's centre is
+    ///   outside their polygon.
+    ///
+    /// So a field linear in the grid's space comes out exactly where the
+    /// faces and their neighbours are wholly in the grid's window: for a
+    /// mesh in longitude and latitude onto a grid in them, a field linear
+    /// in longitude and latitude. A face the window's edge cuts is centred
+    /// on the part in it, and a face with no entries is no one's neighbour.
+    ///
+    /// **Across a seam.** A face whose covered part isn't one piece in the
+    /// grid's cells (through cells sharing a side or a corner) is first
+    /// order: one the grid's seam in longitude cuts, say, has a centre in
+    /// the middle of the grid. A neighbour whose cells' bounding box isn't
+    /// next to the face's (one across the seam) is left out. So at a seam
+    /// the gradients are one-sided, as a grid's cells' are at the edge of
+    /// the source window.
+    ///
+    /// Faces without data (as `opts` says) are left out of the gradients
+    /// band by band, and out of their grid cells, as in
+    /// [`Weights::apply_second_order`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Weights::apply`], if the table has no moments, or if it isn't
+    /// one from this mesh's faces (a source that isn't a face, or no face
+    /// measures in [`Weights::src_cell_area`]).
+    pub fn apply_second_order<S: Sample, D: Sample>(
+        &self,
+        w: &Weights,
+        src: &SourceBuffer<'_, S>,
+        norm: Normalization,
+        opts: &ApplyOptions,
+    ) -> Vec<D> {
+        w.apply_faces_second_order(self, src, norm, opts)
+    }
+
+    /// [`PolyMesh::apply_second_order`]'s table folded into one, as
+    /// [`Weights::second_order`] folds a grid's: each grid cell's entries
+    /// are its faces' and their neighbours', with `frac` such that
+    /// [`Weights::apply`] (one value per face) gives
+    /// [`PolyMesh::apply_second_order`] for a field with data on every face
+    /// `valid` marks (one value per face, `None` for all). Some `frac` are
+    /// negative.
+    ///
+    /// A face without data is no one's neighbour and has no entries.
+    /// Entries come grouped by grid cell, as the table's, and within a cell
+    /// by face, one per face, each with its face's measure in
+    /// [`Weights::src_cell_area`]. For a field with other faces without
+    /// data, use [`PolyMesh::apply_second_order`].
+    ///
+    /// # Panics
+    ///
+    /// If the table has no moments, isn't one from this mesh's faces, or
+    /// `valid` isn't one value per face.
+    pub fn second_order(&self, w: &Weights, valid: Option<&[bool]>) -> Weights {
+        w.faces_second_order(self, valid)
     }
 
     /// Each range of faces' part, in order, made by `add` face by face on
@@ -695,27 +779,23 @@ impl OntoPart {
     }
 }
 
-/// Second order from the faces (moments for [`PolyMesh::weights_to`])
-/// isn't built yet.
-fn no_moments_from_faces(opts: &WeightOptions) -> Result<(), String> {
-    if opts.moments {
-        return Err("first moments (WeightOptions::moments) are not yet measured for a PolyMesh's faces as sources \
-                    (PolyMesh::weights_to); they are for weights onto it"
-            .into());
-    }
-    Ok(())
+/// A range of faces' overlaps from the mesh: (row, col) of the window,
+/// face, coverage, the face's measure; with moments on, each one's first
+/// moments over its window cell's measure (empty otherwise).
+#[derive(Default)]
+struct ToPart {
+    e: Vec<(u32, u32, u32, f64, f64)>,
+    moment: Vec<[f64; 2]>,
 }
 
-/// A range of faces' overlaps from the mesh: (row, col) of the window,
-/// face, coverage, the face's measure.
-#[derive(Default)]
-struct ToPart(Vec<(u32, u32, u32, f64, f64)>);
-
 impl ToPart {
-    fn add(&mut self, f: usize, area: f64, cells: &Cells) {
-        for &(pc, pr, v) in cells {
+    fn add(&mut self, f: usize, area: f64, cells: &Cells, mo: &[[f64; 2]]) {
+        for (i, &(pc, pr, v)) in cells.iter().enumerate() {
             if v != 0.0 {
-                self.0.push((pr as u32, pc as u32, f as u32, v, area));
+                self.e.push((pr as u32, pc as u32, f as u32, v, area));
+                if let Some(&m) = mo.get(i) {
+                    self.moment.push(m);
+                }
             }
         }
     }
@@ -726,12 +806,22 @@ impl ToPart {
 fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, opts: &WeightOptions) -> Weights {
     // each overlap's measure, over its face's, by window cell (a counting
     // sort: in face order within a cell, as a stable sort would leave them)
+    // with moments, the same over the face's measure: about the grid
+    // cell's corner still
     let cell = |t: &(u32, u32, u32, f64, f64)| t.0 as usize * grid.ncol + t.1 as usize;
     let mut count = vec![0usize; areas.len() + 1];
-    let mut kept: Vec<(u32, u32, u32, f64, f64)> = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+    let n: usize = parts.iter().map(|p| p.e.len()).sum();
+    let mut kept: Vec<(u32, u32, u32, f64, f64)> = Vec::with_capacity(n);
+    let mut kept_m: Vec<[f64; 2]> = Vec::with_capacity(if opts.moments { n } else { 0 });
     for p in parts {
-        for mut t in p.0 {
-            if let Some(v) = opts.weight(t.3 * areas[cell(&t)] / t.4) {
+        assert_eq!(p.moment.len(), if opts.moments { p.e.len() } else { 0 }, "a face's moments out of step");
+        for (j, mut t) in p.e.into_iter().enumerate() {
+            let a = areas[cell(&t)];
+            if let Some(v) = opts.weight(t.3 * a / t.4) {
+                if opts.moments {
+                    let m = p.moment[j];
+                    kept_m.push([m[0] * a / t.4, m[1] * a / t.4]);
+                }
                 t.3 = v;
                 count[cell(&t) + 1] += 1;
                 kept.push(t);
@@ -742,8 +832,12 @@ fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, opts: &Wei
         count[k] += count[k - 1];
     }
     let mut e = vec![(0u32, 0u32, 0u32, 0.0, 0.0); kept.len()];
-    for t in kept {
+    let mut moment = vec![[0.0; 2]; kept_m.len()];
+    for (j, t) in kept.into_iter().enumerate() {
         let c = cell(&t);
+        if opts.moments {
+            moment[count[c]] = kept_m[j];
+        }
         e[count[c]] = t;
         count[c] += 1;
     }
@@ -755,7 +849,7 @@ fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, opts: &Wei
         src_col: e.iter().map(|t| t.2).collect(),
         frac: e.iter().map(|t| t.3).collect(),
         src_cell_area: e.iter().map(|t| t.4).collect(),
-        moment: Vec::new(),
+        moment,
         dst_area: areas,
         dst_off: [grid.col_off, grid.row_off],
         dst_size: [grid.ncol, grid.nrow],

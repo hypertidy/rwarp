@@ -64,6 +64,17 @@
 //! [`Weights::second_order`] needs the window's world cell areas for such
 //! a source ([`source_cell_areas`](super::source_cell_areas)).
 //!
+//! **A mesh's faces as sources** ([`PolyMesh::weights_to`]) have no index
+//! space, so their planes are in the grid's, where their overlaps are
+//! measured (its pixels, or its cells' index space), through
+//! [`PolyMesh::apply_second_order`] and [`PolyMesh::second_order`]. Each
+//! overlap's moments are about its grid cell's corner. A face's centre is
+//! the centroid of the part the table covers, and its neighbours are the
+//! faces sharing a node with it (ESMF's), each centred the same way. A
+//! face whose covered part isn't one piece in the grid's cells (cut by its
+//! seam) is first order, and a neighbour whose cells aren't next to the
+//! face's (across the seam) is left out.
+//!
 //! [`Weights::apply_second_order`] estimates the gradients from the field
 //! at hand, so a neighbour without data drops out of them as a cell
 //! without data drops out of first-order [`Weights::apply`].
@@ -71,12 +82,18 @@
 //! files hold it, for a fixed set of cells with data.
 
 use super::{ApplyOptions, GridWindow, Normalization, Weights};
+use crate::mesh::PolyMesh;
 use crate::warp::{Interleaved, Output, Res, Sample, SourceBuffer};
 use controlledburn::{CoverageWindow, Measure};
 
 /// ESMF's tolerance for the source centre being inside the neighbours'
 /// polygon (`is_pnt_in_polygon`).
 const INSIDE_TOL: f64 = 1e-14;
+
+/// An overlap of less than this much of its face is rounding (a window
+/// leaves slivers of 1e-17 or so in cells the face doesn't reach): left out
+/// of where the face is in the grid's cells.
+const SLIVER: f64 = 1e-12;
 
 /// A neighbour of a source cell, in the gradient's polygon.
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +176,15 @@ fn cell_centroid(measure: Measure, row: i64) -> [f64; 2] {
     [w.moment_x()[0] / cov, w.moment_y()[0] / cov]
 }
 
+/// A buffer's pixel for full-grid `(row, col)`, `None` outside it.
+fn buffer_index<S>(src: &SourceBuffer<'_, S>) -> impl Fn(i64, i64) -> Option<usize> {
+    let (ro, co, nrow, ncol) = (src.row_off as i64, src.col_off as i64, src.nrow, src.ncol);
+    move |r: i64, c: i64| -> Option<usize> {
+        let (r, c) = (r - ro, c - co);
+        (r >= 0 && c >= 0 && (r as usize) < nrow && (c as usize) < ncol).then(|| r as usize * ncol + c as usize)
+    }
+}
+
 /// Cell centroids by row, worked out once each.
 struct Centroids {
     measure: Measure,
@@ -181,13 +207,15 @@ impl Centroids {
 /// The table's source cells, each once, with the centre of the part the
 /// table covers, and each entry's cell and its overlap's first moment about
 /// that centre.
-struct Sources {
+pub(crate) struct Sources {
     /// Index (buffer pixel or window cell) of each source cell, ascending.
     p: Vec<usize>,
     /// Its full-grid `[row, col]`.
     rc: Vec<[i64; 2]>,
     /// The covered part's centroid, in full-grid source pixels.
     centre: Vec<[f64; 2]>,
+    /// The first of its entries.
+    k0: Vec<u32>,
     /// Each entry's source cell (into the above), `u32::MAX` for an entry
     /// outside the window.
     of: Vec<u32>,
@@ -198,10 +226,20 @@ struct Sources {
     dm: Vec<[f64; 2]>,
 }
 
+/// A source cell's candidate neighbour for its gradient: its index (as
+/// [`Sources::p`]) and its centre.
+type Cand = (usize, [f64; 2]);
+
+/// Each source cell's candidate neighbours, into the vector (empty to
+/// start with): those without data are left out of them later.
+type Stencil<'a> = dyn FnMut(usize, &mut Vec<Cand>) + 'a;
+
 impl Weights {
     /// The source cells of the table within a window, by `index` (an
-    /// entry to its index there, or `None` outside it).
-    fn sources(&self, index: impl Fn(usize) -> Option<usize>) -> Sources {
+    /// entry to its index there, or `None` outside it), each entry's
+    /// moments about `origin(k)` (in full-grid pixels): its source cell's
+    /// corner for a grid source, its grid cell's for a face.
+    fn sources(&self, index: impl Fn(usize) -> Option<usize>, origin: impl Fn(usize) -> [f64; 2]) -> Sources {
         assert_eq!(
             self.moment.len(),
             self.len(),
@@ -213,35 +251,44 @@ impl Weights {
             p: Vec::new(),
             rc: Vec::new(),
             centre: Vec::new(),
+            k0: Vec::new(),
             of: vec![u32::MAX; self.len()],
             dm: vec![[0.0; 2]; self.len()],
         };
         let mut i = 0;
         while i < by.len() {
             let p = by[i].0;
+            let k0 = by[i].1 as usize;
+            let o = origin(k0);
+            // each entry's origin from the first's: none for a grid source
+            let off = |k: usize| {
+                let ok = origin(k);
+                [ok[0] - o[0], ok[1] - o[1]]
+            };
             let mut j = i;
             let (mut f, mut mx, mut my) = (0.0, 0.0, 0.0);
             while j < by.len() && by[j].0 == p {
                 let k = by[j].1 as usize;
+                let d = off(k);
                 f += self.frac[k];
-                mx += self.moment[k][0];
-                my += self.moment[k][1];
+                mx += self.moment[k][0] + self.frac[k] * d[0];
+                my += self.moment[k][1] + self.frac[k] * d[1];
                 j += 1;
             }
-            let k0 = by[i].1 as usize;
             let (r, c) = (self.src_row[k0] as i64, self.src_col[k0] as i64);
-            // the covered part's centroid, from the cell's corner
+            // the covered part's centroid, from the first entry's origin
             let local = if f > 0.0 { [mx / f, my / f] } else { [0.5, 0.5] };
             let n = s.p.len() as u32;
             for &(_, k) in &by[i..j] {
                 let k = k as usize;
                 s.of[k] = n;
-                let f = self.frac[k];
-                s.dm[k] = [self.moment[k][0] - f * local[0], self.moment[k][1] - f * local[1]];
+                let (f, d) = (self.frac[k], off(k));
+                s.dm[k] = [self.moment[k][0] - f * (local[0] - d[0]), self.moment[k][1] - f * (local[1] - d[1])];
             }
             s.p.push(p);
             s.rc.push([r, c]);
-            s.centre.push([c as f64 + local[0], r as f64 + local[1]]);
+            s.centre.push([o[0] + local[0], o[1] + local[1]]);
+            s.k0.push(k0 as u32);
             i = j;
         }
         s
@@ -259,6 +306,10 @@ impl Weights {
     /// (to rounding), as by the first order: the gradient terms integrate to
     /// zero over each source cell's covered part.
     ///
+    /// For a table from a mesh's faces ([`PolyMesh::weights_to`]), use
+    /// [`PolyMesh::apply_second_order`]: here the sources are a grid's
+    /// cells, and its neighbours the cells round each.
+    ///
     /// # Panics
     ///
     /// As [`Weights::apply`], and if the table has no moments
@@ -268,6 +319,37 @@ impl Weights {
         src: &SourceBuffer<'_, S>,
         norm: Normalization,
         opts: &ApplyOptions,
+    ) -> Vec<D> {
+        let buf = buffer_index(src);
+        let s = self.sources(|k| buf(self.src_row[k] as i64, self.src_col[k] as i64), |k| {
+            [self.src_col[k] as f64, self.src_row[k] as f64]
+        });
+        let mut cen = Centroids::new(self.measure);
+        self.apply_planes(src, norm, opts, &s, &mut |i, out| {
+            let [r, c] = s.rc[i];
+            for dr in -1..=1 {
+                for dc in -1..=1 {
+                    if (dr, dc) == (0, 0) {
+                        continue;
+                    }
+                    if let Some(p) = buf(r + dr, c + dc) {
+                        out.push((p, cen.at(r + dr, c + dc)));
+                    }
+                }
+            }
+        })
+    }
+
+    /// [`Weights::apply_second_order`] for the source cells `s` (indexed
+    /// by buffer pixel), each one's candidate neighbours from `stencil`
+    /// (by buffer pixel too).
+    pub(crate) fn apply_planes<S: Sample, D: Sample>(
+        &self,
+        src: &SourceBuffer<'_, S>,
+        norm: Normalization,
+        opts: &ApplyOptions,
+        s: &Sources,
+        stencil: &mut Stencil<'_>,
     ) -> Vec<D> {
         let nb = src.nbands;
         assert_eq!(src.data.len(), src.ncol * src.nrow * nb, "source buffer size mismatch");
@@ -285,38 +367,24 @@ impl Weights {
             rule: opts.band_nodata,
             cut: None,
         };
-        let (ro, co) = (src.row_off as i64, src.col_off as i64);
-        let buf = |r: i64, c: i64| -> Option<usize> {
-            let (r, c) = (r - ro, c - co);
-            (r >= 0 && c >= 0 && (r as usize) < src.nrow && (c as usize) < src.ncol)
-                .then(|| r as usize * src.ncol + c as usize)
-        };
-        let s = self.sources(|k| buf(self.src_row[k] as i64, self.src_col[k] as i64));
         // whether pixel p has data in band b
         let ok = |p: usize, b: usize| {
             let pix = img.px(p);
             img.pixel_ok(pix) && img.band_ok(pix, b)
         };
         // each source cell's gradient, band by band
-        let mut cen = Centroids::new(self.measure);
         let mut grad = vec![[0.0f64; 2]; s.p.len() * nb];
-        let mut nbrs: Vec<Nbr> = Vec::with_capacity(8);
-        for (i, &[r, c]) in s.rc.iter().enumerate() {
+        let mut cands: Vec<Cand> = Vec::with_capacity(12);
+        let mut nbrs: Vec<Nbr> = Vec::with_capacity(12);
+        for i in 0..s.p.len() {
+            cands.clear();
+            stencil(i, &mut cands);
             for b in 0..nb {
                 if !ok(s.p[i], b) {
                     continue;
                 }
                 nbrs.clear();
-                for dr in -1..=1 {
-                    for dc in -1..=1 {
-                        if (dr, dc) == (0, 0) {
-                            continue;
-                        }
-                        if let Some(p) = buf(r + dr, c + dc).filter(|&p| ok(p, b)) {
-                            nbrs.push(Nbr { at: cen.at(r + dr, c + dc), angle: 0.0, grad: [0.0; 2], p });
-                        }
-                    }
-                }
+                nbrs.extend(cands.iter().filter(|c| ok(c.0, b)).map(|&(p, at)| Nbr { at, angle: 0.0, grad: [0.0; 2], p }));
                 if let Some(own) = green(s.centre[i], &mut nbrs) {
                     let f = |p: usize| img.px(p)[b].to_f64();
                     let mut g = [-own[0] * f(s.p[i]), -own[1] * f(s.p[i])];
@@ -399,6 +467,9 @@ impl Weights {
     /// data; for [`Weights::apply_second_order`] to give the same, mark it
     /// so there too. `None` for a source measured in its pixels.
     ///
+    /// For a table from a mesh's faces ([`PolyMesh::weights_to`]), use
+    /// [`PolyMesh::second_order`].
+    ///
     /// # Panics
     ///
     /// If the table has no moments, if `valid` or `areas` isn't the
@@ -412,7 +483,8 @@ impl Weights {
         let world = !self.src_cell_area.is_empty();
         match areas {
             Some(a) => {
-                assert!(world, "areas are for a table from a source with world cells");
+                // an empty table can't say what its source was
+                assert!(world || self.is_empty(), "areas are for a table from a source with world cells");
                 assert_eq!(a.len(), n, "areas must have one value per cell of the source window");
             }
             None => assert!(
@@ -428,34 +500,60 @@ impl Weights {
                 .filter(|&p| valid.is_none_or(|v| v[p]))
                 .filter(|&p| areas.is_none_or(|a| a[p] > 0.0))
         };
-        let s = self.sources(|k| at(self.src_row[k] as i64, self.src_col[k] as i64));
-        // each source cell's coefficients: (window cell, coefficient) for
-        // its neighbours, then its own
+        let s = self.sources(|k| at(self.src_row[k] as i64, self.src_col[k] as i64), |k| {
+            [self.src_col[k] as f64, self.src_row[k] as f64]
+        });
         let mut cen = Centroids::new(self.measure);
-        let (mut start, mut coef): (Vec<usize>, Vec<(usize, [f64; 2])>) = (vec![0], Vec::new());
-        let mut nbrs: Vec<Nbr> = Vec::with_capacity(8);
-        for (i, &[r, c]) in s.rc.iter().enumerate() {
-            nbrs.clear();
+        let mut stencil = |i: usize, out: &mut Vec<Cand>| {
+            let [r, c] = s.rc[i];
             for dr in -1..=1 {
                 for dc in -1..=1 {
                     if (dr, dc) == (0, 0) {
                         continue;
                     }
                     if let Some(p) = at(r + dr, c + dc) {
-                        nbrs.push(Nbr { at: cen.at(r + dr, c + dc), angle: 0.0, grad: [0.0; 2], p });
+                        out.push((p, cen.at(r + dr, c + dc)));
                     }
                 }
             }
+        };
+        let cell_area = |p: usize| match areas {
+            Some(a) => a[p],
+            None => self.measure.cell_area(ro + (p / src.ncol) as i64),
+        };
+        let place = |p: usize| ((src.row_off + p / src.ncol) as u32, (src.col_off + p % src.ncol) as u32);
+        self.fold_planes(&s, &mut stencil, &cell_area, &place, world)
+    }
+
+    /// [`Weights::second_order`] for the source cells `s` (by window
+    /// cell, or face), each one's candidate neighbours from `stencil`,
+    /// each window cell's measure `cell_area(p)` and full-grid `(row,
+    /// col)` `place(p)`; with `areas` each entry's source cell measure in
+    /// [`Weights::src_cell_area`].
+    pub(crate) fn fold_planes(
+        &self,
+        s: &Sources,
+        stencil: &mut Stencil<'_>,
+        cell_area: &dyn Fn(usize) -> f64,
+        place: &dyn Fn(usize) -> (u32, u32),
+        areas: bool,
+    ) -> Weights {
+        // each source cell's coefficients: (window cell, coefficient) for
+        // its neighbours, then its own
+        let (mut start, mut coef): (Vec<usize>, Vec<(usize, [f64; 2])>) = (vec![0], Vec::new());
+        let mut cands: Vec<Cand> = Vec::with_capacity(12);
+        let mut nbrs: Vec<Nbr> = Vec::with_capacity(12);
+        for i in 0..s.p.len() {
+            cands.clear();
+            stencil(i, &mut cands);
+            nbrs.clear();
+            nbrs.extend(cands.iter().map(|&(p, at)| Nbr { at, angle: 0.0, grad: [0.0; 2], p }));
             if let Some(own) = green(s.centre[i], &mut nbrs) {
                 coef.extend(nbrs.iter().map(|n| (n.p, n.grad)));
                 coef.push((s.p[i], [-own[0], -own[1]]));
             }
             start.push(coef.len());
         }
-        let cell_area = |p: usize| match areas {
-            Some(a) => a[p],
-            None => self.measure.cell_area(ro + (p / src.ncol) as i64),
-        };
         let mut w = Weights {
             dst_off: self.dst_off,
             dst_size: self.dst_size,
@@ -496,18 +594,185 @@ impl Weights {
             });
             let (dr, dc) = (self.dst_row[order[g]], self.dst_col[order[g]]);
             for &(p, f) in &acc {
+                let (sr, sc) = place(p);
                 w.dst_row.push(dr);
                 w.dst_col.push(dc);
-                w.src_row.push((src.row_off + p / src.ncol) as u32);
-                w.src_col.push((src.col_off + p % src.ncol) as u32);
+                w.src_row.push(sr);
+                w.src_col.push(sc);
                 w.frac.push(f);
-                if world {
+                if areas {
                     w.src_cell_area.push(cell_area(p));
                 }
             }
             g = end;
         }
         w
+    }
+}
+
+/// A mesh's faces as a table's sources ([`PolyMesh::weights_to`]): each
+/// face's candidate neighbours are the faces sharing a node with it
+/// (ESMF's), centred on the parts of them the table covers. Only faces
+/// whose covered part is one piece in the grid's cells (8-connected,
+/// slivers aside) take part, and a neighbour only if its cells' bounding
+/// box is next to the face's: a face the grid's seam cuts, or one on its
+/// far side, has no centre there that means anything.
+struct FaceStencil<'a> {
+    mesh: &'a PolyMesh,
+    /// The sources at each node: `at_node[start[n]..start[n + 1]]`.
+    start: Vec<usize>,
+    at_node: Vec<u32>,
+    /// Each source's covered part is one piece.
+    placed: Vec<bool>,
+    /// Its cells' bounding box: first and last row, first and last column.
+    bbox: Vec<[u32; 4]>,
+}
+
+impl<'a> FaceStencil<'a> {
+    fn new(mesh: &'a PolyMesh, w: &Weights, s: &Sources) -> Self {
+        let n = s.p.len();
+        // each source's cells, (row, col), sorted
+        let mut cells: Vec<(u32, u32, u32)> = (0..w.len())
+            .filter(|&k| s.of[k] != u32::MAX && w.frac[k] > SLIVER)
+            .map(|k| (s.of[k], w.dst_row[k], w.dst_col[k]))
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        let (mut placed, mut bbox) = (vec![false; n], vec![[0u32; 4]; n]);
+        let mut a = 0;
+        while a < cells.len() {
+            let i = cells[a].0 as usize;
+            let mut b = a;
+            while b < cells.len() && cells[b].0 as usize == i {
+                b += 1;
+            }
+            let rc: Vec<(u32, u32)> = cells[a..b].iter().map(|t| (t.1, t.2)).collect();
+            placed[i] = connected(&rc);
+            let (c0, c1) = rc.iter().fold((u32::MAX, 0), |(lo, hi), t| (lo.min(t.1), hi.max(t.1)));
+            bbox[i] = [rc[0].0, rc[rc.len() - 1].0, c0, c1];
+            a = b;
+        }
+        let face = |i: usize| s.rc[i][1] as usize;
+        let mut start = vec![0usize; mesh.nnode() + 1];
+        for i in 0..n {
+            for &v in mesh.face(face(i)) {
+                start[v + 1] += 1;
+            }
+        }
+        for v in 0..mesh.nnode() {
+            start[v + 1] += start[v];
+        }
+        let mut fill = start.clone();
+        let mut at_node = vec![0u32; start[mesh.nnode()]];
+        for i in 0..n {
+            for &v in mesh.face(face(i)) {
+                at_node[fill[v]] = i as u32;
+                fill[v] += 1;
+            }
+        }
+        FaceStencil { mesh, start, at_node, placed, bbox }
+    }
+
+    /// Source `i`'s candidates, by its face's nodes.
+    fn cands(&self, s: &Sources, i: usize, out: &mut Vec<Cand>) {
+        if !self.placed[i] {
+            return;
+        }
+        let b = self.bbox[i];
+        let next = |c: [u32; 4]| {
+            c[0] as i64 <= b[1] as i64 + 1
+                && c[1] as i64 >= b[0] as i64 - 1
+                && c[2] as i64 <= b[3] as i64 + 1
+                && c[3] as i64 >= b[2] as i64 - 1
+        };
+        for &v in self.mesh.face(s.rc[i][1] as usize) {
+            for &j in &self.at_node[self.start[v]..self.start[v + 1]] {
+                let j = j as usize;
+                if j != i && self.placed[j] && next(self.bbox[j]) {
+                    out.push((s.p[j], s.centre[j]));
+                }
+            }
+        }
+        out.sort_unstable_by_key(|c| c.0);
+        out.dedup_by_key(|c| c.0);
+    }
+}
+
+/// Whether the cells `rc` (sorted, distinct) are one piece, each reached
+/// from the first through cells sharing a side or a corner.
+fn connected(rc: &[(u32, u32)]) -> bool {
+    let mut seen = vec![false; rc.len()];
+    let mut todo = vec![0usize];
+    seen[0] = true;
+    let mut reached = 1;
+    while let Some(i) = todo.pop() {
+        let (r, c) = (rc[i].0 as i64, rc[i].1 as i64);
+        for dr in -1..=1 {
+            for dc in -1..=1 {
+                let (r, c) = (r + dr, c + dc);
+                if r < 0 || c < 0 || r > u32::MAX as i64 || c > u32::MAX as i64 {
+                    continue;
+                }
+                if let Ok(j) = rc.binary_search(&(r as u32, c as u32)) {
+                    if !seen[j] {
+                        seen[j] = true;
+                        reached += 1;
+                        todo.push(j);
+                    }
+                }
+            }
+        }
+    }
+    reached == rc.len()
+}
+
+impl Weights {
+    /// Panics unless the table could be one from
+    /// [`PolyMesh::weights_to`] on `mesh`.
+    fn check_faces(&self, mesh: &PolyMesh) {
+        assert!(
+            self.src_row.iter().all(|&r| r == 0) && self.src_col.iter().all(|&c| (c as usize) < mesh.nface()),
+            "not a table from this mesh's faces (PolyMesh::weights_to): a source isn't one of its faces"
+        );
+        assert_eq!(
+            self.src_cell_area.len(),
+            self.len(),
+            "not a table from a mesh's faces (PolyMesh::weights_to): it has no face measures"
+        );
+    }
+
+    /// [`PolyMesh::apply_second_order`].
+    pub(crate) fn apply_faces_second_order<S: Sample, D: Sample>(
+        &self,
+        mesh: &PolyMesh,
+        src: &SourceBuffer<'_, S>,
+        norm: Normalization,
+        opts: &ApplyOptions,
+    ) -> Vec<D> {
+        self.check_faces(mesh);
+        let buf = buffer_index(src);
+        let s = self.sources(|k| buf(0, self.src_col[k] as i64), |k| [self.dst_col[k] as f64, self.dst_row[k] as f64]);
+        let faces = FaceStencil::new(mesh, self, &s);
+        self.apply_planes(src, norm, opts, &s, &mut |i, out| faces.cands(&s, i, out))
+    }
+
+    /// [`PolyMesh::second_order`].
+    pub(crate) fn faces_second_order(&self, mesh: &PolyMesh, valid: Option<&[bool]>) -> Weights {
+        self.check_faces(mesh);
+        let nface = mesh.nface();
+        if let Some(v) = valid {
+            assert_eq!(v.len(), nface, "valid must have one value per face");
+        }
+        let s = self.sources(
+            |k| Some(self.src_col[k] as usize).filter(|&f| valid.is_none_or(|v| v[f])),
+            |k| [self.dst_col[k] as f64, self.dst_row[k] as f64],
+        );
+        let faces = FaceStencil::new(mesh, self, &s);
+        let mut area = vec![f64::NAN; nface];
+        for (i, &k) in s.k0.iter().enumerate() {
+            area[s.p[i]] = self.src_cell_area[k as usize];
+        }
+        self.fold_planes(&s, &mut |i, out| faces.cands(&s, i, out), &|p| area[p], &|p| (0, p as u32), true)
     }
 }
 
@@ -571,6 +836,42 @@ mod tests {
         // two neighbours
         let mut n: Vec<Nbr> = ring(5.0, 5.0).into_iter().take(2).collect();
         assert!(green([5.5, 5.5], &mut n).is_none());
+    }
+
+    #[test]
+    fn cells_are_one_piece_through_sides_and_corners() {
+        assert!(connected(&[(4, 4)]));
+        assert!(connected(&[(0, 0), (0, 1), (1, 2), (2, 1)]));
+        assert!(!connected(&[(0, 0), (0, 1), (0, 3)]));
+        assert!(!connected(&[(0, 0), (2, 0)]));
+    }
+
+    #[test]
+    fn a_sliver_of_rounding_doesn_t_split_a_face() {
+        // one face over cells (0, 0) and (0, 1), and a sliver in (0, 5)
+        let mesh = PolyMesh::new(vec![0.0, 1.0, 1.0], vec![0.0, 0.0, 1.0], vec![0, 3], vec![0, 1, 2]).unwrap();
+        let mut w = Weights {
+            dst_row: vec![0; 3],
+            dst_col: vec![0, 1, 5],
+            src_row: vec![0; 3],
+            src_col: vec![0; 3],
+            frac: vec![0.5, 0.5, 1e-17],
+            src_cell_area: vec![2.0; 3],
+            moment: vec![[0.25, 0.25], [0.25, 0.25], [5e-18, 5e-18]],
+            dst_area: vec![1.0; 6],
+            dst_off: [0, 0],
+            dst_size: [6, 1],
+            measure: Measure::Planar,
+        };
+        let placed = |w: &Weights| {
+            let s = w.sources(|k| Some(w.src_col[k] as usize), |k| [w.dst_col[k] as f64, w.dst_row[k] as f64]);
+            let f = FaceStencil::new(&mesh, w, &s);
+            (f.placed[0], f.bbox[0])
+        };
+        assert_eq!(placed(&w), (true, [0, 0, 0, 1]));
+        // a real overlap there would
+        w.frac[2] = 1e-6;
+        assert_eq!(placed(&w), (false, [0, 0, 0, 5]));
     }
 
     #[test]

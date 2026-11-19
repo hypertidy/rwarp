@@ -595,9 +595,9 @@ fn a_grid_onto_a_mesh_has_moments() {
     }
     eprintln!("world cells onto the mesh: {whole} covered wholly, centred to {off:.1e}");
     assert!(whole > 100 && off < 1e-12, "{off:e}");
-    // a mesh's faces as sources aren't measured with moments yet
-    let e = mesh.weights_to(&inner, &grid, &opts).unwrap_err();
-    assert!(e.contains("first moments"), "{e}");
+    // the faces as sources have them too (tests/second_order_faces.rs)
+    let to = mesh.weights_to(&inner, &grid, &opts).unwrap();
+    assert_eq!(to.moment.len(), to.len());
 }
 
 #[test]
@@ -748,4 +748,18 @@ fn a_mesh_across_a_grids_seam_has_moments() {
     }
     eprintln!("across the grid's seam: {whole} cells covered wholly ({} west, {} east), centred to {off:.1e}", ends[0], ends[1]);
     assert!(whole == 100 && ends == [50, 50] && off < 1e-12, "{whole} {ends:?} {off:e}");
+}
+
+/// A table with no entries can't say whether its source has world cells,
+/// so the fold takes the areas for it, and gives an empty table.
+#[test]
+fn an_empty_table_folds_with_areas() {
+    let t = transformer(curved(20, 15), WORLD_GT);
+    let src = t.source_window();
+    // destination pixels in world coordinates, nowhere near the grid
+    let w = exact_weights(&t, &src, 4, 4, &WeightOptions::new(1).with_moments(true));
+    assert!(w.is_empty());
+    let areas = source_cell_areas(&t, &src).unwrap();
+    let folded = w.second_order(&src, None, Some(&areas));
+    assert!(folded.is_empty());
 }
