@@ -2282,7 +2282,7 @@ impl Scratch {
 
 impl<'a, T: Sample> Interleaved<'a, T> {
     #[inline]
-    fn px(&self, p: usize) -> &'a [T] {
+    pub(crate) fn px(&self, p: usize) -> &'a [T] {
         &self.src[p * self.nb..(p + 1) * self.nb]
     }
 
@@ -2305,7 +2305,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
     /// mask, which decides the centre check and, under
     /// [`BandNodata::Unified`] and [`BandNodata::AnyBand`], every band.
     #[inline]
-    fn pixel_ok(&self, pix: &[T]) -> bool {
+    pub(crate) fn pixel_ok(&self, pix: &[T]) -> bool {
         if let Some(a) = self.mask {
             if pix[a] == T::zero() { return false; }
         }
@@ -2318,7 +2318,7 @@ impl<'a, T: Sample> Interleaved<'a, T> {
 
     /// Whether band `b` of a source pixel contributes to band `b`.
     #[inline]
-    fn band_ok(&self, pix: &[T], b: usize) -> bool {
+    pub(crate) fn band_ok(&self, pix: &[T], b: usize) -> bool {
         match self.rule {
             BandNodata::Partial | BandNodata::PerBand => {
                 !self.is_nd(pix[b], b) && self.mask.map_or(true, |a| pix[a] != T::zero())
@@ -3655,6 +3655,9 @@ pub(crate) struct Lattice {
     /// ([`Cover::Pieces`]): `(col, row, fraction)` in buffer pixels, by
     /// row then column, each cell once.
     pub(crate) pieces: Vec<(i64, i64, f64)>,
+    /// With moments on in `win`, the pieces' first moments, one per piece
+    /// in the same order ([`cover_outline`]).
+    pub(crate) piece_moments: Vec<(i64, i64, [f64; 2])>,
     /// The source window's cells in world coordinates, when the
     /// transformer has them ([`Transformer::source_cells`]): the lattice
     /// is then in source world coordinates and each outline is measured
@@ -3701,7 +3704,7 @@ impl Lattice {
             lines: (0..worlds).map(|_| Lines::default()).collect(),
             level: LatticeLine::default(),
             rx: Vec::new(), ry: Vec::new(), win: controlledburn::CoverageWindow::default(),
-            wrap, sx: Vec::new(), pieces: Vec::new(), cells,
+            wrap, sx: Vec::new(), pieces: Vec::new(), piece_moments: Vec::new(), cells,
         };
         if multi {
             lat.find_turns(transformer, window);
@@ -3939,7 +3942,9 @@ impl Lattice {
         if self.cells.as_ref().is_some_and(|c| c.multi) { return self.cover_sheets(c); }
         if self.in_world() { return self.cover_world(c, size); }
         if !self.ring(0, c, src_off) { return Cover::Failed; }
-        let mut scratch = OutlineScratch { win: &mut self.win, sx: &mut self.sx, pieces: &mut self.pieces };
+        let mut scratch = OutlineScratch {
+            win: &mut self.win, sx: &mut self.sx, pieces: &mut self.pieces, moments: Some(&mut self.piece_moments),
+        };
         cover_outline(&mut self.rx, &mut self.ry, self.wrap, src_off.1, size, &mut scratch)
     }
 
@@ -4013,6 +4018,9 @@ pub(crate) struct OutlineScratch<'a> {
     pub(crate) win: &'a mut controlledburn::CoverageWindow,
     pub(crate) sx: &'a mut Vec<f64>,
     pub(crate) pieces: &'a mut Vec<(i64, i64, f64)>,
+    /// Where [`Cover::Pieces`] leaves the pieces' first moments, when the
+    /// window has moments on.
+    pub(crate) moments: Option<&'a mut Vec<(i64, i64, [f64; 2])>>,
 }
 
 /// Exact coverage of the buffer pixels (`ncol` by `nrow`) by the outline
@@ -4025,8 +4033,10 @@ pub(crate) struct OutlineScratch<'a> {
 /// goes around a pole; `row_off` is the buffer's first row in the full
 /// source), then measured at each whole-period offset at which it reaches
 /// the buffer: once, as [`Cover::Window`], or more than once, merged into
-/// [`Cover::Pieces`] (`scratch.pieces`). `rx` is left as measured: moved
-/// by the period if it reaches the buffer at one offset only.
+/// [`Cover::Pieces`] (`scratch.pieces`, and with moments on in the window
+/// their moments in `scratch.moments`, in the same order). `rx` is left
+/// as measured: moved by the period if it reaches the buffer at one
+/// offset only.
 pub(crate) fn cover_outline(
     rx: &mut Vec<f64>, ry: &mut Vec<f64>, wrap: Option<SourceWrap>, row_off: f64, (ncol, nrow): (i64, i64),
     scratch: &mut OutlineScratch<'_>,
@@ -4084,6 +4094,8 @@ pub(crate) fn cover_outline(
         }
         _ => {
             scratch.pieces.clear();
+            let mut moments = scratch.moments.as_deref_mut().filter(|_| win.moments());
+            if let Some(m) = moments.as_deref_mut() { m.clear(); }
             for &k in &hits[..n] {
                 let s = k as f64 * p;
                 scratch.sx.clear();
@@ -4094,8 +4106,10 @@ pub(crate) fn cover_outline(
                 win.add_ring(scratch.sx, ry, 1.0);
                 win.resolve();
                 push_pieces(win, (c0, r0, w), scratch.pieces);
+                if let Some(m) = moments.as_deref_mut() { push_piece_moments(win, (c0, r0, w), m); }
             }
             merge_pieces(scratch.pieces);
+            if let Some(m) = moments { merge_piece_moments(m); }
             Cover::Pieces
         }
     }
@@ -4130,6 +4144,32 @@ fn merge_pieces(pieces: &mut Vec<(i64, i64, f64)>) {
     pieces.sort_by_key(|&(c, r, _)| (r, c));
     pieces.dedup_by(|b, a| {
         if (a.0, a.1) == (b.0, b.1) { a.2 += b.2; true } else { false }
+    });
+}
+
+/// [`push_pieces`] for the window's first moments: the same cells, in the
+/// same order.
+fn push_piece_moments(win: &controlledburn::CoverageWindow, (c0, r0, w): (i64, i64, usize), out: &mut Vec<(i64, i64, [f64; 2])>) {
+    let (mx, my) = (win.moment_x(), win.moment_y());
+    for (i, &f) in win.coverage().iter().enumerate() {
+        if f != 0.0 {
+            out.push((c0 + (i % w) as i64, r0 + (i / w) as i64, [mx[i], my[i]]));
+        }
+    }
+}
+
+/// [`merge_pieces`] for the moments: the same sort and the same cells
+/// summed, so they stay one per piece in order.
+fn merge_piece_moments(m: &mut Vec<(i64, i64, [f64; 2])>) {
+    m.sort_by_key(|&(c, r, _)| (r, c));
+    m.dedup_by(|b, a| {
+        if (a.0, a.1) == (b.0, b.1) {
+            a.2[0] += b.2[0];
+            a.2[1] += b.2[1];
+            true
+        } else {
+            false
+        }
     });
 }
 

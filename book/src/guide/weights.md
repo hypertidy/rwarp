@@ -104,6 +104,60 @@ outer boundary:
 | lon/lat 0.5° to EPSG:3031 at 25 km, densify 1 / 4 | 6.0e-14 / 1.6e-14 | 3.3e-14 / 1.2e-14 | 3.8e-15 / 3.1e-15 |
 | lon/lat 0.5° to LAEA at 20 km, densify 1 / 4 | 2.1e-15 / 4.4e-16 | 3.3e-16 / 3.3e-16 | 1.9e-15 / 2.4e-15 |
 
+## Second order
+
+First order gives each target cell the area-weighted mean of the source
+values. ESMF's `conserve_2nd` (Kritsikis et al. 2017) gives each source
+cell a plane instead, `f + g · (x − c)`, and each overlap the plane's
+mean over it. The result is still conservative, and a smooth field comes
+out far closer.
+
+```rust,ignore
+let opts = WeightOptions::new(densify).with_moments(true);
+let w = exact_weights(&t, &src, ncol, nrow, &opts);
+let values: Vec<f32> = w.apply_second_order(&buf, Normalization::FracArea, &ApplyOptions::new());
+```
+
+- **`with_moments(true)`** records each overlap's first moments
+  (`Weights::moment`), from which its centroid follows. controlledburn's
+  window computes them exactly, beside the area.
+- **The gradient `g`** comes from the cell's eight neighbours, by Green's
+  theorem round the polygon of their centres, as ESMF does. It is zero,
+  so first order for that cell, where the neighbours don't surround the
+  cell's centre: at a corner of the source window.
+- **`c` is the centre of the part of the cell the table covers**, as in
+  ESMF. The gradient terms then integrate to zero over that part, so
+  under `DestArea` the integral is conserved exactly, even where a
+  target's edge or a mask cuts a source cell.
+- **`apply_second_order` estimates the gradients from the field it is
+  given.** A neighbour without data drops out of them, as a cell without
+  data drops out of `apply`.
+- **`Weights::second_order(&src, valid)` folds the gradients into one
+  table**, as ESMF's weight files hold it. Some of its weights are
+  negative. Use it to write files, for a fixed set of cells with data.
+
+What it gives, from `tests/second_order.rs` and
+`tests/esmf_second_order.rs`:
+
+- **Linear fields come out exactly.** A field linear in source pixels is
+  exact to 1e-14 in the interior, planar and on the sphere, where first
+  order is off by 0.16.
+- **The error is second order.** On a quadratic, halving the cell size
+  quarters it exactly. On a smooth sine it is 57 times smaller than first
+  order's.
+- **The weights are ESMF's**, to 6e-14, for a grid onto a grid, inside
+  the source and over its corner. Projected (0.5° lon/lat to EPSG:3031)
+  they differ by up to 0.022. There every overlap is a general polygon,
+  and ESMF centres it on the mean of its vertices rather than its
+  centroid, so ESMF's second order is off by up to 0.035 on a linear
+  field and rwarp's by 1e-14. With ESMF's vertex means in its place,
+  rwarp's table is ESMF's to 1e-12, away from target corners that fall
+  exactly on a source cell's wall.
+
+Moments are for sources measured in their pixels: a regular grid, planar
+or under `lonlat_measure`. Geolocation, mesh and `PolyMesh` sources are
+refused for now.
+
 ## Meshes of polygons
 
 An unstructured mesh, ICON's triangles, MPAS's hexagons, a UGRID or ESMF

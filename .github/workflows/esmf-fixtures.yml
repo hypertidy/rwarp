@@ -38,3 +38,4 @@ jobs:
           cargo test --test esmf -- --nocapture
           cargo test --test esmf_tripolar -- --nocapture
           cargo test --test esmf_mesh -- --nocapture
+          cargo test --test esmf_second_order -- --nocapture

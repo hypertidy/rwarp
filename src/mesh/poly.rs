@@ -731,6 +731,7 @@ fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, opts: &Wei
         src_col: e.iter().map(|t| t.2).collect(),
         frac: e.iter().map(|t| t.3).collect(),
         src_cell_area: e.iter().map(|t| t.4).collect(),
+        moment: Vec::new(),
         dst_area: areas,
         dst_off: [grid.col_off, grid.row_off],
         dst_size: [grid.ncol, grid.nrow],
@@ -770,6 +771,9 @@ impl Measurer {
     /// `inner`: the cells (each window cell's measure in `areas`) and the
     /// scratch, for [`Measurer::run`].
     fn new<T: Transformer>(mesh: &PolyMesh, inner: &T, grid: &GridWindow, opts: &WeightOptions) -> Result<Measurer, String> {
+        if opts.moments {
+            return Err("first moments (WeightOptions::moments) are not yet measured for a PolyMesh".into());
+        }
         if let Some(t) = opts.refine_tolerance {
             if t.is_nan() || t <= 0.0 {
                 return Err(format!("the refinement tolerance must be positive, not {t}"));
@@ -880,7 +884,7 @@ impl Measurer {
                     None | Some(WorldCells { multi: false, .. }) if !held(0) => (Cover::Failed, f64::NAN),
                     None => {
                         outline(0, rx, ry);
-                        let mut scratch = OutlineScratch { win, sx, pieces };
+                        let mut scratch = OutlineScratch { win, sx, pieces, moments: None };
                         let cover = cover_outline(rx, ry, wrap, row_off, size, &mut scratch);
                         (cover, measure.ring_area(rx, ry).abs())
                     }

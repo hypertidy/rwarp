@@ -20,6 +20,12 @@ area, as ESMF's S:
   densify 1, so rwarp must match it to rounding.
 - <case>.sph.txt: spherical (CoordSys.SPH_DEG), with corners in lon/lat and
   ESMF's great-circle edges. The test records rwarp's difference from it.
+- <case>.cart2.txt, for regular_coarser, regular_overhang and lonlat_3031:
+  ESMF's second-order map (conserve_2nd), Cartesian in source pixel
+  coordinates as .cart.txt, its weights summed per (row, col)
+  (ESMF gives one per source cell and neighbour). rwarp's
+  Weights::second_order is the same method there, so it must match to
+  rounding (tests/esmf_second_order.rs).
 - <case>.tr.txt, for regular_coarser and regular_finer: TempestRemap's
   first-order finite volume map (GenerateRLLMesh, GenerateOverlapMesh,
   GenerateOfflineMap --in_np 1). TempestRemap 2.2 builds lon/lat meshes with
@@ -175,13 +181,13 @@ def cell_field(g):
     return esmpy.Field(g, staggerloc=esmpy.StaggerLoc.CENTER)
 
 
-def conserve(src_grid, dst_grid):
+def conserve(src_grid, dst_grid, method=esmpy.RegridMethod.CONSERVE):
     src = cell_field(src_grid)
     dst = cell_field(dst_grid)
     frac = cell_field(dst_grid)
     area = cell_field(dst_grid)
     r = esmpy.Regrid(src, dst,
-                     regrid_method=esmpy.RegridMethod.CONSERVE,
+                     regrid_method=method,
                      norm_type=esmpy.NormType.DSTAREA,
                      unmapped_action=esmpy.UnmappedAction.IGNORE,
                      dst_frac_field=frac, factors=True)
@@ -248,10 +254,17 @@ def tempest(case, work):
         return frac_b, area_b, row, col, get("S")
 
 
+# The cases with a second-order map: inside the source, over its corner (cells
+# cut by the grid's edge, and missing neighbours), and projected.
+SECOND_ORDER = ("regular_coarser", "regular_overhang", "lonlat_3031")
+
+
 def write(path, case, kind, result):
     name, src_crs, src_gt, src_size, dst_crs, dst_gt, dst_size, note = case
     oracle = {
         "cart": f"ESMPy {esmpy.__version__} conserve, norm dstarea, Cartesian in source pixel space",
+        "cart2": f"ESMPy {esmpy.__version__} conserve_2nd, norm dstarea, Cartesian in source pixel space, "
+                 "summed per (row, col)",
         "sph": f"ESMPy {esmpy.__version__} conserve, norm dstarea, spherical, great-circle edges",
         "tr": "TempestRemap first-order FV (--in_np 1), great-circle edges",
     }[kind]
@@ -272,7 +285,7 @@ def write(path, case, kind, result):
 def write_map(path, header, kind, result):
     frac_b, area_b, row, col, s = result
     order = np.lexsort((col, row))
-    fmt = "%.17g" if kind == "cart" else "%.12g"
+    fmt = "%.17g" if kind in ("cart", "cart2") else "%.12g"
     with open(path, "w") as f:
         for h in header:
             f.write(f"# {h}\n")
@@ -664,6 +677,11 @@ def main():
         cart = conserve(grid(up(s_corner), up(s_centre), esmpy.CoordSys.CART),
                         grid(up(d_corner_px), up(d_centre_px), esmpy.CoordSys.CART))
         write(os.path.join(HERE, f"{name}.cart.txt"), case, "cart", cart)
+        if name in SECOND_ORDER:
+            cart2 = summed(conserve(grid(up(s_corner), up(s_centre), esmpy.CoordSys.CART),
+                                    grid(up(d_corner_px), up(d_centre_px), esmpy.CoordSys.CART),
+                                    esmpy.RegridMethod.CONSERVE_2ND))
+            write(os.path.join(HERE, f"{name}.cart2.txt"), case, "cart2", cart2)
         sph = conserve(grid(s_corner_ll, s_centre_ll, esmpy.CoordSys.SPH_DEG),
                        grid(d_corner_ll, d_centre_ll, esmpy.CoordSys.SPH_DEG))
         write(os.path.join(HERE, f"{name}.sph.txt"), case, "sph", sph)
