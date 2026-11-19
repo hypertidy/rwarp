@@ -634,3 +634,65 @@ fn refusals() {
         assert!(e.contains("positive"), "{e}");
     }
 }
+
+/// Every value of a table, bit for bit.
+fn bits(w: &Weights) -> Vec<u64> {
+    let mut v: Vec<u64> = [w.dst_off, w.dst_size].iter().flatten().map(|&x| x as u64).collect();
+    for ix in [&w.dst_row, &w.dst_col, &w.src_row, &w.src_col] {
+        v.push(ix.len() as u64);
+        v.extend(ix.iter().map(|&x| x as u64));
+    }
+    for f in [&w.frac, &w.dst_area, &w.src_cell_area] {
+        v.push(f.len() as u64);
+        v.extend(f.iter().map(|x| x.to_bits()));
+    }
+    v
+}
+
+/// On threads, both ways, the serial table bit for bit: a grid in pixels,
+/// one in longitude and latitude across the seam and round the poles
+/// under the spherical measure, refined edges in LAEA, and faces that
+/// fail.
+#[test]
+fn threads_are_the_serial_table() {
+    let mixed_t = || Ok::<_, String>(same(MIXED_GT));
+    let ll_gt = [-180.0, 2.0, 0.0, 90.0, 0.0, -2.0];
+    let ll = || Ok::<_, String>(lonlat(ll_gt, [180, 90], 0.0));
+    let laea = || GenImgProjTransformer::with_backend(LAEA_GT, WORLD_GT, Box::new(Laea), Box::new(Same));
+    let mesh = mixed(10, 9);
+    let seam = seam_and_poles();
+    let ring = ring_boxes();
+    let (x, y) = lattice(0.0, -3.0, 1.0, 1.0, 6, 3);
+    let (start, nodes) = quads(6, 3);
+    let gap = PolyMesh::new(x, y, start, nodes).unwrap();
+    let cases: Vec<(&PolyMesh, GridWindow, WeightOptions, usize)> = vec![
+        (&mesh, GridWindow::new(MIXED.0, MIXED.1), WeightOptions::new(2), 0),
+        (&seam, GridWindow::new(180, 90), WeightOptions::new(4).with_measure(lonlat_measure(ll_gt).unwrap()), 1),
+        (&ring, GridWindow::new(60, 60), WeightOptions::new(1).with_refine_tolerance(1e-4), 2),
+        (&gap, GridWindow::new(6, 3), WeightOptions::new(1).with_refine_tolerance(1e-3), 3),
+    ];
+    for (m, grid, opts, t) in cases {
+        let (onto, to) = match t {
+            0 => (m.weights_onto(&same(MIXED_GT), &grid, &opts), m.weights_to(&same(MIXED_GT), &grid, &opts)),
+            1 => (m.weights_onto(&ll().unwrap(), &grid, &opts), m.weights_to(&ll().unwrap(), &grid, &opts)),
+            2 => (m.weights_onto(&laea().unwrap(), &grid, &opts), m.weights_to(&laea().unwrap(), &grid, &opts)),
+            _ => (m.weights_onto(&Gap, &grid, &opts), m.weights_to(&Gap, &grid, &opts)),
+        };
+        let (onto, to) = (bits(&onto.unwrap()), bits(&to.unwrap()));
+        for threads in [1, 2, 3, 7] {
+            let (a, b) = match t {
+                0 => (m.weights_onto_par(mixed_t, &grid, &opts, threads), m.weights_to_par(mixed_t, &grid, &opts, threads)),
+                1 => (m.weights_onto_par(ll, &grid, &opts, threads), m.weights_to_par(ll, &grid, &opts, threads)),
+                2 => (m.weights_onto_par(laea, &grid, &opts, threads), m.weights_to_par(laea, &grid, &opts, threads)),
+                _ => (m.weights_onto_par(|| Ok(&Gap), &grid, &opts, threads), m.weights_to_par(|| Ok(&Gap), &grid, &opts, threads)),
+            };
+            assert!(bits(&a.unwrap()) == onto, "case {t}, {threads} threads: onto");
+            assert!(bits(&b.unwrap()) == to, "case {t}, {threads} threads: to");
+        }
+    }
+    // the first transformer's error, and the options' checks, come back
+    let e = mesh.weights_onto_par(|| Err::<GenImgProjTransformer, _>("no".to_string()), &GridWindow::new(2, 2), &WeightOptions::new(1), 4);
+    assert_eq!(e.unwrap_err(), "no");
+    let e = mesh.weights_to_par(mixed_t, &GridWindow::new(2, 2), &WeightOptions::new(1).with_refine_tolerance(-1.0), 4);
+    assert!(e.unwrap_err().contains("positive"));
+}

@@ -143,6 +143,10 @@ grid cell, its `frac` sums to 1 over the faces, as in
 - **From the mesh**, `src_col` is the face, `src_cell_area` its area, and
   `apply` takes the faces' values as a buffer `nface` wide and 1 high.
 
+`weights_onto_par` and `weights_to_par` do the same on threads, with a
+transformer built on each (`|| GenImgProjTransformer::new(...)`), and give
+the same table bit for bit.
+
 Edges are straight in the mesh's coordinates, or with
 `with_great_circles()` great circles between nodes in longitude and
 latitude, as ICON's and MPAS's are. Great circles need `densify` above 1

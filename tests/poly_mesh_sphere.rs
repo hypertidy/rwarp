@@ -480,3 +480,35 @@ fn an_arc_across_the_equator_is_followed() {
         }
     }
 }
+
+/// Every value of a table, bit for bit.
+fn bits(w: &Weights) -> Vec<u64> {
+    let mut v: Vec<u64> = [w.dst_off, w.dst_size].iter().flatten().map(|&x| x as u64).collect();
+    for ix in [&w.dst_row, &w.dst_col, &w.src_row, &w.src_col] {
+        v.push(ix.len() as u64);
+        v.extend(ix.iter().map(|&x| x as u64));
+    }
+    for f in [&w.frac, &w.dst_area, &w.src_cell_area] {
+        v.push(f.len() as u64);
+        v.extend(f.iter().map(|x| x.to_bits()));
+    }
+    v
+}
+
+/// On threads, the serial table bit for bit, great circles refined: the
+/// geodesic mesh and its dual, both ways.
+#[test]
+fn threads_are_the_serial_table() {
+    let ico = Sphere::icosahedron(4);
+    let meshes = [ico.mesh(0.0), ico.dual().mesh(0.0)];
+    let make = || Ok::<_, String>(global(2.0).0);
+    let (t, grid, opts) = global(2.0);
+    let opts = opts.with_refine_tolerance(1e-3);
+    for m in &meshes {
+        let (onto, to) = (bits(&m.weights_onto(&t, &grid, &opts).unwrap()), bits(&m.weights_to(&t, &grid, &opts).unwrap()));
+        for threads in [2, 5] {
+            assert!(bits(&m.weights_onto_par(make, &grid, &opts, threads).unwrap()) == onto, "{threads} threads: onto");
+            assert!(bits(&m.weights_to_par(make, &grid, &opts, threads).unwrap()) == to, "{threads} threads: to");
+        }
+    }
+}

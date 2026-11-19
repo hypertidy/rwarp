@@ -67,6 +67,13 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   1.1e-13; onto a set the faces tile every cell to 1e-12. The world-cell
   measure is factored out of the exact footprint's lattice
   (`WorldCells`); warp and weights hashes are unchanged.
+- `PolyMesh::weights_onto_par` and `weights_to_par`: on threads, a
+  transformer built on each, the faces in ranges taken in turn and joined
+  in order, the serial table bit for bit (conservative stage 5, #39). A
+  geodesic mesh of 20480 great-circle triangles onto a global 0.25 degree
+  grid, refined: 0.52 s serial, 0.12 s on 8 threads; to the grid 0.63 s
+  and 0.25 s. `weights_to` now groups its entries by cell with a counting
+  sort (same order, faster).
 
 ### Fixed
 

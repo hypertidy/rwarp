@@ -500,7 +500,28 @@ geotransform `WORLD_GT`.
     is covered once over to 1e-12, the caps reach none, and the fractions
     are the set's burn of the boxes to 8.2e-7 (its `f32` and slivers).
 
-Later: threads. Mesh to mesh stays out of scope.
+**Status (2026-11-19): threads built**, `PolyMesh::weights_onto_par` and
+`weights_to_par`, the serial table bit for bit:
+
+- A face's results don't depend on the faces measured with it: its
+  points are transformed point by point, a segment's refinement depends
+  only on its ends, and the cells, the worlds' turns and the window are
+  the same on every thread. So the faces are cut into about four ranges a
+  thread, taken in turn (`mesh::set::in_parallel_with`), each thread with
+  a transformer of its own and its own copy of the cells (`Measurer`),
+  and the ranges are joined in order.
+- `weights_to` groups its entries by grid cell with a counting sort,
+  which keeps faces in order within a cell as the stable sort did.
+- Checked bit for bit against serial at 1 to 7 threads, both ways, on
+  every kind of grid (pixels, longitude and latitude across the seam and
+  round the poles, refined LAEA, great circles, a curvilinear mesh,
+  geolocation arrays, a set in two worlds, faces that fail); the serial
+  tables themselves hash as before on 16 tables. A geodesic mesh of
+  20480 great-circle triangles onto a global 0.25 degree grid, refined to
+  1e-3 pixels: 0.52 s serial, 0.12 s on 8 threads (4.2x); to the grid
+  0.63 s and 0.25 s (2.6x, the grouping by cell serial).
+
+Mesh to mesh stays out of scope.
 
 ## 8. Stage 6: second order
 
