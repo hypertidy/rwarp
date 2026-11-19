@@ -90,7 +90,7 @@ fn ours(fx: &Fixture, w: &Weights) -> Ours {
     let [sw, sh] = fx.nums::<2>("src_size").map(|v| v as usize);
     let [dw, _] = fx.nums::<2>("dst_size").map(|v| v as usize);
     let src = GridWindow::new(sw, sh);
-    let folded = w.second_order(&src, None);
+    let folded = w.second_order(&src, None, None);
     let s = folded.normalised(Normalization::DestArea);
     let (row, col) = folded.esmf_row_col(dw, sw);
     let covered = w.dst_covered();

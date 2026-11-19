@@ -547,7 +547,28 @@ of stage 1's weights, and doesn't change the coverage engine.
   `Weights::second_order` folds them into ESMF's single matrix, given the
   cells with data, for weight files.
 
-**Status (2026-11-19): 6a built** (`src/weights/second_order.rs`).
+**Decided next (2026-11-19, the maintainer, each at the recommendation):**
+
+- **World-cell grids (geolocation, `MeshTransformer`, `MeshSet`): planes
+  in the cells' index space** under the walk's equal-area map, where the
+  overlaps are measured. The moments come from the same window, and the
+  neighbours are the eight round a cell in the full grid, so a set's
+  pieces, halos and the seam need nothing new. It conserves exactly, and
+  it is exact for fields linear in the indices, not for fields linear in
+  world coordinates (the map is affine only on each quarter of a cell);
+  on a smooth grid it is second order. The other option, world
+  coordinates as ESMF, needed a second pass clipping each overlap in
+  world coordinates and neighbours carried between a set's worlds.
+- **A `PolyMesh`'s faces as sources: planes in the grid's space**, where
+  their overlaps are measured, neighbours the faces sharing a node
+  (ESMF's), centres from the table. Apply and fold take the mesh.
+- **A limiter, opt-in:** Barth-Jespersen at apply time, off by default
+  (ESMF has none).
+
+Built in three steps: 6b the world-cell grids and grids onto meshes, 6c
+the faces as sources, 6d the limiter and spherical ESMF fixtures.
+
+**Status (2026-11-19): 6a and 6b built** (`src/weights/second_order.rs`).
 
 - **What's built:** `WeightOptions::with_moments`, `Weights::moment`,
   `Weights::apply_second_order` and `Weights::second_order`, for sources
@@ -585,14 +606,36 @@ of stage 1's weights, and doesn't change the coverage engine.
   - The folded table applied by `apply` is `apply_second_order` to 1e-12,
     with and without a mask.
   - Moments survive the seam's pieces, threads and tiles bit for bit.
-  - World-cell sources are refused.
+- **6b, world cells** (`tests/second_order_world.rs`): moments through
+  the walk (`WorldCells::cover_one`, and `offer` for a set's sheets and
+  worlds) and through `PolyMesh::weights_onto`'s measure;
+  `Weights::second_order` takes the window's world cell areas
+  (`weights::source_cell_areas`).
+  - Each entry's fraction and moments are the overlap's, clipped against
+    the cell's four triangles in world coordinates and mapped through the
+    split, to 3e-15 (2,083 entries on a curved grid; 2,408 across a
+    curved global mesh's seam, where an outline reaches it at both
+    ends). There a field linear in rows comes out exact to 4e-15.
+  - A field linear in the grid's indices comes out exact to 7e-15 (first
+    order 0.19).
+  - A world quadratic on the curved grid: second order's error falls
+    3.9 times as the cells halve (from 2e-5 to 5e-6), first order's
+    2.3 times.
+  - Conserved to 1e-12 under `DestArea` with cells without data; the
+    folded table applied is `apply_second_order` to 1e-14.
+  - The grid as a `MeshSet` in two bands, one turned 30 degrees, gives the
+    mesh's table to 3e-12 (through `SetTransformer` and `weights_to`),
+    the rounding of the split's areas in absolute coordinates.
+  - Onto a `PolyMesh`, a field linear in pixels is exact on the faces to
+    5e-14, and faces over a wrapping grid's seam centre its cells on their
+    middles; threads keep the moments bit for bit.
+  - Without moments every table and warp is as before, bit for bit
+    (ORCA2 hashes).
 - **Not built:**
-  - second order from geolocation, mesh (`MeshTransformer`, `MeshSet`) and
-    `PolyMesh` sources, which need their neighbours and centroids in world
-    coordinates;
-  - a gradient limiter (ESMF has none), so a second-order value can lie
-    outside its sources' range next to a sharp front;
-  - spherical ESMF fixtures for second order.
+  - second order from a `PolyMesh`'s faces as sources (6c);
+  - a gradient limiter (6d; ESMF has none), so a second-order value can
+    lie outside its sources' range next to a sharp front;
+  - spherical ESMF fixtures for second order (6d).
 
 ## 9. Interfaces and where things live
 

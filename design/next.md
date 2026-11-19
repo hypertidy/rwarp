@@ -98,9 +98,11 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
 ## Next, in order
 
 1. **The next stage on the board**: conservative stage 6 (#40, second
-   order). 6a is built for sources measured in their pixels (section 8 of
-   conservative.md), on controlledburn 0.3.3's
-   `CoverageWindow::set_moments`. Left: world-cell and mesh sources.
+   order), section 8 of conservative.md. 6a (sources measured in their
+   pixels, on controlledburn 0.3.3's `CoverageWindow::set_moments`) and
+   6b (world-cell grids, in their index space, and grids onto meshes)
+   are built. Left, as decided on 2026-11-19: 6c a `PolyMesh`'s faces as
+   sources, 6d an opt-in limiter and spherical ESMF fixtures.
 2. **Decisions**: none waiting. N2, N5 and C1 to C4 were decided on
    2026-11-19 (#111). N5 (#47) is built, and adaptive predicates weren't
    needed (see N5 in decisions.md).
