@@ -3435,10 +3435,11 @@ impl WorldCells {
     /// period, the outline is unwrapped first (and closed along latitude
     /// 90 or -90 if it goes round a pole), then walked at each whole turn
     /// at which it reaches the mesh's longitudes, as [`cover_outline`]
-    /// does in source pixels. `rx` is left unwrapped.
+    /// does in source pixels. `rx` is left unwrapped. Pieces (and with
+    /// moments on in the window, their moments) go to `scratch`, as
+    /// [`cover_outline`] leaves them.
     pub(crate) fn cover_one(
-        &mut self, rx: &mut Vec<f64>, ry: &mut Vec<f64>, (ncol, nrow): (i64, i64),
-        win: &mut controlledburn::CoverageWindow, pieces: &mut Vec<(i64, i64, f64)>,
+        &mut self, rx: &mut Vec<f64>, ry: &mut Vec<f64>, (ncol, nrow): (i64, i64), scratch: &mut OutlineScratch<'_>,
     ) -> Cover {
         if rx.iter().chain(ry.iter()).any(|v| !v.is_finite()) { return Cover::Failed; }
         let (k0, k1, p) = match self.wrap {
@@ -3456,7 +3457,7 @@ impl WorldCells {
         let mesh = &sheets[0].mesh;
         debug_assert_eq!((mesh.ncol() as i64, mesh.nrow() as i64), (ncol, nrow));
         let mut hit = None;
-        pieces.clear();
+        scratch.clear_pieces();
         for k in k0..=k1 {
             let s = k as f64 * p;
             self.world.clear();
@@ -3481,16 +3482,16 @@ impl WorldCells {
             // a second turn reaches the mesh: the first's coverage, still
             // in the window, goes to the pieces before the window is reused
             if let Some(Some(first)) = hit {
-                push_pieces(win, first, pieces);
+                scratch.push_window(first);
             }
             let w = (c1 - c0) as usize;
-            win.reset(c0, r0, w, (r1 - r0) as usize);
-            win.add_ring(&self.ix, &self.iy, 1.0);
-            win.resolve();
+            scratch.win.reset(c0, r0, w, (r1 - r0) as usize);
+            scratch.win.add_ring(&self.ix, &self.iy, 1.0);
+            scratch.win.resolve();
             hit = match hit {
                 None => Some(Some((c0, r0, w))),
                 Some(_) => {
-                    push_pieces(win, (c0, r0, w), pieces);
+                    scratch.push_window((c0, r0, w));
                     Some(None)
                 }
             };
@@ -3499,7 +3500,7 @@ impl WorldCells {
             None => Cover::Outside,
             Some(Some((c0, r0, w))) => Cover::Window { c0, r0, w },
             Some(None) => {
-                merge_pieces(pieces);
+                scratch.merge_pieces();
                 Cover::Pieces
             }
         }
@@ -3508,8 +3509,8 @@ impl WorldCells {
     /// Start an outline's measure against cells in several sheets or
     /// worlds: offer it in each world ([`WorldCells::offer`]), then
     /// [`WorldCells::finish`].
-    pub(crate) fn begin(&mut self, pieces: &mut Vec<(i64, i64, f64)>) -> Offered {
-        pieces.clear();
+    pub(crate) fn begin(&mut self, scratch: &mut OutlineScratch<'_>) -> Offered {
+        scratch.clear_pieces();
         self.outline = f64::NAN;
         Offered { held: false, hits: 0, most: f64::NEG_INFINITY, first: None }
     }
@@ -3521,10 +3522,8 @@ impl WorldCells {
     /// sheets that its box meets, and covered in the sheet's index space,
     /// offset to buffer pixels. False when it can't be walked: the measure
     /// fails.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn offer(
-        &mut self, k: usize, own: f64, rx: &[f64], ry: &[f64], win: &mut controlledburn::CoverageWindow,
-        pieces: &mut Vec<(i64, i64, f64)>, st: &mut Offered,
+        &mut self, k: usize, own: f64, rx: &[f64], ry: &[f64], scratch: &mut OutlineScratch<'_>, st: &mut Offered,
     ) -> bool {
         let Ok(sheets) = &self.sheets else { return false };
         if rx.iter().chain(ry).any(|v| !v.is_finite()) { return true; }
@@ -3570,9 +3569,10 @@ impl WorldCells {
             // the sheet reached before, still in the window, goes to the
             // pieces before the window is reused
             if let Some(f) = st.first.take() {
-                push_pieces(win, f, pieces);
+                scratch.push_window(f);
             }
             let w = (c1 - c0) as usize;
+            let win = &mut *scratch.win;
             win.reset(c0, r0, w, (r1 - r0) as usize);
             win.add_ring(&self.ix, &self.iy, 1.0);
             win.resolve();
@@ -3586,7 +3586,7 @@ impl WorldCells {
             if st.hits == 1 {
                 st.first = Some(at);
             } else {
-                push_pieces(win, at, pieces);
+                scratch.push_window(at);
             }
         }
         if covered > 0.0 && covered > st.most {
@@ -3601,13 +3601,13 @@ impl WorldCells {
     /// failed when no world holds the outline. The outline area left
     /// ([`WorldCells::outline`]) is the world's whose sheets it covers
     /// most (by world area), or the first world's that holds it.
-    pub(crate) fn finish(&self, st: &Offered, pieces: &mut Vec<(i64, i64, f64)>) -> Cover {
+    pub(crate) fn finish(&self, st: &Offered, scratch: &mut OutlineScratch<'_>) -> Cover {
         if !st.held { return Cover::Failed; }
         match (st.hits, st.first) {
             (0, _) => Cover::Outside,
             (1, Some((c0, r0, w))) => Cover::Window { c0, r0, w },
             _ => {
-                merge_pieces(pieces);
+                scratch.merge_pieces();
                 Cover::Pieces
             }
         }
@@ -3955,7 +3955,10 @@ impl Lattice {
         if !self.cells.as_ref().is_some_and(|w| w.ok()) { return Cover::Failed; }
         if !self.ring(0, c, (0.0, 0.0)) { return Cover::Failed; }
         let Some(cells) = &mut self.cells else { return Cover::Failed };
-        cells.cover_one(&mut self.rx, &mut self.ry, size, &mut self.win, &mut self.pieces)
+        let mut scratch = OutlineScratch {
+            win: &mut self.win, sx: &mut self.sx, pieces: &mut self.pieces, moments: Some(&mut self.piece_moments),
+        };
+        cells.cover_one(&mut self.rx, &mut self.ry, size, &mut scratch)
     }
 
     /// [`Lattice::cover`] against cells in several sheets or worlds: pixel
@@ -3966,16 +3969,23 @@ impl Lattice {
             self.cells = Some(cells);
             return Cover::Failed;
         }
-        let mut st = cells.begin(&mut self.pieces);
+        macro_rules! scratch {
+            () => {
+                OutlineScratch {
+                    win: &mut self.win, sx: &mut self.sx, pieces: &mut self.pieces, moments: Some(&mut self.piece_moments),
+                }
+            };
+        }
+        let mut st = cells.begin(&mut scratch!());
         let mut failed = false;
         for k in 0..self.lines.len() {
             if !self.ring(k, c, (0.0, 0.0)) { continue; }
-            if !cells.offer(k, 1.0, &self.rx, &self.ry, &mut self.win, &mut self.pieces, &mut st) {
+            if !cells.offer(k, 1.0, &self.rx, &self.ry, &mut scratch!(), &mut st) {
                 failed = true;
                 break;
             }
         }
-        let cover = if failed { Cover::Failed } else { cells.finish(&st, &mut self.pieces) };
+        let cover = if failed { Cover::Failed } else { cells.finish(&st, &mut scratch!()) };
         self.cells = Some(cells);
         cover
     }
@@ -4021,6 +4031,32 @@ pub(crate) struct OutlineScratch<'a> {
     /// Where [`Cover::Pieces`] leaves the pieces' first moments, when the
     /// window has moments on.
     pub(crate) moments: Option<&'a mut Vec<(i64, i64, [f64; 2])>>,
+}
+
+impl OutlineScratch<'_> {
+    /// Empty the pieces (and their moments).
+    fn clear_pieces(&mut self) {
+        self.pieces.clear();
+        if let Some(m) = self.moments.as_deref_mut() { m.clear(); }
+    }
+
+    /// The window's nonzero coverage (of buffer pixels `c0..c0 + w` from
+    /// row `r0`) onto the pieces, and with moments on in the window, its
+    /// moments onto theirs, in the same order.
+    fn push_window(&mut self, at: (i64, i64, usize)) {
+        push_pieces(self.win, at, self.pieces);
+        if let (true, Some(m)) = (self.win.moments(), self.moments.as_deref_mut()) {
+            push_piece_moments(self.win, at, m);
+        }
+    }
+
+    /// Sort and merge the pieces, and their moments the same way.
+    fn merge_pieces(&mut self) {
+        merge_pieces(self.pieces);
+        if let (true, Some(m)) = (self.win.moments(), self.moments.as_deref_mut()) {
+            merge_piece_moments(m);
+        }
+    }
 }
 
 /// Exact coverage of the buffer pixels (`ncol` by `nrow`) by the outline
@@ -4076,10 +4112,10 @@ pub(crate) fn cover_outline(
             n += 1;
         }
     }
-    let win = &mut *scratch.win;
     match n {
         0 => Cover::Outside,
         1 => {
+            let win = &mut *scratch.win;
             let k = hits[0];
             if k != 0 {
                 let s = k as f64 * p;
@@ -4093,23 +4129,19 @@ pub(crate) fn cover_outline(
             Cover::Window { c0, r0, w }
         }
         _ => {
-            scratch.pieces.clear();
-            let mut moments = scratch.moments.as_deref_mut().filter(|_| win.moments());
-            if let Some(m) = moments.as_deref_mut() { m.clear(); }
+            scratch.clear_pieces();
             for &k in &hits[..n] {
                 let s = k as f64 * p;
                 scratch.sx.clear();
                 scratch.sx.extend(rx.iter().map(|x| x + s));
                 let (c0, c1) = cols(k);
                 let w = (c1 - c0) as usize;
-                win.reset(c0, r0, w, h);
-                win.add_ring(scratch.sx, ry, 1.0);
-                win.resolve();
-                push_pieces(win, (c0, r0, w), scratch.pieces);
-                if let Some(m) = moments.as_deref_mut() { push_piece_moments(win, (c0, r0, w), m); }
+                scratch.win.reset(c0, r0, w, h);
+                scratch.win.add_ring(scratch.sx, ry, 1.0);
+                scratch.win.resolve();
+                scratch.push_window((c0, r0, w));
             }
-            merge_pieces(scratch.pieces);
-            if let Some(m) = moments { merge_piece_moments(m); }
+            scratch.merge_pieces();
             Cover::Pieces
         }
     }

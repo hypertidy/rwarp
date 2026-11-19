@@ -95,9 +95,12 @@
 //! `conserve_2nd`: each source cell's value is a plane over the cell, its
 //! gradient from the cell's neighbours, and each overlap takes the plane's
 //! mean over it. [`Weights::second_order`] folds the gradients into one
-//! table, as ESMF's weight files hold it. See the
-//! `weights::second_order` module (`src/weights/second_order.rs`) for the
-//! method and how it differs from ESMF's.
+//! table, as ESMF's weight files hold it. For a source with world cells
+//! the planes are in the cells' index space, where their overlaps are
+//! measured, and the fold takes the window's cell areas
+//! ([`source_cell_areas`]). See the `weights::second_order` module
+//! (`src/weights/second_order.rs`) for the method and how it differs from
+//! ESMF's.
 //!
 //! # ESMF and SCRIP weight files
 //!
@@ -159,7 +162,7 @@ pub use controlledburn::Measure;
 mod second_order;
 
 use crate::transform::Transformer;
-use crate::warp::{AreaMean, AreaReducer, BandNodata, Cover, DstNodata, Edges, Interleaved, Lattice, Nodata, Output, Res, Sample, SourceBuffer, WarpOptions};
+use crate::warp::{AreaMean, AreaReducer, BandNodata, Cover, DstNodata, Edges, Interleaved, Lattice, Nodata, Output, Res, Sample, SourceBuffer, WarpOptions, WorldCells};
 
 /// A window of a grid, with no data: `ncol` by `nrow` cells at
 /// `(col_off, row_off)` in the full grid. The source side of
@@ -206,6 +209,27 @@ pub fn lonlat_measure(src_gt: [f64; 6]) -> Option<Measure> {
         .then(|| Measure::cos_latitude(src_gt[3].to_radians(), src_gt[5].to_radians()))
 }
 
+/// Each cell's world area over the source window `src` (row-major), for
+/// a source with world cells ([`Transformer::source_cells`]): geolocation
+/// arrays, a [`QuadMesh`](crate::mesh::QuadMesh) through
+/// [`MeshTransformer`](crate::mesh::MeshTransformer), a
+/// [`MeshSet`](crate::mesh::MeshSet) through
+/// [`SetTransformer`](crate::mesh::SetTransformer). The measures
+/// [`Weights::src_cell_area`] holds for the table's own cells, for every
+/// cell of the window: what [`Weights::second_order`] needs of such a
+/// source, whose gradients draw on cells the table may not reach. `NaN`
+/// for a cell in none of a set's pieces. `None` for a source measured in
+/// its pixels, or when its cells can't be built.
+pub fn source_cell_areas(transformer: &impl Transformer, src: &GridWindow) -> Option<Vec<f64>> {
+    let cells = transformer.source_cells()?;
+    let w = WorldCells::new(cells, (src.col_off, src.row_off, src.ncol, src.nrow));
+    if !w.ok() {
+        return None;
+    }
+    let (nc, nr) = (src.ncol as i64, src.nrow as i64);
+    Some((0..nr).flat_map(|r| (0..nc).map(move |c| (c, r))).map(|(c, r)| w.cell_area(c, r)).collect())
+}
+
 /// `measure` with its row 0 moved to row `rows` of the grid it was given for.
 pub(crate) fn shift_rows(measure: Measure, rows: f64) -> Measure {
     match measure {
@@ -248,8 +272,9 @@ pub struct WeightOptions {
     pub measure: Measure,
     /// Also record each overlap's first moments ([`Weights::moment`]), for
     /// second-order remapping ([`Weights::apply_second_order`],
-    /// [`Weights::second_order`]). Default false. For sources measured in
-    /// their pixels: [`exact_weights`] panics for a source with world cells.
+    /// [`Weights::second_order`]). Default false. For any grid source:
+    /// one measured in its pixels, or one with world cells (moments in the
+    /// cells' index space; see [`Weights::moment`]).
     #[cfg_attr(feature = "serde", serde(default))]
     pub moments: bool,
 }
@@ -421,6 +446,13 @@ pub struct Weights {
     /// whatever `frac`'s snapping or rounding. Empty otherwise. What
     /// second-order remapping centres each source cell's gradient term on
     /// ([`Weights::apply_second_order`]).
+    ///
+    /// For a source with world cells the source pixels are the cells'
+    /// index space under the walk's equal-area map, where each cell is a
+    /// unit square holding its world area evenly: the centroid there, not
+    /// in world coordinates (the map is affine only on each quarter of a
+    /// cell). For a grid onto a mesh ([`PolyMesh::weights_onto`](crate::mesh::PolyMesh::weights_onto)),
+    /// the grid's cells are the source.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub moment: Vec<[f64; 2]>,
 }
@@ -514,10 +546,6 @@ fn check_indices(src: &GridWindow, dst_ncol: usize, dst_nrow: usize, opts: &Weig
 const WORLD_MEASURE: &str = "a source with world cells (Transformer::source_cells) is measured in its world coordinates: \
      WeightOptions::measure must be Measure::Planar";
 
-/// The message for moments from a source with world cells.
-const WORLD_MOMENTS: &str = "first moments (WeightOptions::moments) are for sources measured in their pixels, \
-     not yet for a source with world cells (Transformer::source_cells)";
-
 /// [`exact_weights_with`] for rows `band` of the `dst_ncol` by `dst_nrow`
 /// window, with the lattice kept in `lat` for the thread's next band.
 #[allow(clippy::too_many_arguments)]
@@ -547,7 +575,6 @@ fn weights_rows(
                 (src.col_off, src.row_off, src.ncol, src.nrow), (opts.dst_row_off, dst_nrow),
             );
             assert!(!l.in_world() || opts.measure == Measure::Planar, "{WORLD_MEASURE}");
-            assert!(!l.in_world() || !opts.moments, "{WORLD_MOMENTS}");
             l.win.set_measure(measure);
             l.win.set_moments(opts.moments);
             lat.insert(l)
@@ -662,7 +689,6 @@ pub fn exact_weights_par<X: Transformer>(
     check_indices(src, dst_ncol, dst_nrow, opts);
     let world = first.source_cells().is_some();
     assert!(!world || opts.measure == Measure::Planar, "{WORLD_MEASURE}");
-    assert!(!world || !opts.moments, "{WORLD_MOMENTS}");
     let per = dst_nrow.div_ceil(threads * 4).max(1);
     let n = dst_nrow.div_ceil(per);
     let next = std::sync::atomic::AtomicUsize::new(0);

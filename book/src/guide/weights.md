@@ -132,9 +132,11 @@ let values: Vec<f32> = w.apply_second_order(&buf, Normalization::FracArea, &Appl
 - **`apply_second_order` estimates the gradients from the field it is
   given.** A neighbour without data drops out of them, as a cell without
   data drops out of `apply`.
-- **`Weights::second_order(&src, valid)` folds the gradients into one
-  table**, as ESMF's weight files hold it. Some of its weights are
-  negative. Use it to write files, for a fixed set of cells with data.
+- **`Weights::second_order(&src, valid, areas)` folds the gradients
+  into one table**, as ESMF's weight files hold it. Some of its weights
+  are negative. Use it to write files, for a fixed set of cells with
+  data. `areas` is `None` for a source measured in its pixels, and
+  `weights::source_cell_areas(&t, &src)` for one with world cells.
 
 What it gives, from `tests/second_order.rs` and
 `tests/esmf_second_order.rs`:
@@ -154,8 +156,19 @@ What it gives, from `tests/second_order.rs` and
   rwarp's table is ESMF's to 1e-12, away from target corners that fall
   exactly on a source cell's wall.
 
-Moments are for sources measured in their pixels: a regular grid, planar
-or under `lonlat_measure`. Geolocation, mesh and `PolyMesh` sources are
+Moments come from any grid source: a regular grid, planar or under
+`lonlat_measure`, and a grid with world cells (geolocation arrays, a
+`QuadMesh` through `MeshTransformer`, a `MeshSet`), onto a grid or onto
+a mesh (`PolyMesh::weights_onto`, `MeshSet::weights_onto`). For world
+cells the planes are in the cells' index space, where rwarp measures
+their overlaps: each cell there is a unit square holding its world area
+evenly, so the moments are exact centroids and the neighbours are the
+eight round a cell in the full grid, whatever piece or band they're in.
+That is exact for a field linear in the grid's indices, and second order
+for a smooth field on a smooth grid, but not exact for a field linear in
+world coordinates (ESMF works in world coordinates instead). On a curved
+grid a world quadratic's error falls 3.9 times as the cells halve
+(`tests/second_order_world.rs`). A `PolyMesh`'s faces as sources are
 refused for now.
 
 ## Meshes of polygons

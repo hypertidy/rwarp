@@ -6,7 +6,6 @@
 //! tiles.
 
 use controlledburn::{CoverageWindow, Measure};
-use rwarp::mesh::{CellMap, MeshTransformer, QuadMesh};
 use rwarp::transform::SourceWrap;
 use rwarp::warp::{Nodata, SourceBuffer};
 use rwarp::weights::{exact_weights, exact_weights_par, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
@@ -203,7 +202,7 @@ fn the_folded_table_is_the_same_method() {
                     data[k] = -9999.0;
                 }
             }
-            let folded = w.second_order(&src_window(), mask.then_some(&valid[..]));
+            let folded = w.second_order(&src_window(), mask.then_some(&valid[..]), None);
             assert!(folded.moment.is_empty() && folded.frac.iter().any(|&f| f < 0.0));
             let buf = buffer(&src_window(), &data);
             let opts = ApplyOptions::new().with_src_nodata(Nodata::Value(-9999.0));
@@ -377,20 +376,4 @@ fn threads_and_tiles_keep_the_moments() {
     let plain = exact_weights(&t, &src_window(), 30, 24, &WeightOptions::new(4));
     assert!(plain.moment.is_empty());
     assert_eq!(plain.frac, whole.frac);
-}
-
-#[test]
-#[should_panic(expected = "first moments")]
-fn world_cell_sources_are_refused() {
-    let (nc, nr) = (6, 5);
-    let (mut x, mut y) = (Vec::new(), Vec::new());
-    for j in 0..=nr {
-        for i in 0..=nc {
-            x.push(140.0 + i as f64 + 0.1 * j as f64);
-            y.push(-40.0 - j as f64);
-        }
-    }
-    let mesh = QuadMesh::from_corners(nc, nr, x, y, CellMap::EqualArea).unwrap();
-    let t = MeshTransformer::new(mesh, "EPSG:4326", [140.0, 0.5, 0.0, -40.0, 0.0, -0.5], "EPSG:4326").unwrap();
-    exact_weights(&t, &GridWindow::new(nc, nr), 10, 8, &WeightOptions::new(1).with_moments(true));
 }

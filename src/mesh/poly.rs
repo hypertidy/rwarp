@@ -16,6 +16,10 @@ const CHUNK: usize = 1 << 16;
 /// window pixels, coverage a fraction of the cell's measure.
 type Cells = [(i64, i64, f64)];
 
+/// What [`Measurer::run`] gives each face to: the face, its measure, its
+/// cells and (with moments on, else empty) their first moments.
+type FaceFn<'a> = dyn FnMut(usize, f64, &Cells, &[[f64; 2]]) + 'a;
+
 /// A mesh of polygonal faces, triangles, hexagons or any mix, each a
 /// ring of the mesh's nodes: ICON's triangles, MPAS's hexagons, a UGRID
 /// or ESMF mesh. For conservative weights between the mesh and a grid,
@@ -296,7 +300,7 @@ impl PolyMesh {
         check_indices(grid, self.nface());
         let mut m = Measurer::new(self, inner, grid, opts)?;
         let mut part = OntoPart::default();
-        m.run(self, inner, 0..self.nface(), &mut |f, area, cells| part.add(grid, opts, f, area, cells));
+        m.run(self, inner, 0..self.nface(), &mut |f, area, cells, mo| part.add(grid, opts, f, area, cells, mo));
         Ok(self.onto_weights(vec![part], &m.areas, inner.source_cells().is_some(), opts))
     }
 
@@ -323,8 +327,8 @@ impl PolyMesh {
         threads: usize,
     ) -> Result<Weights, String> {
         check_indices(grid, self.nface());
-        let (parts, areas, world) = self.in_ranges(inner, grid, opts, threads, |p: &mut OntoPart, f, area, cells| {
-            p.add(grid, opts, f, area, cells)
+        let (parts, areas, world) = self.in_ranges(inner, grid, opts, threads, |p: &mut OntoPart, f, area, cells, mo| {
+            p.add(grid, opts, f, area, cells, mo)
         })?;
         Ok(self.onto_weights(parts, &areas, world, opts))
     }
@@ -347,6 +351,7 @@ impl PolyMesh {
             w.src_row.append(&mut p.src_row);
             w.src_col.append(&mut p.src_col);
             w.frac.append(&mut p.frac);
+            w.moment.append(&mut p.moment);
             if world {
                 w.src_cell_area.extend(p.at.iter().map(|&k| areas[k]));
             }
@@ -377,9 +382,10 @@ impl PolyMesh {
     /// Errors and panics as [`PolyMesh::weights_onto`].
     pub fn weights_to<T: Transformer>(&self, inner: &T, grid: &GridWindow, opts: &WeightOptions) -> Result<Weights, String> {
         check_indices(grid, self.nface());
+        no_moments_from_faces(opts)?;
         let mut m = Measurer::new(self, inner, grid, opts)?;
         let mut part = ToPart::default();
-        m.run(self, inner, 0..self.nface(), &mut |f, area, cells| part.add(f, area, cells));
+        m.run(self, inner, 0..self.nface(), &mut |f, area, cells, _| part.add(f, area, cells));
         let areas = std::mem::take(&mut m.areas);
         Ok(to_weights(vec![part], areas, grid, opts))
     }
@@ -395,8 +401,9 @@ impl PolyMesh {
         threads: usize,
     ) -> Result<Weights, String> {
         check_indices(grid, self.nface());
+        no_moments_from_faces(opts)?;
         let (parts, areas, _) =
-            self.in_ranges(inner, grid, opts, threads, |p: &mut ToPart, f, area, cells| p.add(f, area, cells))?;
+            self.in_ranges(inner, grid, opts, threads, |p: &mut ToPart, f, area, cells, _| p.add(f, area, cells))?;
         Ok(to_weights(parts, areas, grid, opts))
     }
 
@@ -410,7 +417,7 @@ impl PolyMesh {
         grid: &GridWindow,
         opts: &WeightOptions,
         threads: usize,
-        add: impl Fn(&mut A, usize, f64, &Cells) + Sync,
+        add: impl Fn(&mut A, usize, f64, &Cells, &[[f64; 2]]) + Sync,
     ) -> Result<(Vec<A>, Vec<f64>, bool), String> {
         let threads = match threads {
             0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
@@ -424,7 +431,7 @@ impl PolyMesh {
         let ranges: Vec<std::ops::Range<usize>> = (0..nface).step_by(per).map(|a| a..(a + per).min(nface)).collect();
         if threads <= 1 || ranges.len() <= 1 {
             let mut a = A::default();
-            m.run(self, &first, 0..nface, &mut |f, area, cells| add(&mut a, f, area, cells));
+            m.run(self, &first, 0..nface, &mut |f, area, cells, mo| add(&mut a, f, area, cells, mo));
             return Ok((vec![a], std::mem::take(&mut m.areas), world));
         }
         let areas = std::mem::take(&mut m.areas);
@@ -442,7 +449,7 @@ impl PolyMesh {
             |state: &mut (X, Measurer), i| {
                 let (t, m) = state;
                 let mut a = A::default();
-                m.run(self, t, ranges[i].clone(), &mut |f, area, cells| add(&mut a, f, area, cells));
+                m.run(self, t, ranges[i].clone(), &mut |f, area, cells, mo| add(&mut a, f, area, cells, mo));
                 a
             },
         )?;
@@ -664,22 +671,39 @@ struct OntoPart {
     src_row: Vec<u32>,
     src_col: Vec<u32>,
     frac: Vec<f64>,
+    moment: Vec<[f64; 2]>,
     at: Vec<usize>,
 }
 
 impl OntoPart {
-    fn add(&mut self, grid: &GridWindow, opts: &WeightOptions, f: usize, area: f64, cells: &Cells) {
+    /// Face `f`'s entries, from its `cells` and (with moments on, else
+    /// empty) their moments `mo`.
+    fn add(&mut self, grid: &GridWindow, opts: &WeightOptions, f: usize, area: f64, cells: &Cells, mo: &[[f64; 2]]) {
         self.dst_area.push(area);
-        for &(pc, pr, v) in cells {
+        for (i, &(pc, pr, v)) in cells.iter().enumerate() {
             if let Some(v) = opts.weight(v) {
                 self.dst_col.push(f as u32);
                 self.src_row.push((grid.row_off as i64 + pr) as u32);
                 self.src_col.push((grid.col_off as i64 + pc) as u32);
                 self.frac.push(v);
+                if let Some(&m) = mo.get(i) {
+                    self.moment.push(m);
+                }
                 self.at.push(pr as usize * grid.ncol + pc as usize);
             }
         }
     }
+}
+
+/// Second order from the faces (moments for [`PolyMesh::weights_to`])
+/// isn't built yet.
+fn no_moments_from_faces(opts: &WeightOptions) -> Result<(), String> {
+    if opts.moments {
+        return Err("first moments (WeightOptions::moments) are not yet measured for a PolyMesh's faces as sources \
+                    (PolyMesh::weights_to); they are for weights onto it"
+            .into());
+    }
+    Ok(())
 }
 
 /// A range of faces' overlaps from the mesh: (row, col) of the window,
@@ -758,7 +782,9 @@ struct Measurer {
     win: CoverageWindow,
     sx: Vec<f64>,
     pieces: Vec<(i64, i64, f64)>,
+    piece_moments: Vec<(i64, i64, [f64; 2])>,
     cells: Vec<(i64, i64, f64)>,
+    cell_moments: Vec<[f64; 2]>,
     rx: Vec<f64>,
     ry: Vec<f64>,
     pts: Points,
@@ -771,9 +797,6 @@ impl Measurer {
     /// `inner`: the cells (each window cell's measure in `areas`) and the
     /// scratch, for [`Measurer::run`].
     fn new<T: Transformer>(mesh: &PolyMesh, inner: &T, grid: &GridWindow, opts: &WeightOptions) -> Result<Measurer, String> {
-        if opts.moments {
-            return Err("first moments (WeightOptions::moments) are not yet measured for a PolyMesh".into());
-        }
         if let Some(t) = opts.refine_tolerance {
             if t.is_nan() || t <= 0.0 {
                 return Err(format!("the refinement tolerance must be positive, not {t}"));
@@ -814,8 +837,13 @@ impl Measurer {
             .collect();
         Ok(Measurer {
             world, nworld, d, tolerance: opts.refine_tolerance, edge, size, wrap, col_off, row_off, measure, areas,
-            win: CoverageWindow::with_measure(measure),
-            sx: Vec::new(), pieces: Vec::new(), cells: Vec::new(), rx: Vec::new(), ry: Vec::new(),
+            win: {
+                let mut w = CoverageWindow::with_measure(measure);
+                w.set_moments(opts.moments);
+                w
+            },
+            sx: Vec::new(), pieces: Vec::new(), piece_moments: Vec::new(), cells: Vec::new(), cell_moments: Vec::new(),
+            rx: Vec::new(), ry: Vec::new(),
             pts: Points::default(),
             moved: (0..nworld).map(|_| Points::default()).collect(),
             refined: (0..nworld).map(|_| Refined::default()).collect(),
@@ -825,18 +853,19 @@ impl Measurer {
     /// Each of `faces`' measure and its coverage of the window's cells,
     /// face by face: `f(face, measure, cells)` with `cells` `(col, row,
     /// coverage)` in window pixels, coverage a fraction of the cell's
-    /// measure (zeros included). A face that fails has measure `NaN` and
-    /// no cells. A face's results don't depend on the range it is in.
+    /// measure (zeros included), and with moments on their first moments,
+    /// one per cell (empty otherwise). A face that fails has measure `NaN`
+    /// and no cells. A face's results don't depend on the range it is in.
     fn run<T: Transformer>(
         &mut self,
         mesh: &PolyMesh,
         inner: &T,
         faces: std::ops::Range<usize>,
-        f: &mut dyn FnMut(usize, f64, &Cells),
+        f: &mut FaceFn<'_>,
     ) {
         let Measurer {
-            world, nworld, d, tolerance, edge, size, wrap, col_off, row_off, measure, win, sx, pieces, cells, rx, ry, pts,
-            moved, refined, ..
+            world, nworld, d, tolerance, edge, size, wrap, col_off, row_off, measure, win, sx, pieces, piece_moments,
+            cells, cell_moments, rx, ry, pts, moved, refined, ..
         } = self;
         let (nworld, d, tolerance, edge, size, wrap) = (*nworld, *d, *tolerance, *edge, *size, *wrap);
         let (col_off, row_off, measure) = (*col_off, *row_off, *measure);
@@ -864,6 +893,7 @@ impl Measurer {
             for (i, face) in (f0..f1).enumerate() {
                 let r = pts.at[i]..pts.at[i + 1];
                 cells.clear();
+                cell_moments.clear();
                 let held = |k: usize| {
                     moved[k].ok[r.clone()].iter().all(|&ok| ok) && !refined[k].failed.get(i).copied().unwrap_or(false)
                 };
@@ -880,48 +910,57 @@ impl Measurer {
                         }
                     }
                 };
+                let mut scratch = OutlineScratch { win, sx, pieces, moments: Some(piece_moments) };
                 let (cover, area) = match world {
                     None | Some(WorldCells { multi: false, .. }) if !held(0) => (Cover::Failed, f64::NAN),
                     None => {
                         outline(0, rx, ry);
-                        let mut scratch = OutlineScratch { win, sx, pieces, moments: None };
                         let cover = cover_outline(rx, ry, wrap, row_off, size, &mut scratch);
                         (cover, measure.ring_area(rx, ry).abs())
                     }
                     Some(w) if !w.multi => {
                         outline(0, rx, ry);
-                        let cover = w.cover_one(rx, ry, size, win, pieces);
+                        let cover = w.cover_one(rx, ry, size, &mut scratch);
                         (cover, Measure::Planar.ring_area(rx, ry).abs())
                     }
                     Some(w) => {
                         let own = mesh.own_turn(pts, r.clone());
-                        let mut st = w.begin(pieces);
+                        let mut st = w.begin(&mut scratch);
                         let mut cover = None;
                         for k in 0..nworld {
                             if !held(k) {
                                 continue;
                             }
                             outline(k, rx, ry);
-                            if !w.offer(k, own, rx, ry, win, pieces, &mut st) {
+                            if !w.offer(k, own, rx, ry, &mut scratch, &mut st) {
                                 cover = Some(Cover::Failed);
                                 break;
                             }
                         }
-                        let cover = cover.unwrap_or_else(|| w.finish(&st, pieces));
+                        let cover = cover.unwrap_or_else(|| w.finish(&st, &mut scratch));
                         (cover, w.outline)
                     }
                 };
                 let area = if matches!(cover, Cover::Failed) { f64::NAN } else { area };
+                let moments = win.moments();
                 match cover {
                     Cover::Window { c0, r0, w } => {
                         for (k, &v) in win.coverage().iter().enumerate() {
                             cells.push((c0 + (k % w) as i64, r0 + (k / w) as i64, v));
                         }
+                        if moments {
+                            cell_moments.extend(win.moment_x().iter().zip(win.moment_y()).map(|(&x, &y)| [x, y]));
+                        }
                     }
-                    Cover::Pieces => cells.extend_from_slice(pieces),
+                    Cover::Pieces => {
+                        cells.extend_from_slice(pieces);
+                        if moments {
+                            cell_moments.extend(piece_moments.iter().map(|m| m.2));
+                        }
+                    }
                     Cover::Failed | Cover::Outside => {}
                 }
-                f(face, area, cells);
+                f(face, area, cells, cell_moments);
             }
             f0 = f1;
         }

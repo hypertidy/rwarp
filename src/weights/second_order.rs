@@ -46,6 +46,24 @@
 //! ESMF's spherical method works in three dimensions on the sphere;
 //! this works in source pixels, under the source's measure.
 //!
+//! **A source with world cells** (geolocation arrays, a
+//! [`QuadMesh`](crate::mesh::QuadMesh) through
+//! [`MeshTransformer`](crate::mesh::MeshTransformer), a
+//! [`MeshSet`](crate::mesh::MeshSet) through
+//! [`SetTransformer`](crate::mesh::SetTransformer)) takes the same method
+//! in its cells' index space under the walk's equal-area map, where its
+//! overlaps are measured. There each cell is a unit square holding its
+//! world area evenly, so the moments are exact centroids, a whole cell's
+//! is its middle, and the neighbours are the eight round it in the full
+//! grid, whichever piece, band or world their cells are in. It conserves
+//! exactly, as above, and it is exact for fields linear in the grid's
+//! indices. It is not exact for fields linear in world coordinates: the
+//! equal-area map is affine only on each quarter of a cell, so a plane in
+//! index space is off a world plane by about how far the cells are from
+//! parallelograms. On a smooth grid that is second order too.
+//! [`Weights::second_order`] needs the window's world cell areas for such
+//! a source ([`source_cell_areas`](super::source_cell_areas)).
+//!
 //! [`Weights::apply_second_order`] estimates the gradients from the field
 //! at hand, so a neighbour without data drops out of them as a cell
 //! without data drops out of first-order [`Weights::apply`].
@@ -372,13 +390,35 @@ impl Weights {
     /// [`Weights::apply_second_order`]: [`Weights::apply`] would drop their
     /// entries and leave the gradient terms unbalanced.
     ///
+    /// `areas` is for a table from a source with world cells (one with
+    /// [`Weights::src_cell_area`]): each window cell's world area,
+    /// row-major, from [`source_cell_areas`](super::source_cell_areas) for
+    /// the same window. The folded table then has
+    /// [`Weights::src_cell_area`] too. A cell whose area isn't positive
+    /// (one in none of a set's pieces, or of no area) counts as without
+    /// data; for [`Weights::apply_second_order`] to give the same, mark it
+    /// so there too. `None` for a source measured in its pixels.
+    ///
     /// # Panics
     ///
-    /// If the table has no moments, or `valid` isn't the window's size.
-    pub fn second_order(&self, src: &GridWindow, valid: Option<&[bool]>) -> Weights {
+    /// If the table has no moments, if `valid` or `areas` isn't the
+    /// window's size, or if `areas` is given for a table from a source
+    /// measured in its pixels or missing for one with world cells.
+    pub fn second_order(&self, src: &GridWindow, valid: Option<&[bool]>, areas: Option<&[f64]>) -> Weights {
         let n = src.ncol * src.nrow;
         if let Some(v) = valid {
             assert_eq!(v.len(), n, "valid must have one value per cell of the source window");
+        }
+        let world = !self.src_cell_area.is_empty();
+        match areas {
+            Some(a) => {
+                assert!(world, "areas are for a table from a source with world cells");
+                assert_eq!(a.len(), n, "areas must have one value per cell of the source window");
+            }
+            None => assert!(
+                !world,
+                "a table from a source with world cells needs the window's cell areas (weights::source_cell_areas)"
+            ),
         }
         let (ro, co) = (src.row_off as i64, src.col_off as i64);
         let at = |r: i64, c: i64| -> Option<usize> {
@@ -386,6 +426,7 @@ impl Weights {
             (r >= 0 && c >= 0 && (r as usize) < src.nrow && (c as usize) < src.ncol)
                 .then(|| r as usize * src.ncol + c as usize)
                 .filter(|&p| valid.is_none_or(|v| v[p]))
+                .filter(|&p| areas.is_none_or(|a| a[p] > 0.0))
         };
         let s = self.sources(|k| at(self.src_row[k] as i64, self.src_col[k] as i64));
         // each source cell's coefficients: (window cell, coefficient) for
@@ -411,7 +452,10 @@ impl Weights {
             }
             start.push(coef.len());
         }
-        let cell_area = |p: usize| self.measure.cell_area(ro + (p / src.ncol) as i64);
+        let cell_area = |p: usize| match areas {
+            Some(a) => a[p],
+            None => self.measure.cell_area(ro + (p / src.ncol) as i64),
+        };
         let mut w = Weights {
             dst_off: self.dst_off,
             dst_size: self.dst_size,
@@ -457,6 +501,9 @@ impl Weights {
                 w.src_row.push((src.row_off + p / src.ncol) as u32);
                 w.src_col.push((src.col_off + p % src.ncol) as u32);
                 w.frac.push(f);
+                if world {
+                    w.src_cell_area.push(cell_area(p));
+                }
             }
             g = end;
         }

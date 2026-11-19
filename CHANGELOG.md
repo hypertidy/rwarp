@@ -99,8 +99,22 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     cuts general polygons from a lon/lat one, ESMF is off by up to 0.035
     on a linear field and rwarp is exact. Given ESMF's vertex means,
     rwarp gives ESMF's table to 1e-12.
-  - **Scope:** for sources measured in their pixels; geolocation, mesh
-    and `PolyMesh` sources are refused for now.
+  - **Scope:** any grid source, and a grid onto a mesh; a `PolyMesh`'s
+    faces as sources are refused for now.
+  - **Sources with world cells (6b):** geolocation arrays, a `QuadMesh`
+    through `MeshTransformer`, a `MeshSet` (through `SetTransformer` or
+    `weights_to`), and a grid onto a `PolyMesh` (`weights_onto`) or a
+    set (`weights_onto`). The planes are in the cells' index space under
+    the walk's equal-area map, where the overlaps are measured (decided
+    2026-11-19). The moments there are exact centroids: they are the
+    overlaps clipped against each cell's four triangles to 3e-15. A
+    field linear in the grid's indices comes out exact to 1e-14. A world
+    quadratic on a curved grid is second order (its error falls 3.9
+    times as the cells halve) though not exact, as the map is affine only
+    on each quarter of a cell. `Weights::second_order(src, valid, areas)`
+    takes the window's world cell areas for such a source, from the new
+    `weights::source_cell_areas`, as a gradient draws on cells the table
+    may not reach.
   - **Dependency:** controlledburn 0.3.3 (from 0.3.1), for `set_moments`.
 
 ### Changed
