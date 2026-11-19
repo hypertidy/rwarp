@@ -1,6 +1,6 @@
-# State and what's next (2026-11-18)
+# State and what's next (2026-11-19)
 
-Where rwarp stands at the end of the 2026-11-16 to 2026-11-18 session,
+Where rwarp stands at the end of the 2026-11-16 to 2026-11-19 session,
 and what to pick up. The long-term framing is in #52 and on the roadmap
 board (<https://github.com/orgs/hypertidy/projects/1>). The open
 decisions, with options and figures, are in [decisions.md](decisions.md).
@@ -58,6 +58,17 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
   `WeightOptions::refine_tolerance`, the exact footprint's edges refined
   by bigcurve (#103), and `burn_from` on a `QuadMesh` or `Rectilinear`
   for polygons in another CRS (#104).
+- **Conservative stage 5 (#39, closed 2026-11-18)**, section 7 of
+  `conservative.md`: `mesh::PolyMesh`, a mesh of polygons (ICON, MPAS,
+  UGRID, ESMF meshes), and conservative weights between it and a grid
+  both ways, `weights_onto` and `weights_to` (#106); great-circle edges,
+  `with_great_circles`, edges cut at the equator and nodes on the poles
+  taken along their meridians (#107); grids with world cells on the other
+  side, geolocation arrays, a `QuadMesh` or a `MeshSet`, through the
+  exact footprint's world-cell measure factored out as `WorldCells`
+  (#108); and threads, `weights_onto_par` and `weights_to_par`, bit for
+  bit (#109). Checked against ESMF (Cartesian to 6e-14; spherical, the
+  faces' areas to 8e-8) and against closed forms, clipping and burns.
 - **#76** fixed (#101); Open says what rwarp-r needs for it.
 
 ## Open
@@ -71,6 +82,12 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
   wanted: great-circle polygon edges for `burn_from` (close to #41), a
   tolerance in cells rather than world units, and bilinear cells
   through bigcurve.
+- **Left out of conservative stage 5** (#39): mesh to mesh (polygon
+  overlay, out of scope as the issue says); and a grid's own cells as
+  great circles, ESMF's lon/lat cells (rwarp's are bounded by parallels,
+  so the spherical maps against ESMF differ by those cells, `S` to
+  3.8e-3 at 5 degrees; see #41). Reading UGRID, MPAS and ICON files is
+  wxylib's.
 - **#76** is fixed in the crate (#101; 0.5.1, unreleased): with
   `split_antimeridian`, a full-width window with no jump takes GDAL's
   fill ratio split again. rwarp-r gets it with its next crate update;
@@ -79,8 +96,8 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
 
 ## Next, in order
 
-1. **The next stages on the board**: conservative stage 5 (#39,
-   meshes) and 6 (#40, second order).
+1. **The next stage on the board**: conservative stage 6 (#40, second
+   order).
 2. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
    C4 (#48 to #51).
 3. **The rest of controlledburn 0.3**: `burn_window` could replace
@@ -96,8 +113,10 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
   win-builder was never reviewed.
 - **Upstreaming the GDAL findings** (#34): parked until the PSC business
   settles.
-- **Great-circle cell edges** (#41): resumes with meshes and grids
-  defined by great circles, through bigcurve.
+- **Great-circle cell edges** (#41): a `PolyMesh`'s faces can be great
+  circles (#107). A grid's own cells as great circles (ESMF's) would need
+  curved source cells, a separate engine from controlledburn's
+  (`conservative.md` 5.2).
 - **garry** (Hugh Graham's belian-earth/garry): the MUR demo is merged
   in wxylib/refharvest (`demo/garry-mur`, PR #6). Running the garry
   steps needs garry 0.2.0. The issue for garry is drafted and not
