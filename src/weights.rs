@@ -41,7 +41,11 @@
 //!   defined here, whose edges are straight in source pixel space. Over
 //!   source world cells the measure is planar area in the source's world
 //!   coordinates (square degrees for longitude and latitude arrays), and
-//!   [`WeightOptions::measure`] must be [`Measure::Planar`].
+//!   [`WeightOptions::measure`] must be [`Measure::Planar`]. The measure
+//!   is the source side's: a destination in longitude and latitude with a
+//!   projected source has its `dst_area` planar in source pixel space, not
+//!   on the sphere (decision C4: a destination-side measure waits for a
+//!   use).
 //! - **`frac`** is the overlap's measure over the source cell's (1 for the
 //!   planar measure), unrounded `f64`. Because neighbouring destination outlines are built
 //!   from the same transformed points, the destination cells tile source
@@ -75,6 +79,13 @@
 //!   are scaled down by their coverage, so `sum_i value_i * dst_area_i` is
 //!   `sum_j frac_j a_j src_j`: the integral is conserved. ESMF `destarea`,
 //!   xESMF `conserve`.
+//!
+//! **The default is `FracArea`** ([`Normalization::default`]), which is
+//! not ESMF's: ESMF's default is `DSTAREA`, as is xESMF's `conservative`.
+//! A cell half off the source, at a grid's edge or a coast, keeps its
+//! mean under `FracArea` and comes out at half under `DestArea`. To
+//! compare with ESMF or xESMF's `conservative`, ask for
+//! [`Normalization::DestArea`] (decision C2, `design/decisions.md`).
 //!
 //! # ESMF and SCRIP weight files
 //!
@@ -310,7 +321,8 @@ impl WeightOptions {
 #[non_exhaustive]
 pub enum Normalization {
     /// Over the covered (and, in `apply`, valid) part of the destination
-    /// cell: the area-weighted mean. Matches `warp()`.
+    /// cell: the area-weighted mean. Matches `warp()`. The default, unlike
+    /// ESMF's (`DSTAREA`); see the module docs.
     #[default]
     FracArea,
     /// Over the whole destination cell (`dst_area`): conserves the
@@ -346,7 +358,9 @@ pub struct CellWeights<'a> {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct Weights {
-    /// Full-grid indices (offsets applied), one entry per overlapping pair.
+    /// Full-grid indices (offsets applied), one entry per overlapping pair:
+    /// `u32` per axis, so grids up to 4 billion cells a side (decision
+    /// C1; ESMF's flattened index is [`Weights::esmf_row_col`]).
     pub dst_row: Vec<u32>,
     pub dst_col: Vec<u32>,
     pub src_row: Vec<u32>,
