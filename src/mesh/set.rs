@@ -1664,7 +1664,7 @@ fn in_parallel<T: Send>(
 /// takes an item, so where building is slow the costliest items go to the
 /// threads that are ready. Err with an `init` error once the other
 /// threads have finished, or if a thread panicked.
-fn in_parallel_with<S, T: Send>(
+pub(super) fn in_parallel_with<S, T: Send>(
     n: usize,
     order: &[usize],
     threads: usize,
@@ -1714,7 +1714,7 @@ fn in_parallel_with<S, T: Send>(
         })
     });
     if !joined {
-        return Err("a burn thread panicked".into());
+        return Err("a worker thread panicked".into());
     }
     if let Some(e) = failed {
         return Err(e);

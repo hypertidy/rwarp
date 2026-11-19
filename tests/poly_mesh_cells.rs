@@ -433,3 +433,64 @@ fn a_measure_with_world_cells_is_refused() {
     assert!(e.contains("Planar"), "{e}");
 }
 
+
+/// Every value of a table, bit for bit.
+fn bits(w: &Weights) -> Vec<u64> {
+    let mut v: Vec<u64> = [w.dst_off, w.dst_size].iter().flatten().map(|&x| x as u64).collect();
+    for ix in [&w.dst_row, &w.dst_col, &w.src_row, &w.src_col] {
+        v.push(ix.len() as u64);
+        v.extend(ix.iter().map(|&x| x as u64));
+    }
+    for f in [&w.frac, &w.dst_area, &w.src_cell_area] {
+        v.push(f.len() as u64);
+        v.extend(f.iter().map(|x| x.to_bits()));
+    }
+    v
+}
+
+/// On threads, the serial table bit for bit, both ways: onto a curvilinear
+/// mesh, geolocation arrays across 180, a set in two worlds.
+#[test]
+fn threads_are_the_serial_table() {
+    let (x, y, start, nodes) = mixed(-1.3, 2.2, 1.7, 1.4, 16, 12, 0.25);
+    let curved_faces = PolyMesh::new(x, y, start, nodes).unwrap();
+    let quad = || MeshTransformer::with_backend(curved(), WORLD_GT, Box::new(Same), Box::new(Same));
+    let seam = seam_boxes();
+    let geo = || {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for j in 0..=36 {
+            for i in 0..=72 {
+                let lon = -180.0 + 5.0 * i as f64;
+                x.push(if lon >= 180.0 { lon - 360.0 } else { lon });
+                y.push(90.0 - 5.0 * j as f64);
+            }
+        }
+        let g = GeolocArrays::new(x, y, 73, 37, GeolocOptions::default().with_lon_wrap(true))?;
+        Ok::<_, String>(GenImgGeolocTransformer::with_backend(PixelGeo::Geoloc(g), PixelGeo::affine(WORLD_GT)?, Box::new(Same), Box::new(Same)))
+    };
+    let s = set();
+    let all_round = boxes_all_round();
+    let on_set = || {
+        let crs: Vec<(Box<dyn CrsTransform>, Box<dyn CrsTransform>)> =
+            vec![(Box::new(World(0, false)), Box::new(World(0, true))), (Box::new(World(1, false)), Box::new(World(1, true)))];
+        SetTransformer::with_backend(&s, WORLD_GT, crs)
+    };
+    let refined = WeightOptions::new(1).with_refine_tolerance(1e-6);
+    for threads in [2, 3] {
+        let g = quad().unwrap().source_window();
+        let (a, b) = (curved_faces.weights_onto(&quad().unwrap(), &g, &refined), curved_faces.weights_onto_par(quad, &g, &refined, threads));
+        assert!(bits(&a.unwrap()) == bits(&b.unwrap()), "curved onto, {threads} threads");
+        let (a, b) = (curved_faces.weights_to(&quad().unwrap(), &g, &refined), curved_faces.weights_to_par(quad, &g, &refined, threads));
+        assert!(bits(&a.unwrap()) == bits(&b.unwrap()), "curved to, {threads} threads");
+        let (g, o) = (GridWindow::new(72, 36), WeightOptions::new(2));
+        let (a, b) = (seam.weights_onto(&geo().unwrap(), &g, &o), seam.weights_onto_par(geo, &g, &o, threads));
+        assert!(bits(&a.unwrap()) == bits(&b.unwrap()), "geolocation onto, {threads} threads");
+        let (a, b) = (seam.weights_to(&geo().unwrap(), &g, &o), seam.weights_to_par(geo, &g, &o, threads));
+        assert!(bits(&a.unwrap()) == bits(&b.unwrap()), "geolocation to, {threads} threads");
+        let (g, o) = (on_set().unwrap().source_window(), WeightOptions::new(1).with_refine_tolerance(10.0));
+        let (a, b) = (all_round.weights_onto(&on_set().unwrap(), &g, &o), all_round.weights_onto_par(on_set, &g, &o, threads));
+        assert!(bits(&a.unwrap()) == bits(&b.unwrap()), "set onto, {threads} threads");
+        let (a, b) = (all_round.weights_to(&on_set().unwrap(), &g, &o), all_round.weights_to_par(on_set, &g, &o, threads));
+        assert!(bits(&a.unwrap()) == bits(&b.unwrap()), "set to, {threads} threads");
+    }
+}
