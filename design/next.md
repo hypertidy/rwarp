@@ -14,6 +14,7 @@ This file is a snapshot, so replace it rather than append to it.
 | rwarp | 0.4.1 | 2026-11-16 | `QuadMesh::burn_par`, `Rectilinear::burn_par` (#59, #63) |
 | rwarp | 0.4.0 | 2026-11-12 | controlledburn 0.3.1 (breaking for rwarp: its types are in rwarp's API); N6 recorded |
 | rwarp | 0.3.3 | 2026-11-12 | antimeridian split reads two edge windows, not the whole width; `merge_tile` |
+| controlledburn | 0.3.3 | 2026-11-19 | `CoverageWindow::set_moments` (first moments, for second order); burns the same as 0.3.2 |
 | controlledburn | 0.3.2 | 2026-11-12 | `burn_wkb_par`; burns the same as 0.3.1 |
 | controlledburn | 0.3.1 | 2026-11-12 | `relate_cells` (0.3.0: `burn_par`, `burn_window`, `merge_parts`, `f32` edges kept) |
 | bigcurve (crate) | 0.3.0 | 2026-11-04 | |
@@ -98,9 +99,8 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
 
 1. **The next stage on the board**: conservative stage 6 (#40, second
    order). 6a is built for sources measured in their pixels (section 8 of
-   conservative.md); it needs controlledburn's release with
-   `CoverageWindow::set_moments` (controlledburn-rs #51). Left: world-cell
-   and mesh sources.
+   conservative.md), on controlledburn 0.3.3's
+   `CoverageWindow::set_moments`. Left: world-cell and mesh sources.
 2. **Decisions**: none waiting. N2, N5 and C1 to C4 were decided on
    2026-11-19 (#111). N5 (#47) is built, and adaptive predicates weren't
    needed (see N5 in decisions.md).

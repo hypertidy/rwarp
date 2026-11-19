@@ -101,7 +101,7 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     rwarp gives ESMF's table to 1e-12.
   - **Scope:** for sources measured in their pixels; geolocation, mesh
     and `PolyMesh` sources are refused for now.
-  - **Dependency:** needs controlledburn with `set_moments` (0.3.3).
+  - **Dependency:** controlledburn 0.3.3 (from 0.3.1), for `set_moments`.
 
 ### Changed
 

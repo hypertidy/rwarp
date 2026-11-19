@@ -535,7 +535,7 @@ of stage 1's weights, and doesn't change the coverage engine.
 
 - **The moments live in controlledburn.** `CoverageWindow::set_moments`
   books each cell's first moments beside its coverage, planar and
-  `CosLatitude` (controlledburn-rs #51; rwarp needs the release with it).
+  `CosLatitude` (controlledburn-rs #51, released in 0.3.3).
 - **ESMF's centre for each source cell:** the centroid of the part of the
   cell the table covers, not the whole cell. It gives ESMF parity, and
   the mapped part is conserved exactly. Where a grid's edge or a mask cuts
