@@ -613,8 +613,9 @@ fn a_point_that_fails_fails_its_face() {
     }
 }
 
-/// Grids with world cells aren't supported yet, and a tolerance must be
-/// positive.
+/// A tolerance must be positive. (A grid with world cells is taken: the
+/// same cells as a `QuadMesh` are the identity; `tests/poly_mesh_cells.rs`
+/// has the rest.)
 #[test]
 fn refusals() {
     let (x, y) = lattice(0.0, -3.0, 1.0, 1.0, 6, 3);
@@ -624,9 +625,9 @@ fn refusals() {
     let (qx, qy) = lattice(0.0, -3.0, 1.0, 1.0, 6, 3);
     let q = QuadMesh::from_corners(6, 3, qx, qy, CellMap::EqualArea).unwrap();
     let mt = MeshTransformer::with_backend(q, WORLD_GT, Box::new(Same), Box::new(Same)).unwrap();
-    let e = mesh.weights_onto(&mt, &grid, &WeightOptions::new(1)).unwrap_err();
-    assert!(e.contains("world cells"), "{e}");
-    assert!(mesh.weights_to(&mt, &grid, &WeightOptions::new(1)).is_err());
+    let w = mesh.weights_onto(&mt, &grid, &WeightOptions::new(1)).unwrap();
+    assert_eq!(w.len(), 18);
+    assert!((0..18).all(|k| w.src_row[k] * 6 + w.src_col[k] == w.dst_col[k] && (w.frac[k] - 1.0).abs() < 1e-15));
     let t = same([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]);
     for tol in [0.0, -1.0, f64::NAN] {
         let e = mesh.weights_onto(&t, &grid, &WeightOptions::new(1).with_refine_tolerance(tol)).unwrap_err();

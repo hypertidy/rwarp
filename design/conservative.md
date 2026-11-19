@@ -458,8 +458,49 @@ MPAS's are.
     area at 5 degrees: `S` to 6.9e-4 onto the mesh and 3.8e-3 from it,
     recorded as ceilings.
 
-Later: a grid with world cells on the other side (geolocation, a
-`QuadMesh`, a `MeshSet`), and threads. Mesh to mesh stays out of scope.
+**Status (2026-11-18): 5c built**, a grid with world cells on the other
+side: geolocation arrays (`GenImgGeolocTransformer`), a `QuadMesh`
+(`MeshTransformer`), a `MeshSet` (`SetTransformer`), each with destination
+geotransform `WORLD_GT`.
+
+- **The engine is the exact footprint's again.** The lattice's measure
+  against world cells is factored out as `warp::WorldCells` (the sheets,
+  their areas, each world's turn, the wrap): `cover_one` for one sheet
+  (the outline walked onto the mesh at each turn of a period or
+  `lon_wrap`), and `begin`, `offer` once a world, `finish` for several.
+  The lattice gives it its outlines as before; warp and weights hashes
+  are unchanged, sets and pieces included.
+- **Faces in each world.** A face's points go to each of the source's
+  worlds (`dst_to_world_in`), refined there with the tolerance in world
+  units. The face's area is its planar area there (with several worlds,
+  in the one whose cells it covers most), `frac` a fraction of a cell's
+  world area, and the measure must be planar.
+- **Inside out.** In a set's polar projection a face near the far pole
+  comes out inside out round it, and its box covers the world. A pixel's
+  outline has one turn, so the lattice compares its turn in each world
+  with the world's. A face may be written either way round, so `offer`
+  takes the face's own turn too: the sign of its area in the mesh's
+  coordinates, unwrapped by the period and closed along a pole if it
+  goes round one (so a cap round the south pole has a turn, and in the
+  north world is left out). Each world's turn is voted from small
+  triangles at the faces' first nodes, as the lattice's is.
+- **Measured** (`tests/poly_mesh_cells.rs`):
+  - Quads, triangles and hexagons onto a curvilinear `QuadMesh` in the
+    same plane: every fraction is the face's overlap with the cell,
+    clipped independently (Sutherland and Hodgman), over its area, to
+    1.1e-13, at densify 1 and refined. The cells' own burn of the faces
+    agrees to `f32`, but for two slivers of 3e-7 where three faces meet
+    at a cell's corner, which it leaves out.
+  - A lon/lat `QuadMesh` with a period, and geolocation arrays with
+    `lon_wrap` stored from -180, give the fractions of the same cells as a
+    regular grid, to rounding (1e-12), across 180 and with a cap round
+    the pole.
+  - A set in a south-polar and a north-polar LAEA, under boxes all round
+    written either way, and caps round both poles: every cell of the set
+    is covered once over to 1e-12, the caps reach none, and the fractions
+    are the set's burn of the boxes to 8.2e-7 (its `f32` and slivers).
+
+Later: threads. Mesh to mesh stays out of scope.
 
 ## 8. Stage 6: second order
 
