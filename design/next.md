@@ -98,8 +98,9 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
 
 1. **The next stage on the board**: conservative stage 6 (#40, second
    order).
-2. **Decisions waiting on the maintainer**: N2 and N5 (#44, #47), C1 to
-   C4 (#48 to #51).
+2. **Decisions**: none waiting. N2, N5 and C1 to C4 were decided on
+   2026-11-19 (#111). N5 (#47) is built, and adaptive predicates weren't
+   needed (see N5 in decisions.md).
 3. **The rest of controlledburn 0.3**: `burn_window` could replace
    `Cutline::burn_window` (check the records are identical first) and
    split one large geometry into tiles for `burn_par`; `relate_cells`

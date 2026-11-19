@@ -88,9 +88,41 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   to ask for to compare with ESMF's `DSTAREA` default), the lattice
   shared by `warp()` and `exact_weights`, and the measure on the source
   side only, said in the docs.
+- Decision N5 (#47), built: the curvilinear walk (`QuadMesh::burn`,
+  `cover_ring`, `ring_to_index`, and a mesh source's exact footprint)
+  keeps plain `f64` orientation tests, made consistent where
+  near-degenerate input meets them. A ring vertex within 1e-12 (index
+  space) of its cell's corner or side is put on it, and a crossing
+  within 1e-12 of an edge's end is put at the end, so a ring through the
+  mesh's own corners covers its cells exactly once and their neighbours
+  not at all (it gave a neighbour a sliver up to 2e-16 before). Each
+  segment is walked from its lexicographically smaller end, so a side two
+  polygons share has bitwise the same path from both (they could differ
+  by 3e-12 in coverage). Property tests (`tests/mesh_walk_degenerate.rs`,
+  71,000 checks, 290,000 at twenty times the cases) search vertices on
+  and within rounding of corners, sides, spokes and centres, segments
+  through them, along sides and at shallow angles, against the world
+  clip, complementary tilings and the ring reversed. No failure is left,
+  so adaptive predicates aren't needed. Output changes only in rounding:
+  on ORCA2 as a set, `warp()` and `weights_onto` are bit for bit the
+  same, and `weights_to` loses 560 entries of at most 1.4e-14 (1,171 at
+  densify 4) and moves no other by more than 1.8e-12.
 
 ### Fixed
 
+- The curvilinear walk (`QuadMesh::burn`, `cover_ring`, `ring_to_index`)
+  no longer loses a segment that starts an ulp off a corner (found by the
+  N5 property tests). Such a point can be owned, to rounding, by a cell
+  whose bounding box it is just outside, and the flood of cells along the
+  segment then stopped at that cell. The segment was taken as outside the
+  mesh, and the ring closed by a boundary arc, covering cells it doesn't
+  reach. The owner now counts as touched. Likewise a segment that enters
+  the mesh within rounding of an outer corner (an ulp off it, next to 0)
+  was missed: whether it meets an outer side is now decided by the
+  orientation tests' signs, not a box test they could contradict. And a
+  segment that leaves just past an outer corner now leaves through the
+  wall, not from inside the mesh by up to 1e-12 of its length: short
+  pieces of it are kept.
 - `ChunkOptions::split_antimeridian` with the fill ratio split
   (`with_fill_ratio_split`) no longer loses that split on a window that
   spans the source width with no jump in source x (#76), such as a

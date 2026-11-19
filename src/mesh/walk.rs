@@ -12,7 +12,9 @@
 //!    on, at its parameter along the edge's canonical direction: exact
 //!    along a side (the map is linear there) and along a spoke, and
 //!    bitwise the same for every ring that crosses that edge at that point
-//!    in either direction. Ring vertices use the cell's barycentric map.
+//!    in either direction (each segment is walked from its
+//!    lexicographically smaller end). Ring vertices use the cell's
+//!    barycentric map.
 //! 3. A part of the ring outside the mesh is replaced by the boundary arc
 //!    from its exit to its re-entry, the arc for which the excursion and
 //!    the arc together do not wind around the mesh. The arc lies on the
@@ -32,6 +34,18 @@
 //! straight through the collapsed cell's index square, which weighs
 //! nothing, and where that cell is on an outer wall, through it to the
 //! wall and then across the walls ([`Link`]).
+//!
+//! Near-degenerate input (a vertex on, or within rounding of, a corner, a
+//! side, a spoke or a split centre; a segment through one, or along a side)
+//! is walked with plain `f64` orientation tests (decision N5), made
+//! consistent where they meet: a vertex within `SNAP_EPS` of a cell's
+//! corner or side is put on it in index space, and so is a crossing within
+//! `SNAP_EPS` of an edge's end; the cell that owns a segment's start is
+//! taken as touched whatever its bounding box says; a segment meets an
+//! outer side by the orientation tests' signs; and a piece is kept however
+//! short, so a segment that grazes an outer corner leaves through the
+//! wall. `tests/mesh_walk_degenerate.rs` searches for failures against the
+//! world clip and complementary tilings.
 //!
 //! The walk uses the equal-area map whatever the mesh's [`CellMap`] (which
 //! is for its point methods): under `Bilinear` the preimage of a straight
@@ -115,6 +129,7 @@ struct Scratch {
     seen: Seen,
     stack: Vec<(usize, usize)>,
     pieces: Vec<Piece>,
+    stops: Vec<Stop>,
 }
 
 /// Gaps in segment parameter smaller than this join two pieces (the two
@@ -129,6 +144,12 @@ const WALL_EPS: f64 = 1e-9;
 /// Index-space distance beyond which two positions of one world point are
 /// on different walls that meet in the world, not the same point.
 const JUMP_EPS: f64 = 1e-6;
+
+/// Index-space distance within which a ring vertex is put onto the cell
+/// corner or side it is near, and the fraction of an edge within which a
+/// crossing is put onto the edge's end (decision N5). Far above the
+/// barycentric map's rounding, far below anything that weighs.
+const SNAP_EPS: f64 = 1e-12;
 
 /// An edge of a cell's four-triangle split.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -147,6 +168,19 @@ struct Piece {
     /// Index-space positions of the ends.
     p0: [f64; 2],
     p1: [f64; 2],
+}
+
+/// A point of a segment's path through the mesh: where it enters or
+/// leaves a triangle, at parameter `t` along the segment.
+#[derive(Debug, Clone, Copy)]
+struct Stop {
+    idx: [f64; 2],
+    world: [f64; 2],
+    t: f64,
+    /// Whether the stretch of segment from the stop before (or from the
+    /// segment's start) lies outside the mesh, or across two outer walls
+    /// that meet in the world.
+    out_before: bool,
 }
 
 /// A point of the ring as walked: index-space position when it is in the
@@ -240,13 +274,23 @@ fn dedup(mut v: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
 }
 
 /// Whether segments `a b` and `c d` intersect, ends included.
+///
+/// Decided by the orientation tests' signs alone where one segment's ends
+/// lie strictly either side of the other's line: then an end of the other
+/// with orientation zero is where they meet. (A box test there can
+/// disagree with the zero by rounding, or by underflow next to 0, and miss
+/// a segment that enters the mesh within rounding of an outer corner.)
+/// Only where both pairs have a zero, as for collinear segments, do boxes
+/// decide.
 fn segments_meet(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let d1 = orient(c, d, a);
     let d2 = orient(c, d, b);
     let d3 = orient(a, b, c);
     let d4 = orient(a, b, d);
-    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    let strict = |u: f64, v: f64| (u > 0.0 && v < 0.0) || (u < 0.0 && v > 0.0);
+    let touch = |u: f64, v: f64| u == 0.0 || v == 0.0;
+    if (strict(d1, d2) && (strict(d3, d4) || touch(d3, d4)))
+        || (strict(d3, d4) && touch(d1, d2))
     {
         return true;
     }
@@ -302,17 +346,21 @@ impl QuadMesh {
             Edge::Spoke { row, col, j } => {
                 let ux = self.cells[row * self.ncol + col].unit;
                 let uj = UNIT[j];
-                [
-                    col as f64 + (ux[0] + s * (uj[0] - ux[0])),
-                    row as f64 + (ux[1] + s * (uj[1] - ux[1])),
-                ]
+                let u = if s == 1.0 {
+                    uj
+                } else {
+                    [ux[0] + s * (uj[0] - ux[0]), ux[1] + s * (uj[1] - ux[1])]
+                };
+                [col as f64 + u[0], row as f64 + u[1]]
             }
         }
     }
 
     /// The index-space point where segment `a b` crosses edge `e`. The
-    /// parameter is computed from the edge's canonical ends, so it does not
-    /// depend on the segment's direction.
+    /// parameter is computed from the edge's canonical ends, and the
+    /// segment's ([`QuadMesh::segment_path`]), so it is the same whichever
+    /// way the segment is walked. A crossing within `SNAP_EPS` of an end
+    /// of the edge is at that end: a corner, or the split centre.
     fn crossing(&self, e: Edge, a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
         let (e0, e1) = self.edge_world(e);
         let oa = orient(a, b, e0);
@@ -322,7 +370,33 @@ impl QuadMesh {
         } else {
             (oa / (oa - ob)).clamp(0.0, 1.0)
         };
+        let s = if s <= SNAP_EPS {
+            0.0
+        } else if s >= 1.0 - SNAP_EPS {
+            1.0
+        } else {
+            s
+        };
         self.edge_index(e, s)
+    }
+
+    /// A ring vertex's position `[u, v]` in its cell's unit square, put
+    /// onto the corner or side it is within `SNAP_EPS` of. The barycentric
+    /// map places a vertex on a corner or a side within rounding of it,
+    /// and a little to the far side would give the neighbouring cell a
+    /// sliver of coverage. (A vertex near a spoke or the split centre is
+    /// left: they are inside the cell, so rounding there changes no
+    /// cell's coverage.)
+    fn snap(uv: [f64; 2]) -> [f64; 2] {
+        uv.map(|w| {
+            if w.abs() <= SNAP_EPS {
+                0.0
+            } else if (w - 1.0).abs() <= SNAP_EPS {
+                1.0
+            } else {
+                w
+            }
+        })
     }
 
     /// Index-space position of `p` through triangle `k` of cell
@@ -337,10 +411,11 @@ impl QuadMesh {
         let wa = orient(b, x, p) / d;
         let wb = orient(x, a, p) / d;
         let wx = 1.0 - wa - wb;
-        [
-            col as f64 + (wx * ux[0] + wa * ua[0] + wb * ub[0]),
-            row as f64 + (wx * ux[1] + wa * ua[1] + wb * ub[1]),
-        ]
+        let [u, v] = Self::snap([
+            wx * ux[0] + wa * ua[0] + wb * ub[0],
+            wx * ux[1] + wa * ua[1] + wb * ub[1],
+        ]);
+        [col as f64 + u, row as f64 + v]
     }
 
     /// Clip segment `a b` by triangle `k` of cell `(row, col)`. Returns the
@@ -422,7 +497,10 @@ impl QuadMesh {
     }
 
     /// Flood from `seeds` over the cells segment `a b` passes, collecting
-    /// its pieces.
+    /// its pieces. With `owned`, the seeds own `a`, so the segment touches
+    /// them whatever their clip says: a point within rounding of a corner
+    /// can be owned by a cell whose bounding box it is just outside, and
+    /// the segment from it may then meet only the cell's neighbours.
     #[allow(clippy::too_many_arguments)]
     fn flood(
         &self,
@@ -431,21 +509,23 @@ impl QuadMesh {
         ia: Option<[f64; 2]>,
         ib: Option<[f64; 2]>,
         seeds: &[(usize, usize)],
+        owned: bool,
         scratch: &mut Scratch,
     ) {
-        let Scratch { seen, stack, pieces: out } = scratch;
+        let Scratch { seen, stack, pieces: out, .. } = scratch;
         stack.clear();
         for &s in seeds {
             if seen.insert(s.0 * self.ncol + s.1) {
                 stack.push(s);
             }
         }
+        let owner = if owned { seeds.first().copied() } else { None };
         while let Some((r, c)) = stack.pop() {
-            let mut touched = false;
+            let mut touched = owner == Some((r, c));
             let q = self.corners(r, c);
             let cell = &self.cells[r * self.ncol + c];
             if cell.area2 == 0.0 {
-                touched = Self::meets_box(&q, a, b);
+                touched |= Self::meets_box(&q, a, b);
             } else if Self::meets_box(&q, a, b) {
                 // (a segment that misses the cell's box misses the cell)
                 for k in 0..4 {
@@ -522,7 +602,8 @@ impl QuadMesh {
         // the cell that owns `a`; failing that (`a` outside, or on a corner
         // whose owner by the low-index rule has no area, as next to a
         // tripolar grid's pivot) the cells near it
-        let start: Vec<(usize, usize)> = match self.locate_planar(a, hint) {
+        let owner = self.locate_planar(a, hint);
+        let start: Vec<(usize, usize)> = match owner {
             Some(s) => vec![s],
             None => self
                 .buckets()
@@ -530,7 +611,7 @@ impl QuadMesh {
                 .map(|k| (k / self.ncol, k % self.ncol))
                 .collect(),
         };
-        self.flood(a, b, ia, ib, &start, scratch);
+        self.flood(a, b, ia, ib, &start, owner.is_some(), scratch);
         let pieces = &mut scratch.pieces;
         pieces.sort_by(|p, q| p.t0.total_cmp(&q.t0).then(p.t1.total_cmp(&q.t1)));
         // Complete when the pieces join from 0 to 1; otherwise the segment
@@ -546,9 +627,83 @@ impl QuadMesh {
         }
         if !complete || reach < 1.0 - T_EPS {
             let seeds = self.boundary_seeds(a, b);
-            self.flood(a, b, ia, ib, &seeds, scratch);
+            self.flood(a, b, ia, ib, &seeds, false, scratch);
             scratch.pieces.sort_by(|p, q| p.t0.total_cmp(&q.t0).then(p.t1.total_cmp(&q.t1)));
         }
+    }
+
+    /// The path of segment `a b` through the mesh, left in
+    /// `scratch.stops` in order from `a`: the ends of its pieces, joined
+    /// across cells with no area and walls that meet in the world, with
+    /// gaps where it is outside the mesh. A stop at `t` within `T_EPS` of
+    /// 0 is the segment's start, and within `T_EPS` of 1 its end.
+    ///
+    /// The path is found from the segment's lexicographically smaller end
+    /// and reversed if that is `b`, so a segment walked either way (the
+    /// side two polygons share) has bitwise the same path. A piece is kept
+    /// when it takes the path any further, however little, so a path that
+    /// leaves the mesh past a corner it grazes leaves through the wall.
+    #[allow(clippy::too_many_arguments)]
+    fn segment_path(
+        &self,
+        a: [f64; 2],
+        b: [f64; 2],
+        ia: Option<[f64; 2]>,
+        ib: Option<[f64; 2]>,
+        ha: Option<(usize, usize)>,
+        hb: Option<(usize, usize)>,
+        scratch: &mut Scratch,
+    ) -> Result<(), String> {
+        let flip = (b[0], b[1]) < (a[0], a[1]);
+        let (lo, hi, ilo, ihi, hint) = if flip { (b, a, ib, ia, hb) } else { (a, b, ia, ib, ha) };
+        self.segment_pieces(lo, hi, ilo, ihi, hint, scratch);
+        let Scratch { pieces, stops, .. } = scratch;
+        stops.clear();
+        let stop = |idx: [f64; 2], t: f64, out_before: bool| Stop {
+            idx,
+            world: lerp(lo, hi, t),
+            t,
+            out_before,
+        };
+        let mut cur = 0.0f64;
+        for p in pieces.iter() {
+            if p.t1 <= cur {
+                continue;
+            }
+            match stops.last() {
+                Some(q) if p.t0 <= cur + T_EPS => {
+                    let w = lerp(lo, hi, p.t0);
+                    match self.link(q.idx, p.p0, w).ok_or_else(|| lost(w))? {
+                        Link::Same => {}
+                        Link::Direct => stops.push(stop(p.p0, p.t0, false)),
+                        Link::Walls => stops.push(stop(p.p0, p.t0, true)),
+                        Link::Via(y, walls_first) => {
+                            stops.push(stop(y, p.t0, walls_first));
+                            stops.push(stop(p.p0, p.t0, !walls_first));
+                        }
+                    }
+                }
+                // the first piece, or a re-entry after a stretch outside
+                _ => stops.push(stop(p.p0, p.t0, !stops.is_empty() || p.t0 > T_EPS)),
+            }
+            stops.push(stop(p.p1, p.t1, false));
+            cur = p.t1;
+        }
+        if flip {
+            // each stop's stretch before is, the other way, the next one's
+            let n = stops.len();
+            for i in 0..n.saturating_sub(1) {
+                stops[i].out_before = stops[i + 1].out_before;
+            }
+            stops.reverse();
+            for q in stops.iter_mut() {
+                q.t = 1.0 - q.t;
+            }
+            if let Some(q) = stops.first_mut() {
+                q.out_before = q.t > T_EPS;
+            }
+        }
+        Ok(())
     }
 
     /// Position along the mesh boundary (0 to `2 (ncol + nrow)`, clockwise
@@ -776,6 +931,7 @@ impl QuadMesh {
             vcell.push(cell);
             vidx.push(cell.and_then(|(r, c)| {
                 self.local_in(CellMap::EqualArea, r, c, p)
+                    .map(Self::snap)
                     .map(|[u, v]| [c as f64 + u, r as f64 + v])
             }));
         }
@@ -786,65 +942,59 @@ impl QuadMesh {
         for k in 0..n {
             let k1 = (k + 1) % n;
             let (a, b) = (pts[k], pts[k1]);
-            self.segment_pieces(a, b, vidx[k], vidx[k1], vcell[k].or(hint), &mut scratch);
-            let mut cur = 0.0f64;
-            for p in &scratch.pieces {
-                if p.t1 <= cur + T_EPS {
+            self.segment_path(a, b, vidx[k], vidx[k1], vcell[k].or(hint), vcell[k1].or(hint), &mut scratch)?;
+            let stops = &scratch.stops;
+            let starts = stops.first().is_some_and(|q| q.t <= T_EPS);
+            let ends = stops.last().is_some_and(|q| q.t >= 1.0 - T_EPS);
+            for (i, q) in stops.iter().enumerate() {
+                if i == 0 && starts {
+                    // the segment's start, joined to the node before
+                    let link = match nodes.last().and_then(|n| n.idx) {
+                        Some(l) => self.link(l, q.idx, a).ok_or_else(|| lost(a))?,
+                        None => Link::Same,
+                    };
+                    if link == Link::Walls {
+                        // across two outer walls that meet in the world (a
+                        // seam, a fold): closed along the walls
+                        nodes.push(Node {
+                            idx: Some(q.idx),
+                            world: a,
+                            out_before: true,
+                        });
+                    } else if link != Link::Same {
+                        // across a cell with no area
+                        push_link(&mut nodes, link, q.idx, a);
+                    } else if vidx[k].is_none() {
+                        // starts on the boundary at a vertex the mesh does not own
+                        nodes.push(Node {
+                            idx: Some(q.idx),
+                            world: a,
+                            out_before: false,
+                        });
+                        if k == 0 {
+                            first = Some((q.idx, true));
+                        }
+                    } else if k == 0 {
+                        // the ring's start, left implicit: its last node
+                        first = Some((q.idx, false));
+                    }
                     continue;
                 }
-                let w0 = lerp(a, b, p.t0);
-                let link = match nodes.last().and_then(|q| q.idx) {
-                    Some(q) if p.t0 <= cur + T_EPS => {
-                        self.link(q, p.p0, w0).ok_or_else(|| lost(w0))?
-                    }
-                    _ => Link::Same,
-                };
-                if p.t0 > cur + T_EPS || link == Link::Walls {
-                    // re-entry after a stretch outside (or a start
-                    // outside), or across two outer walls that meet in
-                    // the world (a seam, a fold): closed along the walls
-                    nodes.push(Node {
-                        idx: Some(p.p0),
-                        world: w0,
-                        out_before: true,
-                    });
-                } else if link != Link::Same {
-                    // across a cell with no area
-                    push_link(&mut nodes, link, p.p0, w0);
-                } else if cur == 0.0 && vidx[k].is_none() {
-                    // starts on the boundary at a vertex the mesh does not own
-                    nodes.push(Node {
-                        idx: Some(p.p0),
-                        world: a,
-                        out_before: false,
-                    });
-                    if k == 0 {
-                        first = Some((p.p0, true));
-                    }
-                } else if k == 0 && cur == 0.0 {
-                    // the ring's start, left implicit: its last node
-                    first = Some((p.p0, false));
-                }
-                if p.t1 >= 1.0 - T_EPS {
+                let idx = if i + 1 == stops.len() && ends {
                     // the vertex's own position, unless it is on the other
                     // side of a seam, a fold or a cell with no area from
                     // this piece
-                    let v = vidx[k1].filter(|&q| !apart(q, p.p1));
-                    nodes.push(Node {
-                        idx: Some(v.unwrap_or(p.p1)),
-                        world: b,
-                        out_before: false,
-                    });
+                    vidx[k1].filter(|&v| !apart(v, q.idx)).unwrap_or(q.idx)
                 } else {
-                    nodes.push(Node {
-                        idx: Some(p.p1),
-                        world: lerp(a, b, p.t1),
-                        out_before: false,
-                    });
-                }
-                cur = p.t1;
+                    q.idx
+                };
+                nodes.push(Node {
+                    idx: Some(idx),
+                    world: if i + 1 == stops.len() && ends { b } else { q.world },
+                    out_before: q.out_before,
+                });
             }
-            if cur < 1.0 - T_EPS {
+            if !ends {
                 nodes.push(Node {
                     idx: vidx[k1],
                     world: b,
