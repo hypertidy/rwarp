@@ -1,6 +1,6 @@
 # Open decisions
 
-Status: 2026-11-05; N1 decided 2026-11-16, N3 and N4 2026-11-17, N2, N5 and C1 to C4 2026-11-19. The decisions the roadmap is waiting on, one section
+Status: 2026-11-05; N1 decided 2026-11-16, N3 and N4 2026-11-17, N2, N5 and C1 to C4 2026-11-19 (N5 built the same day). The decisions the roadmap is waiting on, one section
 each: what is being decided, the options with their costs, the
 recommendation, and what the code does today. Several are already
 implemented at their recommendation *provisionally*; for those the
@@ -22,7 +22,7 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 | N2 | non-convex cells | equal-area split; fallback a debug panic, searched for by a property test | decided: A, keep the split (2026-11-19) |
 | N3 | folds other than tripolar | folds that flip orientation refused at construction | decided: A, refuse; one mesh per scan for overlapping swaths; overlaps that keep orientation refused by `from_cf_bounds` (4b) (2026-11-17) |
 | N4 | `mesh` public or crate-private | public, documented unstable | decided: A, public; may break at a 0.x minor release, not a patch (2026-11-17) |
-| N5 | robust predicates | plain `f64`, no snapping yet | decided: A, plain `f64` with snapping first; adaptive `orient2d` only if property tests fail (2026-11-19) |
+| N5 | robust predicates | plain `f64` with snapping, searched by property tests; no failure left | decided: A, plain `f64` with snapping first; adaptive `orient2d` only if property tests fail (2026-11-19); built, adaptive not needed |
 | N6 | `f64` edge fractions in controlledburn | `f32` in `burn`, `f64` in `CoverageWindow` | decided: `f32`, documented (0.3.0) |
 | C1 | weight index types | `u32` per axis | decided: `u32` per axis (2026-11-19) |
 | C2 | default normalisation | `FracArea` | decided: A, `FracArea`, said prominently (2026-11-19) |
@@ -177,15 +177,67 @@ unstable until a second consumer used it.
 
 **Decided (2026-11-19): option A.** Plain `f64` with snapping of
 near-degenerate vertices first, and adaptive `orient2d` only if property
-tests find failures. Snapping and its property tests are the next PR
-(#47 stays open until then).
+tests find failures.
+
+**Built (2026-11-19).** The property tests are
+`tests/mesh_walk_degenerate.rs`. Ring vertices sit on, or within one
+rounding unit to 1e-10 of a cell of, corners, sides, spokes and split
+centres. Segments run through them, along sides, and across sides at
+shallow angles. Fans and cuts go through them, and long segments leave the
+mesh past an outer corner. Ten meshes are used: integer, rotated (near the
+origin, far from it, tiny), jittered, polar, sinusoid, dented (non-convex)
+and flipped. The oracles are the world clip, complementary tilings (pieces
+cover each cell as their union does), and the ring reversed (its index ring
+the same reversed, bit for bit) and started elsewhere. The search found
+these failures, none of them in the orientation tests:
+
+- **A cell owns a point outside its box.** A point an ulp off a corner can
+  be owned (by orientation, to rounding) by a cell whose bounding box it is
+  just outside. The flood's box shortcut then never left that cell, and a
+  segment from the point into the cells round the corner was taken as
+  outside the mesh. The coverage error was O(1): a boundary arc round the
+  whole mesh. The owner now counts as touched.
+- **A segment meets an outer side by sign, not by box.** A segment entering
+  the mesh within rounding of an outer corner could be missed: an
+  orientation of zero at the corner was checked against the segment's
+  bounding box, which rounding, or underflow next to 0, puts the corner
+  outside. Now the signs decide: one segment's ends strictly either side of
+  the other's line, and an end of the other with orientation zero, is a
+  meeting.
+- **Paths depended on direction.** A segment walked one way and the other
+  gave crossings different in the last bits, and a nearly collinear one
+  crossing a side at points 1e-6 apart along it. So shared sides of
+  neighbouring polygons didn't quite tile, to 3e-12. Each segment is now
+  walked from its lexicographically smaller end, and reversed.
+- **Short pieces were dropped.** A piece shorter than the joining tolerance
+  (1e-12 of the segment) was dropped, so a long segment leaving just past
+  an outer corner left from inside the mesh, not through the wall. Now a
+  piece is kept when it takes the path any further.
+
+The snapping: a ring vertex within 1e-12 (index space) of its cell's
+corner or side is put on it. A crossing within 1e-12 of an edge's end is
+put at the end. Without it, a vertex placed on a corner lands up to 2e-16
+off it, and a ring through the mesh's own corners gave 314 of 1,200
+checks a neighbouring cell's sliver; with it, exactly 1 and 0. Vertices
+near a spoke or a split centre are left alone: those are inside the
+cell, so rounding there changes no cell's coverage.
+
+With these, no failure is left at twenty times the tests' cases (about
+290,000 checks; 71,000 as CI runs them), so adaptive `orient2d` is not
+needed. Each fix has a test that fails without it. On ORCA2 as a set
+(`MeshSet`, two polar LAEAs), `warp()`'s hashes and `weights_onto`'s are
+unchanged. `weights_to` (the walk of each pixel's outline) loses its
+slivers: 560 entries of at most 1.4e-14 go at densify 1, and 1,171 at
+densify 4; 3 and 1 of 6e-17 come; no other entry moves by more than
+1.8e-12.
 
 The walk decides which triangle a segment enters next by orientation tests.
 Near-degenerate input (a vertex within rounding of a side, spoke or corner)
 is where plain floating point gives inconsistent answers.
 
-**Today:** plain `f64` tests. Snapping of near-degenerate vertices isn't
-implemented yet, and no property test has failed without it.
+**Before:** plain `f64` tests. Snapping of near-degenerate vertices wasn't
+implemented, and no property test had failed without it (the tests then
+didn't look within rounding).
 
 | option | for | against |
 |---|---|---|

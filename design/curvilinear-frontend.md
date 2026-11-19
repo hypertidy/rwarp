@@ -22,10 +22,11 @@ from the first point's cell, or from crossed boundary sides, and each
 segment clipped by every triangle it meets; cut points placed by their
 parameter along the canonical edge; off-mesh stretches closed by the
 boundary arc of zero winding), `QuadMesh::burn` (polygons, points),
-`QuadMesh::cover_ring` (`CoverageWindow`), `Rectilinear`. Not yet: lines,
-snapping of near-degenerate vertices (no property-test failure without
-it so far), a boundary index (crossed boundary sides are found by a scan
-when a segment leaves the mesh). Stage 1 as built: `QuadMesh::{from_corners, from_centres}`,
+`QuadMesh::cover_ring` (`CoverageWindow`), `Rectilinear`; crossed
+boundary sides found through a bucket index of the outer sides (#36);
+near-degenerate input made consistent and searched by property tests
+(decision N5, 2026-11-19; section 2, "Degeneracies"). Not yet: lines.
+Stage 1 as built: `QuadMesh::{from_corners, from_centres}`,
 validation (bow-ties and folds refused, zero-area cells allowed),
 `CellMap::{Bilinear, EqualArea}` with the equal-area split (corner mean
 for convex cells; for non-convex cells the balanced point in the kernel
@@ -196,7 +197,8 @@ excursion's.
 
 ### Degeneracies
 
-#6 in controlledburn shows what happens when these are left for later:
+#6 in controlledburn shows what happens when these are left for later.
+The plan was:
 
 - vertex within tolerance of a side, spoke or corner: snap onto it with
   its exact `t`;
@@ -208,7 +210,35 @@ excursion's.
   #15).
 
 Plain `f64` orientation tests with snapping first; adaptive-precision
-`orient2d` if the property tests find failures.
+`orient2d` if the property tests find failures (decision N5).
+
+Built (2026-11-19). A segment through a corner or a centre needed no fan
+walk: Cyrus-Beck clipping per triangle, with each edge's orientation tests
+computed from its canonical ends, already gives each triangle round the
+point a consistent piece. A segment along a side stays on it, as planned.
+The property tests (`tests/mesh_walk_degenerate.rs`: vertices on and
+within rounding of every kind of point, segments through them and along
+sides, shallow crossings, fans and cuts through them, long segments past
+an outer corner; against the world clip, complementary tilings, and the
+ring reversed, bit for bit) found four failures, none of them in the
+orientation tests. See N5 in [decisions.md](decisions.md):
+
+- a cell that owns a segment's start (to rounding, an ulp off a corner)
+  is taken as touched, though the start is outside its bounding box;
+- a segment meets an outer side by the orientation tests' signs, not a box
+  test that rounding or underflow can contradict;
+- each segment is walked from its lexicographically smaller end, so its
+  path is the same either way, bit for bit;
+- a piece is kept however short, so a segment that grazes an outer corner
+  leaves through the wall.
+
+The snapping is in index space: a ring vertex within `SNAP_EPS` (1e-12) of
+its cell's corner or side is put on it, and a crossing within `SNAP_EPS` of
+an edge's end is put at the end. So a ring through the mesh's own corners
+covers its cells exactly once and their neighbours not at all. A vertex
+near a spoke or a split centre is left where it is: both are inside the
+cell, so rounding there changes no cell's coverage. Adaptive predicates
+weren't needed.
 
 ## 3. Folds, poles, periodic grids, the antimeridian
 
@@ -1522,6 +1552,11 @@ Each generator has an exact oracle:
 7. **Degenerate.** Collapsed corners and triangles (no coverage, a note);
    bow-ties (construction error); non-convex cells where the equal-area
    line misses the kernel (a note, bounded error).
+   Near-degenerate input (decision N5) is `tests/mesh_walk_degenerate.rs`:
+   vertices on and within rounding of corners, sides, spokes and centres,
+   segments through them and along sides, against the world clip,
+   complementary tilings and the ring reversed (section 2,
+   "Degeneracies").
 8. **Exact footprint.** For a destination pixel inside the source, the
    sum over source cells of weight times world cell area equals the
    pixel's outline area in the source CRS. Index-measure weights fail
@@ -1546,7 +1581,7 @@ Decided since: 1 (N1, 2026-11-16, `EqualArea` for coverage), 2 (N2,
 2026-11-19, keep the split; its fallback a debug panic, searched for by a
 property test), 3 (N3, 2026-11-17, refuse), 4 (N4, 2026-11-17, public;
 may break at a 0.x minor release), 5 (N5, 2026-11-19, plain `f64` with
-snapping first), 6 (N6, controlledburn 0.3.0, `f32`). See `decisions.md`.
+snapping first; built, adaptive predicates not needed), 6 (N6, controlledburn 0.3.0, `f32`). See `decisions.md`.
 
 1. **`EqualArea` as the coverage default.** Recommended for coverage and
    area methods, with `Bilinear` kept for point kernels and
