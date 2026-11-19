@@ -1542,9 +1542,11 @@ GDAL parity tests for `Bilinear` stay as they are.
 
 ## Decisions for the maintainer
 
-Decided since: 1 (N1, 2026-11-16, `EqualArea` for coverage), 3 (N3,
-2026-11-17, refuse), 4 (N4, 2026-11-17, public; may break at a 0.x minor
-release), 6 (N6, controlledburn 0.3.0, `f32`). See `decisions.md`.
+Decided since: 1 (N1, 2026-11-16, `EqualArea` for coverage), 2 (N2,
+2026-11-19, keep the split; its fallback a debug panic, searched for by a
+property test), 3 (N3, 2026-11-17, refuse), 4 (N4, 2026-11-17, public;
+may break at a 0.x minor release), 5 (N5, 2026-11-19, plain `f64` with
+snapping first), 6 (N6, controlledburn 0.3.0, `f32`). See `decisions.md`.
 
 1. **`EqualArea` as the coverage default.** Recommended for coverage and
    area methods, with `Bilinear` kept for point kernels and

@@ -1019,8 +1019,13 @@ fn bow_tie(q: &[[f64; 2]; 4]) -> bool {
 /// cell contains it, so all four triangles are proper. A non-convex cell
 /// may not: then the point of the balanced line (through the corner mean)
 /// inside the cell's kernel that keeps the four triangles furthest from
-/// degenerate is used, and failing that the best kernel point found,
-/// flagged inexact.
+/// degenerate is used.
+///
+/// The line may always meet the kernel: no counterexample is known, and
+/// the property test `the_balanced_line_meets_the_kernel` searches for
+/// one (decision N2, `design/decisions.md`). If it ever misses, a debug
+/// build panics, to report it; a release build uses the best kernel point
+/// found and flags the cell inexact ([`QuadMesh::inexact_cells`]).
 fn split(q: &[[f64; 2]; 4], sign: f64) -> Cell {
     let area2 = shoelace2(q);
     let mean = [
@@ -1116,8 +1121,15 @@ fn split(q: &[[f64; 2]; 4], sign: f64) -> Cell {
             };
         }
     }
-    // no balanced kernel point: the best kernel point among corner
+    // no balanced kernel point: a counterexample to decision N2, loud in a
+    // debug build; otherwise the best kernel point among corner
     // combinations, flagged inexact
+    if cfg!(debug_assertions) {
+        panic!(
+            "the equal-area split of the cell {q:?} found no balanced point in its kernel: \
+             a counterexample to decision N2 (design/decisions.md), please report it"
+        );
+    }
     let mut best = (f64::NEG_INFINITY, mean);
     let n = 12;
     for i in 0..=n {
@@ -1331,6 +1343,69 @@ mod tests {
             CellMap::EqualArea,
         );
         assert!(fold.unwrap_err().contains("fold"));
+    }
+
+    /// A small, seeded generator (xorshift64*): uniform in `[lo, hi)`.
+    struct Draws(u64);
+
+    impl Draws {
+        fn next(&mut self, lo: f64, hi: f64) -> f64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            let u = (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64;
+            lo + (hi - lo) * u
+        }
+    }
+
+    /// Decision N2: for every simple non-convex quadrilateral, the
+    /// balanced line through the corner mean meets the cell's kernel, so
+    /// the equal-area split is exact and its fallback never runs. The
+    /// search of `design/figures/nonconvex-search.R` (the unit square's
+    /// corners moved by up to 0.9 each way, the simple anticlockwise
+    /// non-convex ones kept), and each cell also flattened 500 to 1,
+    /// turned and moved a thousand of its sizes off, and mirrored
+    /// (clockwise): the same geometry, harder arithmetic. (A million of
+    /// its sizes off, `shoelace2` takes a cell's area, a sum over absolute
+    /// coordinates, as zero to rounding: the cell counts as collapsed.)
+    #[test]
+    fn the_balanced_line_meets_the_kernel() {
+        let mut d = Draws(0x9e37_79b9_7f4a_7c15);
+        let (mut cells, mut tried) = (0, 0);
+        let turn = 0.6f64;
+        let variants: [&dyn Fn([f64; 2]) -> [f64; 2]; 4] = [
+            &|p| p,
+            &|p| [p[0] * 1e3, p[1] * 2.0],
+            &|p| [1e3 + p[0] * turn.cos() - p[1] * turn.sin(), -2e3 + p[0] * turn.sin() + p[1] * turn.cos()],
+            &|p| [-p[0], p[1]],
+        ];
+        while tried < 200_000 {
+            tried += 1;
+            let mut q = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+            for c in &mut q {
+                c[0] += d.next(-0.9, 0.9);
+                c[1] += d.next(-0.9, 0.9);
+            }
+            if shoelace2(&q) <= 0.0 || bow_tie(&q) {
+                continue;
+            }
+            let convex = (0..4).all(|k| orient(q[k], q[(k + 1) % 4], q[(k + 2) % 4]) > 0.0);
+            if convex {
+                continue;
+            }
+            cells += 1;
+            for (v, f) in variants.iter().enumerate() {
+                let qv = q.map(f);
+                let sign = shoelace2(&qv).signum();
+                let cell = split(&qv, sign);
+                assert!(cell.exact, "variant {v} of {q:?}: the balanced line misses the kernel");
+                let t: Vec<f64> = (0..4).map(|k| sign * orient(qv[k], qv[(k + 1) % 4], cell.centre)).collect();
+                assert!(t.iter().all(|&a| a > 0.0), "variant {v} of {q:?}: {t:?}");
+            }
+        }
+        // the R search kept 59,234 of 200,000
+        eprintln!("{cells} simple non-convex cells, each in 4 variants: every split exact");
+        assert!((55_000..64_000).contains(&cells), "{cells}");
     }
 
     #[test]

@@ -545,6 +545,10 @@ Per m20:
 
 ## 10. Open questions
 
+All four decided 2026-11-19 at the recommendation (C1 to C4,
+`decisions.md`): `u32` per axis; `FracArea`, said prominently; the
+lattice shared; a destination-side measure waits for a use.
+
 1. **Index types:** `u32` per axis (grids up to 4 billion per side) or one
    flattened `u64` per side as ESMF does? Per-axis is easier to read, and
    flattening is one multiply.

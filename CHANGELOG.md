@@ -75,6 +75,20 @@ All notable changes to rwarp. Dates are when the change reached `main`.
   and 0.25 s. `weights_to` now groups its entries by cell with a counting
   sort (same order, faster).
 
+### Changed
+
+- Decision N2 (#44): the equal-area split's fallback for a non-convex
+  cell whose balanced line misses its kernel (the best kernel point, the
+  cell flagged inexact) now panics in a debug build, naming the decision,
+  and runs only in a release build. A property test searches for such a
+  cell (59,754 simple non-convex cells in four variants, all exact), as
+  do eORCA1's and ORCA2's sets (6 non-convex cells, all exact).
+- Decisions C1 to C4 (#48 to #51) are recorded: `u32` indices per axis,
+  `FracArea` the default normalisation (now said prominently, with what
+  to ask for to compare with ESMF's `DSTAREA` default), the lattice
+  shared by `warp()` and `exact_weights`, and the measure on the source
+  side only, said in the docs.
+
 ### Fixed
 
 - `ChunkOptions::split_antimeridian` with the fill ratio split

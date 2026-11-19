@@ -1,6 +1,6 @@
 # Open decisions
 
-Status: 2026-11-05; N1 decided 2026-11-16, N3 and N4 2026-11-17. The decisions the roadmap is waiting on, one section
+Status: 2026-11-05; N1 decided 2026-11-16, N3 and N4 2026-11-17, N2, N5 and C1 to C4 2026-11-19. The decisions the roadmap is waiting on, one section
 each: what is being decided, the options with their costs, the
 recommendation, and what the code does today. Several are already
 implemented at their recommendation *provisionally*; for those the
@@ -19,15 +19,15 @@ C5 is recorded because it shapes how the work is presented, and is decided.
 | | decision | today | recommendation |
 |---|---|---|---|
 | N1 | cell map default for coverage | coverage uses `EqualArea` on every mesh; `Bilinear` default for point methods | decided: A, `EqualArea` for coverage (2026-11-16) |
-| N2 | non-convex cells | equal-area split; fallback note never seen | keep, and test that it never fires |
+| N2 | non-convex cells | equal-area split; fallback a debug panic, searched for by a property test | decided: A, keep the split (2026-11-19) |
 | N3 | folds other than tripolar | folds that flip orientation refused at construction | decided: A, refuse; one mesh per scan for overlapping swaths; overlaps that keep orientation refused by `from_cf_bounds` (4b) (2026-11-17) |
 | N4 | `mesh` public or crate-private | public, documented unstable | decided: A, public; may break at a 0.x minor release, not a patch (2026-11-17) |
-| N5 | robust predicates | plain `f64`, no snapping yet | plain `f64`, snap first |
+| N5 | robust predicates | plain `f64`, no snapping yet | decided: A, plain `f64` with snapping first; adaptive `orient2d` only if property tests fail (2026-11-19) |
 | N6 | `f64` edge fractions in controlledburn | `f32` in `burn`, `f64` in `CoverageWindow` | decided: `f32`, documented (0.3.0) |
-| C1 | weight index types | `u32` per axis | settled; confirm |
-| C2 | default normalisation | `FracArea` | `FracArea`, documented |
-| C3 | `warp()` built on `exact_weights` | shares the `Lattice` | settled; confirm |
-| C4 | spherical measure on the destination side | source side only | wait for a use |
+| C1 | weight index types | `u32` per axis | decided: `u32` per axis (2026-11-19) |
+| C2 | default normalisation | `FracArea` | decided: A, `FracArea`, said prominently (2026-11-19) |
+| C3 | `warp()` built on `exact_weights` | shares the `Lattice` | decided: share the lattice (2026-11-19) |
+| C4 | spherical measure on the destination side | source side only | decided: A, wait for a use (2026-11-19) |
 | C5 | cells bounded by parallels, or by great circles | parallels (exact for CF lon/lat) | decided |
 
 ---
@@ -65,7 +65,19 @@ construction, and `QuadMesh::burn` / `ring_to_index` required `EqualArea`
 | B. `Bilinear` default everywhere (today) | one model, GDAL-identical everywhere; no surprise for GDAL users | coverage callers must opt in, or `burn` refuses them |
 | C. `EqualArea` default everywhere | one default | point kernels lose GDAL parity; the map has kinks along the four spokes, so interpolated fields get slope breaks |
 
-## N2. Non-convex cells
+## N2. Non-convex cells (decided)
+
+**Decided (2026-11-19): option A.** The equal-area split stays. Its
+fallback (the best kernel point, the cell flagged inexact) panics in a
+debug build, naming this decision, and runs only in a release build.
+The search is a property test, `the_balanced_line_meets_the_kernel` in
+`src/mesh.rs`: 200,000 draws as below, 59,754 simple non-convex cells,
+each also flattened 500 to 1, turned and moved off, and mirrored, and
+every split exact. On real grids, eORCA1's and ORCA2's sets (CMIP6) have
+2 and 4 non-convex cells, all exact. (Moved a million of its sizes off,
+a cell's area, a sum over absolute coordinates, is taken as zero to
+rounding and the cell as collapsed: a separate matter, the shoelace
+about a corner.)
 
 ![Non-convex cells and their split point](figures/nonconvex.svg)
 
@@ -161,7 +173,12 @@ unstable until a second consumer used it.
 | B. Crate-private until wxylib's cover module asks | free to change; nothing to break | no outside use, so no feedback; the R bindings can't reach it |
 | C. A separate crate (`rwarp-mesh`) | own version and stability promise | another crate to publish; it still needs rwarp's transformers for the exact footprint |
 
-## N5. Robust predicates
+## N5. Robust predicates (decided)
+
+**Decided (2026-11-19): option A.** Plain `f64` with snapping of
+near-degenerate vertices first, and adaptive `orient2d` only if property
+tests find failures. Snapping and its property tests are the next PR
+(#47 stays open until then).
 
 The walk decides which triangle a segment enters next by orientation tests.
 Near-degenerate input (a vertex within rounding of a side, spoke or corner)
@@ -195,7 +212,10 @@ cell.
 | **B. Keep `f32`, document it** (chosen) | no churn | the front end's exactness is capped at about 1e-7 of each cell |
 | C. Generic over the float type | both | complexity in a crate that is dependency-free and small on purpose |
 
-## C1. Weight index types
+## C1. Weight index types (decided)
+
+**Decided (2026-11-19): confirmed**, `u32` per axis, as below; the
+`Weights` docs say so.
 
 **Settled by implementation:** `Weights` stores `u32` row and column per
 axis, as conservative.md recommended. ESMF's flattened 1-based index is
@@ -203,7 +223,11 @@ axis, as conservative.md recommended. ESMF's flattened 1-based index is
 are limited to 4 billion cells per side. Confirm, or ask for `u64`
 flattened.
 
-## C2. Default normalisation
+## C2. Default normalisation (decided)
+
+**Decided (2026-11-19): option A.** `FracArea` stays the default, and the
+`weights` module docs, `Normalization` and the book's chapter say so in
+bold, with what to ask for to compare with ESMF and xESMF.
 
 ![FracArea vs DestArea on a partly covered cell](figures/normalisation.svg)
 
@@ -221,7 +245,10 @@ ESMF's default is `DSTAREA`; xESMF's `conservative` is `DSTAREA` and
 | **A. `FracArea` default, say so prominently** (today; recommended) | matches `warp()` and what raster users expect at coasts and edges; no artificial low values | differs from ESMF's default, so a side-by-side comparison has to set the option |
 | B. `DestArea` default | matches ESMF and xESMF's `conservative` out of the box | partly covered cells come out low (8.0 rather than 12.0 in the figure), which raster users read as a bug |
 
-## C3. `warp()` and `exact_weights`
+## C3. `warp()` and `exact_weights` (decided)
+
+**Decided (2026-11-19): confirmed**, the lattice shared and `warp()`'s
+direct reduction kept.
 
 **Settled by implementation:** `warp()`'s exact footprint and
 `exact_weights` share the destination `Lattice` and its per-pixel coverage
@@ -229,7 +256,10 @@ function. `warp()` keeps its direct reduction (no weights materialised) and
 its `f32` rounding for 0.2/0.3 compatibility, and a test holds the two
 equal bit for bit. Confirm, or ask for one code path.
 
-## C4. Spherical measure on the destination side
+## C4. Spherical measure on the destination side (decided)
+
+**Decided (2026-11-19): option A**, wait for a use. The `weights` docs
+and the book's limits say the measure is the source side's.
 
 The spherical measure (stage 3a) applies on the source side, which is all
 ESMF parity needs, since `frac` is relative to the source cell. A lon/lat

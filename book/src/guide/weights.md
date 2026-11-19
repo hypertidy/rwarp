@@ -80,6 +80,10 @@ space):
   equals the integral of the source over the region the target covers.
   ESMF `destarea`, xESMF `conserve`.
 
+**The default is `FracArea`**, which is not ESMF's: ESMF's default is
+`destarea`, as is xESMF's `conservative`. To compare with them, ask for
+`Normalization::DestArea`.
+
 `Weights::normalised(norm)` returns `S` per entry. `Weights::apply`
 also skips source nodata: `FracArea` renormalises over the valid entries,
 and `DestArea` doesn't (a missing source cell counts as zero).
@@ -264,10 +268,13 @@ columns.
 
 ## Limits
 
-- **Planar areas** in source pixel space, or in a geolocation source's
-  world coordinates. ESMF measures on the sphere with
-  great-circle edges. A spherical measure is planned (design/conservative.md,
-  stage 3).
+- **The measure is the source side's**: planar in source pixel space, on
+  the sphere for a regular longitude/latitude source (`lonlat_measure`),
+  or planar in a geolocation or mesh source's world coordinates. A
+  destination in longitude and latitude with a projected source has its
+  `dst_area` planar in source pixel space, not on the sphere: a
+  destination-side measure waits for a use (decision C4). ESMF measures
+  on the sphere with great-circle edges on both sides.
 - **The antimeridian needs the transformer to say the source wraps.** A
   target cell whose outline crosses a geographic source's seam is unwrapped
   and measured on both sides of it, and one around a pole is closed along
