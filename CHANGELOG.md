@@ -99,8 +99,8 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     cuts general polygons from a lon/lat one, ESMF is off by up to 0.035
     on a linear field and rwarp is exact. Given ESMF's vertex means,
     rwarp gives ESMF's table to 1e-12.
-  - **Scope:** any grid source, and a grid onto a mesh; a `PolyMesh`'s
-    faces as sources are refused for now.
+  - **Scope:** any grid source, a grid onto a mesh, and a `PolyMesh`'s
+    faces onto a grid.
   - **Sources with world cells (6b):** geolocation arrays, a `QuadMesh`
     through `MeshTransformer`, a `MeshSet` (through `SetTransformer` or
     `weights_to`), and a grid onto a `PolyMesh` (`weights_onto`) or a
@@ -114,7 +114,23 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     on each quarter of a cell. `Weights::second_order(src, valid, areas)`
     takes the window's world cell areas for such a source, from the new
     `weights::source_cell_areas`, as a gradient draws on cells the table
-    may not reach.
+    may not reach. An empty table takes them too (it can't say what its
+    source was).
+  - **A `PolyMesh`'s faces as sources (6c):** `PolyMesh::weights_to` (and
+    `_par`) records moments, about each overlap's grid cell corner, and
+    the new `PolyMesh::apply_second_order` and `PolyMesh::second_order`
+    remap and fold with them. A face's plane is in the grid's space,
+    where its overlaps are measured (its pixels, or a curvilinear grid's
+    indices), as decided on 2026-11-19. Its neighbours are the faces
+    sharing a node, as in ESMF, each centred on the part of it the table
+    covers. A field linear in the grid's space comes out exact to 3e-14,
+    in pixels, on the sphere and in a curvilinear grid's indices (first
+    order is off by 1.2 to 2.3). On a quadratic, halving mesh and grid
+    divides the error by 3.9. At the grid's seam the gradients are
+    one-sided: a face the seam cuts is first order (its cells aren't one
+    piece), and a neighbour across the seam is left out (its cells aren't
+    next to the face's). Without moments the tables are as before, bit
+    for bit.
   - **Dependency:** controlledburn 0.3.3 (from 0.3.1), for `set_moments`.
 
 ### Changed

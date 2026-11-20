@@ -168,8 +168,27 @@ That is exact for a field linear in the grid's indices, and second order
 for a smooth field on a smooth grid, but not exact for a field linear in
 world coordinates (ESMF works in world coordinates instead). On a curved
 grid a world quadratic's error falls 3.9 times as the cells halve
-(`tests/second_order_world.rs`). A `PolyMesh`'s faces as sources are
-refused for now.
+(`tests/second_order_world.rs`).
+
+From a `PolyMesh`'s faces to a grid (`weights_to` with moments), the
+faces have no index space, so their planes are in the grid's, where the
+overlaps are measured: its pixels, or a curvilinear grid's indices.
+
+```rust,ignore
+let w = mesh.weights_to(&t, &grid, &WeightOptions::new(densify).with_moments(true))?;
+let values: Vec<f32> = mesh.apply_second_order(&w, &faces, Normalization::FracArea, &ApplyOptions::new());
+let folded = mesh.second_order(&w, None);
+```
+
+A face's neighbours are the faces sharing a node with it, as in ESMF, each
+centred on the part of it the table covers. A field linear in the grid's
+space comes out exact to 3e-14 where the faces are whole in the grid
+(first order is off by 2.3), and on a quadratic halving both mesh and
+grid divides the error by 3.9 (`tests/second_order_faces.rs`). For a mesh
+in longitude and latitude onto a grid in them, the planes are linear in
+longitude and latitude. At the grid's seam the gradients are one-sided: a
+face the seam cuts is first order, and a face's neighbour across it is
+left out.
 
 ## Meshes of polygons
 

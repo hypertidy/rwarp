@@ -98,7 +98,12 @@
 //! table, as ESMF's weight files hold it. For a source with world cells
 //! the planes are in the cells' index space, where their overlaps are
 //! measured, and the fold takes the window's cell areas
-//! ([`source_cell_areas`]). See the `weights::second_order` module
+//! ([`source_cell_areas`]). From a mesh's faces
+//! ([`PolyMesh::weights_to`](crate::mesh::PolyMesh::weights_to)) the
+//! planes are in the grid's space and the neighbours are faces sharing a
+//! node: [`PolyMesh::apply_second_order`](crate::mesh::PolyMesh::apply_second_order)
+//! and [`PolyMesh::second_order`](crate::mesh::PolyMesh::second_order).
+//! See the `weights::second_order` module
 //! (`src/weights/second_order.rs`) for the method and how it differs from
 //! ESMF's.
 //!
@@ -274,7 +279,10 @@ pub struct WeightOptions {
     /// second-order remapping ([`Weights::apply_second_order`],
     /// [`Weights::second_order`]). Default false. For any grid source:
     /// one measured in its pixels, or one with world cells (moments in the
-    /// cells' index space; see [`Weights::moment`]).
+    /// cells' index space; see [`Weights::moment`]). And for a
+    /// [`PolyMesh`](crate::mesh::PolyMesh)'s faces as sources
+    /// ([`PolyMesh::weights_to`](crate::mesh::PolyMesh::weights_to)), with
+    /// [`PolyMesh::apply_second_order`](crate::mesh::PolyMesh::apply_second_order).
     #[cfg_attr(feature = "serde", serde(default))]
     pub moments: bool,
 }
@@ -453,6 +461,13 @@ pub struct Weights {
     /// in world coordinates (the map is affine only on each quarter of a
     /// cell). For a grid onto a mesh ([`PolyMesh::weights_onto`](crate::mesh::PolyMesh::weights_onto)),
     /// the grid's cells are the source.
+    ///
+    /// From a mesh's faces to a grid ([`PolyMesh::weights_to`](crate::mesh::PolyMesh::weights_to)),
+    /// where the source has no corner: about the *grid* cell's corner (the
+    /// destination's), over the face's measure, so the centroid is at
+    /// column `dst_col + moment[0] / frac` and row `dst_row + moment[1] /
+    /// frac`. For [`PolyMesh::apply_second_order`](crate::mesh::PolyMesh::apply_second_order),
+    /// not [`Weights::apply_second_order`].
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub moment: Vec<[f64; 2]>,
 }
