@@ -131,6 +131,38 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     piece), and a neighbour across the seam is left out (its cells aren't
     next to the face's). Without moments the tables are as before, bit
     for bit.
+  - **A limiter (6d), opt-in:** `ApplyOptions::with_limiter(Limiter::BarthJespersen)`
+    (new `weights::Limiter`, `Off` by default, as in ESMF). Barth and
+    Jespersen's: each source cell's gradient scaled so its plane, at each
+    of its overlaps' centroids, stays within the values of the cell and
+    its neighbours. Next to a sharp front, values overshot their sources
+    by 0.1 to 7 without it (fronts over grid cells, world cells and a
+    mesh's faces); with it, each destination value (`FracArea`) is within
+    its sources' and their neighbours' values to 1e-15, band by band,
+    cells without data left out. It is a factor per cell, so the integral
+    is conserved as before. Inside a window a linear field comes out as
+    without it; on a smooth sine it costs 16 to 72% in rms (planes at
+    extrema are flattened too) and stays 7 to 49 times closer than first
+    order. It depends on the field, so it is for `apply_second_order`
+    only; a folded table can't hold it. Overlaps under 1e-12 of their cell
+    (rounding, 2 to 4% of a table's entries, centroids up to 45 cells
+    off) are left out of the factor and take their cell's value.
+    `ApplyOptions` is `non_exhaustive`, so the new field is not breaking.
+  - **On the sphere, against ESMF (6d):** new fixtures
+    `<case>.sph2.txt`, ESMF's spherical `conserve_2nd`, for the three
+    second-order grid cases and both sphere meshes both ways
+    (`tests/esmf_second_order_sphere.rs`). ESMF's method works in three
+    dimensions, rwarp's in longitude and latitude, so the comparison is
+    of accuracy: each against exact cell means in its own cells (great
+    circles for ESMF's, parallels for rwarp's). A grid onto a grid: both
+    second order, 15 to 1,300 times closer than first inside, close to
+    each other for lon/lat onto lon/lat and rwarp 19 times closer
+    projected. A grid onto a mesh: rwarp 5 to 12 times closer than ESMF
+    everywhere (ESMF's vertex means). A mesh onto a grid: rwarp 1.8 to
+    4.4 times closer away from the grid's seam, and close to first order
+    within 15 degrees of it, where ESMF is 1.3 to 3.6 times closer: a
+    face the seam cuts is first order, as the table doesn't carry the
+    grid's period.
   - **Dependency:** controlledburn 0.3.3 (from 0.3.1), for `set_moments`.
 
 ### Changed

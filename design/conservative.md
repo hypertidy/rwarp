@@ -568,7 +568,7 @@ of stage 1's weights, and doesn't change the coverage engine.
 Built in three steps: 6b the world-cell grids and grids onto meshes, 6c
 the faces as sources, 6d the limiter and spherical ESMF fixtures.
 
-**Status (2026-11-19): 6a, 6b and 6c built** (`src/weights/second_order.rs`).
+**Status (2026-11-20): 6a to 6d built** (`src/weights/second_order.rs`).
 
 - **What's built:** `WeightOptions::with_moments`, `Weights::moment`,
   `Weights::apply_second_order` and `Weights::second_order`, for sources
@@ -661,10 +661,56 @@ the faces as sources, 6d the limiter and spherical ESMF fixtures.
     across it is exact; in a face the seam cuts, the value is the face's.
     Each guard (connected, next to, slivers) has a test that fails
     without it. Threads keep the moments bit for bit.
-- **Not built:**
-  - a gradient limiter (6d; ESMF has none), so a second-order value can
-    lie outside its sources' range next to a sharp front;
-  - spherical ESMF fixtures for second order (6d).
+- **6d, the limiter** (`tests/second_order_limiter.rs`):
+  `ApplyOptions::limiter`, `Limiter::BarthJespersen` (off by default).
+  Each source cell's gradient is scaled by the largest factor in [0, 1]
+  keeping its plane, at each of its overlaps' centroids (where it is
+  used), within the values of the cell and the neighbours its gradient
+  came from. Per band, and cells without data left out. Overlaps under
+  1e-12 of their cell are rounding (2 to 4% of a table's entries, their
+  centroids up to 45 cells off): left out of the factor (otherwise it
+  flattens planes for nothing), and given their cell's value (so a
+  destination cell with nothing else stays in bounds).
+  - Fronts over grid cells (planar, on the sphere, finer and coarser
+    destinations), a curved grid's world cells and a mesh's faces
+    overshoot their bounds by 0.1 to 7.3 without it, and by at most
+    1.3e-15 with it. Conserved to 1e-12 under `DestArea`.
+  - A linear field inside the window is as without it to 3.6e-15 (the
+    slivers' terms); on the window's edge, where a plane is one-sided,
+    it is limited.
+  - On a sine (wavelengths 75, 38 and 19 cells) it costs 16, 43 and 72%
+    in rms, still 49, 19 and 7 times closer than first order.
+  - Each guard (no nodata in the range, the cell's own value in it,
+    slivers out of the factor, slivers' values) has a test that fails
+    without it. With the limiter off every output is as before, bit for
+    bit (38 hashes, with the faces' second order).
+- **6d, on the sphere against ESMF** (`tests/esmf_second_order_sphere.rs`,
+  fixtures `<case>.sph2.txt`: ESMF's spherical `conserve_2nd` for the
+  three second-order grid cases and both sphere meshes both ways). The
+  two are different methods, so the comparison is of accuracy, each
+  against exact cell means in its own cells (quadrature, checked against
+  closed forms to 1e-14), rms of a smooth field:
+  - A grid onto a grid, inside: rwarp 2.8e-6, 1.9e-7, 4.5e-6
+    (`regular_coarser`, `regular_overhang`, `lonlat_3031`), ESMF 2.6e-6,
+    3.0e-7, 8.6e-5, first order 3.0e-4, 2.4e-4, 1.3e-3. Over every cell
+    the ring on cut source cells dominates both, no better than first
+    order there, and the two agree.
+  - A grid onto a mesh: rwarp 1.3e-4 and 9.8e-5, ESMF 1.6e-3 and 4.8e-4
+    (ESMF's vertex means), first order 4.0e-3 and 3.2e-3.
+  - A mesh onto a grid, faces of 15 degrees onto cells of 5, first order
+    7.5e-2 to 9.5e-2: away from the seam and the poles rwarp 9.7e-3 and
+    1.6e-2, ESMF 1.7e-2 and 7.1e-2. Within 15 degrees of the seam rwarp
+    5.3e-2 and 7.7e-2, near first order, ESMF 1.5e-2 and 6.1e-2: the
+    faces the seam cuts are first order, and their neighbours' gradients
+    one-sided.
+  - The weights differ from ESMF's by more than first order's: by first
+    order's for a grid onto a grid but next to the source's edge
+    (one-sided gradients, `S` to 0.074), and elsewhere by the method
+    (0.02 projected, 0.23 from a mesh).
+- **Not built:** the grid's period in a face table, for two-sided
+  gradients at a lon/lat grid's seam (and a face the seam cuts with a
+  plane): the spherical fixtures show it is where a mesh onto a global
+  grid loses most (6c's one-sided seam).
 
 ## 9. Interfaces and where things live
 

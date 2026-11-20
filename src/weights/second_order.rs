@@ -80,8 +80,24 @@
 //! without data drops out of first-order [`Weights::apply`].
 //! [`Weights::second_order`] folds them into one table, as ESMF's weight
 //! files hold it, for a fixed set of cells with data.
+//!
+//! **A limiter.** Next to a sharp front a plane can reach past the values
+//! round it, so a second-order value can overshoot: below the lowest of
+//! its sources, or above the highest. ESMF has no limiter. With
+//! [`Limiter::BarthJespersen`] in [`ApplyOptions::limiter`] each source
+//! cell's gradient is scaled (by Barth and Jespersen's factor, the largest
+//! in `[0, 1]` that works) so that the plane at each of its overlaps'
+//! centroids, where it is used, lies within the values of the cell and its
+//! neighbours. Under [`Normalization::FracArea`] each destination value is
+//! then within the values of its sources and theirs. A factor per cell
+//! keeps the integral as it was. It costs accuracy at smooth extrema,
+//! where the planes are flattened too, and at a window's edge, where a
+//! plane reaches past the neighbours on one side; inside, a linear field
+//! comes out exactly as without it. It depends on the field, so it is for
+//! [`Weights::apply_second_order`] (and [`PolyMesh::apply_second_order`])
+//! only: a folded table can't hold it.
 
-use super::{ApplyOptions, GridWindow, Normalization, Weights};
+use super::{ApplyOptions, GridWindow, Limiter, Normalization, Weights};
 use crate::mesh::PolyMesh;
 use crate::warp::{Interleaved, Output, Res, Sample, SourceBuffer};
 use controlledburn::{CoverageWindow, Measure};
@@ -90,9 +106,10 @@ use controlledburn::{CoverageWindow, Measure};
 /// polygon (`is_pnt_in_polygon`).
 const INSIDE_TOL: f64 = 1e-14;
 
-/// An overlap of less than this much of its face is rounding (a window
-/// leaves slivers of 1e-17 or so in cells the face doesn't reach): left out
-/// of where the face is in the grid's cells.
+/// An overlap of less than this much of its source cell or face is
+/// rounding (a window leaves slivers of 1e-17 or so in cells the outline
+/// doesn't reach), and so is its centroid: left out of where a face is in
+/// the grid's cells, and of the limiter.
 const SLIVER: f64 = 1e-12;
 
 /// A neighbour of a source cell, in the gradient's polygon.
@@ -214,8 +231,9 @@ pub(crate) struct Sources {
     rc: Vec<[i64; 2]>,
     /// The covered part's centroid, in full-grid source pixels.
     centre: Vec<[f64; 2]>,
-    /// The first of its entries.
-    k0: Vec<u32>,
+    /// Its entries, ascending: `ent[at[i]..at[i + 1]]`.
+    ent: Vec<u32>,
+    at: Vec<u32>,
     /// Each entry's source cell (into the above), `u32::MAX` for an entry
     /// outside the window.
     of: Vec<u32>,
@@ -224,6 +242,13 @@ pub(crate) struct Sources {
     /// as `moment - frac * centre`, so an overlap of next to no area has
     /// next to none, whatever rounding does to its centroid.
     dm: Vec<[f64; 2]>,
+}
+
+impl Sources {
+    /// Source cell `i`'s entries.
+    fn entries(&self, i: usize) -> &[u32] {
+        &self.ent[self.at[i] as usize..self.at[i + 1] as usize]
+    }
 }
 
 /// A source cell's candidate neighbour for its gradient: its index (as
@@ -251,7 +276,8 @@ impl Weights {
             p: Vec::new(),
             rc: Vec::new(),
             centre: Vec::new(),
-            k0: Vec::new(),
+            ent: by.iter().map(|e| e.1).collect(),
+            at: vec![0],
             of: vec![u32::MAX; self.len()],
             dm: vec![[0.0; 2]; self.len()],
         };
@@ -288,7 +314,7 @@ impl Weights {
             s.p.push(p);
             s.rc.push([r, c]);
             s.centre.push([o[0] + local[0], o[1] + local[1]]);
-            s.k0.push(k0 as u32);
+            s.at.push(j as u32);
             i = j;
         }
         s
@@ -305,6 +331,10 @@ impl Weights {
     /// Under [`Normalization::DestArea`] the integral is conserved exactly
     /// (to rounding), as by the first order: the gradient terms integrate to
     /// zero over each source cell's covered part.
+    ///
+    /// With [`Limiter::BarthJespersen`] in [`ApplyOptions::limiter`] the
+    /// gradients are limited, so values next to a sharp front don't
+    /// overshoot (see the module docs). Off by default, as in ESMF.
     ///
     /// For a table from a mesh's faces ([`PolyMesh::weights_to`]), use
     /// [`PolyMesh::apply_second_order`]: here the sources are a grid's
@@ -372,6 +402,10 @@ impl Weights {
             let pix = img.px(p);
             img.pixel_ok(pix) && img.band_ok(pix, b)
         };
+        let limited = match opts.limiter {
+            Limiter::Off => false,
+            Limiter::BarthJespersen => true,
+        };
         // each source cell's gradient, band by band
         let mut grad = vec![[0.0f64; 2]; s.p.len() * nb];
         let mut cands: Vec<Cand> = Vec::with_capacity(12);
@@ -387,10 +421,15 @@ impl Weights {
                 nbrs.extend(cands.iter().filter(|c| ok(c.0, b)).map(|&(p, at)| Nbr { at, angle: 0.0, grad: [0.0; 2], p }));
                 if let Some(own) = green(s.centre[i], &mut nbrs) {
                     let f = |p: usize| img.px(p)[b].to_f64();
-                    let mut g = [-own[0] * f(s.p[i]), -own[1] * f(s.p[i])];
+                    let fi = f(s.p[i]);
+                    let mut g = [-own[0] * fi, -own[1] * fi];
                     for n in &nbrs {
                         g[0] += n.grad[0] * f(n.p);
                         g[1] += n.grad[1] * f(n.p);
+                    }
+                    if limited {
+                        let phi = self.barth_jespersen(s, i, g, fi, nbrs.iter().map(|n| f(n.p)));
+                        g = [g[0] * phi, g[1] * phi];
                     }
                     grad[i * nb + b] = g;
                 }
@@ -413,7 +452,9 @@ impl Weights {
                 if i == u32::MAX {
                     continue;
                 }
-                let (i, w, a, dm) = (i as usize, self.overlap(k), self.src_area(k), s.dm[k]);
+                let (i, w, a) = (i as usize, self.overlap(k), self.src_area(k));
+                // limited, a sliver's centroid is rounding: it takes the cell's value
+                let dm = if limited && self.frac[k] <= SLIVER { [0.0; 2] } else { s.dm[k] };
                 for b in 0..nb {
                     if ok(s.p[i], b) {
                         let g = grad[i * nb + b];
@@ -439,6 +480,32 @@ impl Weights {
             start = end;
         }
         out
+    }
+
+    /// Barth and Jespersen's factor for source cell `i`'s gradient `g`
+    /// ([`Limiter::BarthJespersen`]): the largest in `[0, 1]` that keeps
+    /// the plane, at each of the cell's overlaps' centroids, within the
+    /// cell's value `own` and its neighbours' values `nbrs`. Overlaps under
+    /// [`SLIVER`] of the cell are left out: their centroids are rounding,
+    /// and the plane isn't used there.
+    fn barth_jespersen(&self, s: &Sources, i: usize, g: [f64; 2], own: f64, nbrs: impl Iterator<Item = f64>) -> f64 {
+        let (lo, hi) = nbrs.fold((own, own), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let mut phi = 1.0f64;
+        for &k in s.entries(i) {
+            let k = k as usize;
+            let f = self.frac[k];
+            if f <= SLIVER {
+                continue;
+            }
+            // the plane at the overlap's centroid, less the cell's value
+            let dv = (g[0] * s.dm[k][0] + g[1] * s.dm[k][1]) / f;
+            if dv > 0.0 {
+                phi = phi.min((hi - own) / dv);
+            } else if dv < 0.0 {
+                phi = phi.min((lo - own) / dv);
+            }
+        }
+        phi
     }
 
     /// The second-order table folded into one, as ESMF's `conserve_2nd`
@@ -769,8 +836,8 @@ impl Weights {
         );
         let faces = FaceStencil::new(mesh, self, &s);
         let mut area = vec![f64::NAN; nface];
-        for (i, &k) in s.k0.iter().enumerate() {
-            area[s.p[i]] = self.src_cell_area[k as usize];
+        for (i, &p) in s.p.iter().enumerate() {
+            area[p] = self.src_cell_area[s.entries(i)[0] as usize];
         }
         self.fold_planes(&s, &mut |i, out| faces.cands(&s, i, out), &|p| area[p], &|p| (0, p as u32), true)
     }
