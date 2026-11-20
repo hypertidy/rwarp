@@ -98,12 +98,16 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
 ## Next, in order
 
 1. **The next stage on the board**: conservative stage 6 (#40, second
-   order), section 8 of conservative.md. 6a (sources measured in their
-   pixels, on controlledburn 0.3.3's `CoverageWindow::set_moments`) and
-   6b (world-cell grids, in their index space, and grids onto meshes)
-   and 6c (a `PolyMesh`'s faces as sources, in the grid's space) are
-   built. Left, as decided on 2026-11-19: 6d an opt-in limiter and
-   spherical ESMF fixtures.
+   order), section 8 of conservative.md, is built: 6a (sources measured
+   in their pixels, on controlledburn 0.3.3's
+   `CoverageWindow::set_moments`), 6b (world-cell grids, in their index
+   space, and grids onto meshes), 6c (a `PolyMesh`'s faces as sources,
+   in the grid's space) and 6d (an opt-in Barth-Jespersen limiter, and
+   spherical ESMF fixtures). Possible next, found by 6d's fixtures: the
+   grid's period in a face table, so faces at a global lon/lat grid's
+   seam get two-sided gradients; within 15 degrees of the seam a mesh
+   onto the grid is near first order now, and ESMF 1.3 to 3.6 times
+   closer.
 2. **Decisions**: none waiting. N2, N5 and C1 to C4 were decided on
    2026-11-19 (#111). N5 (#47) is built, and adaptive predicates weren't
    needed (see N5 in decisions.md).

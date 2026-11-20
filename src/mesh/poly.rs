@@ -452,7 +452,11 @@ impl PolyMesh {
     ///
     /// Faces without data (as `opts` says) are left out of the gradients
     /// band by band, and out of their grid cells, as in
-    /// [`Weights::apply_second_order`].
+    /// [`Weights::apply_second_order`]; and with
+    /// [`Limiter::BarthJespersen`](crate::weights::Limiter::BarthJespersen)
+    /// in `opts` the gradients are limited as there, each face's plane at
+    /// its overlaps' centroids kept within its own and its neighbours'
+    /// values.
     ///
     /// # Panics
     ///

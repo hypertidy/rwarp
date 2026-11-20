@@ -103,7 +103,9 @@
 //! planes are in the grid's space and the neighbours are faces sharing a
 //! node: [`PolyMesh::apply_second_order`](crate::mesh::PolyMesh::apply_second_order)
 //! and [`PolyMesh::second_order`](crate::mesh::PolyMesh::second_order).
-//! See the `weights::second_order` module
+//! [`Limiter::BarthJespersen`] in [`ApplyOptions::limiter`] keeps values
+//! next to a sharp front within their sources' range (off by default, as
+//! ESMF has none). See the `weights::second_order` module
 //! (`src/weights/second_order.rs`) for the method and how it differs from
 //! ESMF's.
 //!
@@ -472,8 +474,34 @@ pub struct Weights {
     pub moment: Vec<[f64; 2]>,
 }
 
+/// A limit on second-order gradients ([`ApplyOptions::limiter`]), so that
+/// a value next to a sharp front doesn't overshoot what it is drawn from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Limiter {
+    /// None: ESMF's `conserve_2nd`, and what [`Weights::second_order`]
+    /// folds.
+    #[default]
+    Off,
+    /// Barth and Jespersen's (1989): each source cell's gradient scaled by
+    /// the largest factor in `[0, 1]` that keeps its plane, at each of its
+    /// overlaps' centroids, within the values of the cell and its
+    /// neighbours (those its gradient came from). Each overlap's mean is
+    /// the plane there, so it lies in that range; under
+    /// [`Normalization::FracArea`] so does each destination value, a mean
+    /// of its overlaps'. The factor is per cell, so the integral is
+    /// conserved as without it. A linear field's planes are left as they
+    /// are where the cell's neighbours surround it (inside a window, not
+    /// on its edge, where the plane reaches past them). Planes at a smooth
+    /// extremum are flattened too, so there the method falls to first
+    /// order. Overlaps under 1e-12 of their cell, whose centroids are
+    /// rounding, take the cell's value. The factor depends on the field,
+    /// so a folded table ([`Weights::second_order`]) can't hold it.
+    BarthJespersen,
+}
+
 /// Options for [`Weights::apply`]: nodata and validity, as in
-/// [`WarpOptions`].
+/// [`WarpOptions`], and for [`Weights::apply_second_order`] a limiter.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct ApplyOptions {
@@ -482,6 +510,12 @@ pub struct ApplyOptions {
     pub band_nodata: BandNodata,
     /// A band whose zero marks the whole source pixel invalid.
     pub mask_band: Option<usize>,
+    /// For second order ([`Weights::apply_second_order`],
+    /// [`PolyMesh::apply_second_order`](crate::mesh::PolyMesh::apply_second_order)):
+    /// how the gradients are limited, band by band. [`Limiter::Off`] by
+    /// default. First order ([`Weights::apply`]) has no gradients, so
+    /// takes no notice of it.
+    pub limiter: Limiter,
 }
 
 impl ApplyOptions {
@@ -508,6 +542,11 @@ impl ApplyOptions {
         self.mask_band = band;
         self
     }
+
+    pub fn with_limiter(mut self, limiter: Limiter) -> Self {
+        self.limiter = limiter;
+        self
+    }
 }
 
 impl From<&WarpOptions> for ApplyOptions {
@@ -518,6 +557,7 @@ impl From<&WarpOptions> for ApplyOptions {
             dst_nodata: o.dst_nodata.clone(),
             band_nodata: o.band_nodata,
             mask_band: o.mask_band,
+            limiter: Limiter::Off,
         }
     }
 }

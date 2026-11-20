@@ -1,5 +1,6 @@
-"""Regenerate the ESMF oracle fixtures for tests/esmf.rs, tests/esmf_tripolar.rs
-and tests/esmf_mesh.rs.
+"""Regenerate the ESMF oracle fixtures for tests/esmf.rs, tests/esmf_tripolar.rs,
+tests/esmf_mesh.rs, tests/esmf_second_order.rs and
+tests/esmf_second_order_sphere.rs.
 
     /opt/gdal-py/bin/python tests/fixtures/esmf/gen.py [case ...]
 
@@ -26,6 +27,11 @@ area, as ESMF's S:
   (ESMF gives one per source cell and neighbour). rwarp's
   Weights::second_order is the same method there, so it must match to
   rounding (tests/esmf_second_order.rs).
+- <case>.sph2.txt, for the same cases: ESMF's second-order map on the
+  sphere, as .sph.txt, summed per (row, col). ESMF's spherical method
+  works in three dimensions and rwarp's in longitude and latitude, so
+  the two are different second-order methods: the test compares each
+  with exact cell means (tests/esmf_second_order_sphere.rs).
 - <case>.tr.txt, for regular_coarser and regular_finer: TempestRemap's
   first-order finite volume map (GenerateRLLMesh, GenerateOverlapMesh,
   GenerateOfflineMap --in_np 1). TempestRemap 2.2 builds lon/lat meshes with
@@ -71,7 +77,8 @@ great circles, so the test records the difference; the faces are the
 same on both sides:
 
 - mesh_ico_to.sph.txt, mesh_ico_onto.sph.txt, mesh_dual_to.sph.txt,
-  mesh_dual_onto.sph.txt.
+  mesh_dual_onto.sph.txt, and the same four as .sph2.txt, ESMF's
+  second-order maps (tests/esmf_second_order_sphere.rs).
 
 ESMF splits a polygon into triangles and gives one weight per triangle,
 so a mesh map's weights are summed per (row, col) before they are
@@ -266,6 +273,8 @@ def write(path, case, kind, result):
         "cart2": f"ESMPy {esmpy.__version__} conserve_2nd, norm dstarea, Cartesian in source pixel space, "
                  "summed per (row, col)",
         "sph": f"ESMPy {esmpy.__version__} conserve, norm dstarea, spherical, great-circle edges",
+        "sph2": f"ESMPy {esmpy.__version__} conserve_2nd, norm dstarea, spherical, great-circle edges, "
+                "summed per (row, col)",
         "tr": "TempestRemap first-order FV (--in_np 1), great-circle edges",
     }[kind]
     header = [
@@ -616,7 +625,10 @@ def sphere_mesh_cases():
     size, gt = SPHERE_GRID_SIZE, SPHERE_GRID_GT
     corner, centre = (pixel_to_geo(gt, *lattice(*size, off)) for off in (False, True))
     g = grid(corner, centre, esmpy.CoordSys.SPH_DEG)
-    oracle = f"oracle ESMPy {esmpy.__version__} conserve, norm dstarea, spherical, great-circle edges (area_b in steradians)"
+    oracle = {ext: f"oracle ESMPy {esmpy.__version__} {method}, norm dstarea, spherical, great-circle edges"
+                   f"{summed_note} (area_b in steradians)"
+              for ext, method, summed_note in [("sph", "conserve", ""), ("sph2", "conserve_2nd", ", summed per (row, col)")]}
+    methods = [("sph", esmpy.RegridMethod.CONSERVE), ("sph2", esmpy.RegridMethod.CONSERVE_2ND)]
     for name, note, vs, faces in meshes:
         xs, ys = zip(*(lonlat(v) for v in vs))
         write_mesh(os.path.join(HERE, f"{name}.mesh.txt"), list(xs), list(ys), faces,
@@ -627,12 +639,13 @@ def sphere_mesh_cases():
             f"grid_gt {' '.join(repr(float(v)) for v in gt)}",
             f"grid_size {size[0]} {size[1]}",
         ]
-        for kind, what, res in [
-            ("to", f"{note} to a global 5 degree grid", conserve(mesh, g)),
-            ("onto", f"a global 5 degree grid onto {note}", conserve(g, mesh)),
-        ]:
-            write_map(os.path.join(HERE, f"{name}_{kind}.sph.txt"), [f"case {name}_{kind}: {what}", oracle] + common,
-                      "sph", summed(res))
+        for ext, method in methods:
+            for kind, what, res in [
+                ("to", f"{note} to a global 5 degree grid", conserve(mesh, g, method)),
+                ("onto", f"a global 5 degree grid onto {note}", conserve(g, mesh, method)),
+            ]:
+                write_map(os.path.join(HERE, f"{name}_{kind}.{ext}.txt"),
+                          [f"case {name}_{kind}: {what}", oracle[ext]] + common, ext, summed(res))
 
 
 def mesh_cases():
@@ -685,6 +698,11 @@ def main():
         sph = conserve(grid(s_corner_ll, s_centre_ll, esmpy.CoordSys.SPH_DEG),
                        grid(d_corner_ll, d_centre_ll, esmpy.CoordSys.SPH_DEG))
         write(os.path.join(HERE, f"{name}.sph.txt"), case, "sph", sph)
+        if name in SECOND_ORDER:
+            sph2 = summed(conserve(grid(s_corner_ll, s_centre_ll, esmpy.CoordSys.SPH_DEG),
+                                   grid(d_corner_ll, d_centre_ll, esmpy.CoordSys.SPH_DEG),
+                                   esmpy.RegridMethod.CONSERVE_2ND))
+            write(os.path.join(HERE, f"{name}.sph2.txt"), case, "sph2", sph2)
         if name in ("regular_coarser", "regular_finer"):
             work = tempfile.mkdtemp()
             write(os.path.join(HERE, f"{name}.tr.txt"), case, "tr", tempest(case, work))

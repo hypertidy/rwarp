@@ -190,6 +190,38 @@ longitude and latitude. At the grid's seam the gradients are one-sided: a
 face the seam cuts is first order, and a face's neighbour across it is
 left out.
 
+**A limiter.** Next to a sharp front a plane can reach past the values
+round it, so a second-order value overshoots what it is drawn from: below
+the lowest of its sources, or above the highest. ESMF has no limiter, and
+none is the default. Ask for Barth and Jespersen's:
+
+```rust,ignore
+let opts = ApplyOptions::new().with_limiter(Limiter::BarthJespersen);
+let values: Vec<f32> = w.apply_second_order(&buf, Normalization::FracArea, &opts);
+```
+
+Each source cell's gradient is scaled so that its plane, at each of its
+overlaps' centroids, stays within the values of the cell and its
+neighbours; under `FracArea` each target value is then within its
+sources' and theirs. One factor per cell keeps the integral as it was.
+It works for grids, grids with world cells and a mesh's faces, band by
+band (`tests/second_order_limiter.rs`). It costs some accuracy on a smooth
+field, as it flattens planes at extrema too: on a sine, 16 to 72% in rms,
+the more the less the field is resolved, still 7 to 49 times closer than
+first order. It depends on the field, so a folded table can't hold it.
+
+**On the sphere** rwarp's planes are in longitude and latitude, under the
+spherical measure, and ESMF's in three dimensions, so the two are
+different second-order methods, and `tests/esmf_second_order_sphere.rs`
+compares their accuracy, each against exact cell means in its own cells.
+Onto a grid both are second order, close for lon/lat onto lon/lat, rwarp
+19 times closer projected; onto a mesh rwarp is 5 to 12 times closer
+(ESMF centres an overlap on its vertices' mean). From a mesh's faces rwarp
+is 1.8 to 4.4 times closer away from the grid's seam, but close to first
+order within 15° of it, where ESMF, with no seam, is 1.3 to 3.6 times
+closer: a face the seam cuts is first order, as the table doesn't carry
+the grid's period.
+
 ## Meshes of polygons
 
 An unstructured mesh, ICON's triangles, MPAS's hexagons, a UGRID or ESMF
