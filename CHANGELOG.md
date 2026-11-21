@@ -6,6 +6,26 @@ All notable changes to rwarp. Dates are when the change reached `main`.
 
 ### Added
 
+- `rwarp::view`: which chunks, at which level, a view on a screen needs
+  from a chunked source with resolution levels (a Zarr with multiscales,
+  a COG with overviews), as a value, with no I/O. `plan_view` takes a
+  `View` (extent and screen size), a `Source` (per level a geotransform,
+  a size and a chunk shape; whether its CRS wraps, and its poles) and the
+  CRS transforms, and returns a `ViewPlan`: chunk keys nearest the centre
+  first, and per screen tile the level it needs. The screen is planned in
+  tiles of 64 pixels, each with its own level from the local scale (the
+  Jacobian of screen pixel to source, `Need::Area` or `Need::Shortest`;
+  gdalwarp's `-ovr AUTO` rule per tile) and its own footprint, unwrapped
+  across the source's seam; a tile holding a pole takes the full row of
+  longitudes; tiles at the limb of a globe are sampled a pixel at a time.
+  `ViewOptions::max_chunks` and `max_cells` are a budget, met by moving
+  the outermost tiles coarser; `ViewPlan::diff` gives what to fetch and
+  drop on a pan. `plan_single_box` is the one box, one level rule most
+  viewers use, for comparison: for a polar view of a global lon/lat
+  pyramid it asks for 6.5 times the cells, across 180 degrees 8.5 times.
+  The cases are data (`tests/fixtures/view/cases.json`) for other
+  planners to run. With `serde`, the inputs and the plan derive it.
+  In rwarp-wasm: `planView`, `planSingleBox`, `planViewWith`.
 - `Footprint::Adaptive { densify, tolerance }` and
   `WeightOptions::refine_tolerance` (`with_refine_tolerance`): the exact
   footprint with each segment of the outline bisected where the

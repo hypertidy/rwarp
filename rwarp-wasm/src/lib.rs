@@ -8,6 +8,10 @@
 //!                               window into one RGBA buffer
 //!   4. `Warper::warp_rgba`      resample into the destination tile
 //!
+//! Before any of that, a viewer with a chunked, levelled source (a Zarr
+//! with multiscales, a COG with overviews) asks which chunks its view
+//! needs: `planView`, over `rwarp::view`.
+//!
 //! Everything below `#[wasm_bindgen]` is plain Rust so the core can be
 //! tested natively with `cargo test`; the bindgen layer only converts types.
 
@@ -16,6 +20,7 @@ use rwarp::CrsTransform;
 use wasm_bindgen::JsCast;
 use rwarp::source_window::{compute_source_window, SourceWindow};
 use rwarp::transform::GenImgProjTransformer;
+use rwarp::view::{plan_single_box, plan_view, Level, Source, View, ViewOptions, ViewPlan};
 use rwarp::warp::{warp, KernelScaling, Nodata, ResampleAlg, SourceBuffer, WarpOptions};
 use wasm_bindgen::prelude::*;
 
@@ -337,6 +342,185 @@ pub fn crs_to_lonlat(crs: &str, x: f64, y: f64) -> Option<Vec<f64>> {
 }
 
 // ---------------------------------------------------------------------------
+// View planning
+// ---------------------------------------------------------------------------
+
+/// The levels of a source from a flat array, ten numbers a level: the
+/// geotransform `[x0, dx, rx, y0, ry, dy]`, the size `[width, height]` in
+/// cells and the chunk shape `[width, height]`.
+pub fn levels_from_flat(levels: &[f64]) -> Result<Vec<Level>, String> {
+    if levels.is_empty() || levels.len() % 10 != 0 {
+        return Err(format!("levels must hold 10 numbers a level (gt, size, chunk), got {}", levels.len()));
+    }
+    levels
+        .chunks(10)
+        .enumerate()
+        .map(|(i, l)| {
+            if l[6..].iter().any(|v| !(v.is_finite() && *v >= 1.0)) {
+                return Err(format!("level {i}: size and chunk must be 1 or more"));
+            }
+            let n = |v: f64| v as usize;
+            Ok(Level::new([l[0], l[1], l[2], l[3], l[4], l[5]], [n(l[6]), n(l[7])], [n(l[8]), n(l[9])]))
+        })
+        .collect()
+}
+
+fn view_of(extent: &[f64], width: u32, height: u32) -> Result<View, String> {
+    match extent {
+        [x0, y0, x1, y1] if x1 > x0 && y1 > y0 => Ok(View::new([*x0, *y0, *x1, *y1], [width as usize, height as usize])),
+        _ => Err("view extent must be [xmin, ymin, xmax, ymax]".to_string()),
+    }
+}
+
+/// `planView` without the JavaScript types: the plan for a view in
+/// `view_crs` of a source in `source_crs`, with proj4rs. `single_box`
+/// gives the one-box, one-level plan instead, for comparison.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_view_core(
+    view_crs: &str,
+    extent: &[f64],
+    width: u32,
+    height: u32,
+    source_crs: &str,
+    levels: &[f64],
+    opts: &ViewOptions,
+    single_box: bool,
+) -> Result<(ViewPlan, Source), String> {
+    let view = view_of(extent, width, height)?;
+    let source = Source::for_crs(levels_from_flat(levels)?, source_crs)?;
+    let to_source = rwarp::crs::Proj4rsBackend::new(view_crs, source_crs)?;
+    let to_view = rwarp::crs::Proj4rsBackend::new(source_crs, view_crs)?;
+    let plan = if single_box {
+        plan_single_box(&view, &source, &to_source, Some(&to_view), 64, 0.7)
+    } else {
+        plan_view(&view, &source, &to_source, Some(&to_view), opts)
+    };
+    Ok((plan, source))
+}
+
+fn view_options(tile: u32, quality: f64, max_chunks: u32) -> ViewOptions {
+    let mut o = ViewOptions::default();
+    if tile > 0 {
+        o = o.with_tile(tile as usize);
+    }
+    if quality.is_finite() && quality > 0.0 {
+        o = o.with_quality(quality);
+    }
+    o.with_max_chunks((max_chunks > 0).then_some(max_chunks as usize))
+}
+
+fn plan_to_js(plan: &ViewPlan, source: &Source) -> JsValue {
+    let chunks: Vec<u32> = plan.keys().flat_map(|k| [k.level as u32, k.col as u32, k.row as u32]).collect();
+    let screen: Vec<f64> = plan.chunks.iter().map(|c| c.screen_px).collect();
+    let tiles: Vec<f64> = plan
+        .tiles
+        .iter()
+        .flat_map(|t| [t.col as f64, t.row as f64, t.level as f64, t.planned as f64, t.need, t.valid as f64 / t.samples as f64, t.pole as u8 as f64])
+        .collect();
+    let o = js_sys::Object::new();
+    let set = |k: &str, v: JsValue| {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str(k), &v);
+    };
+    set("chunks", js_sys::Uint32Array::from(&chunks[..]).into());
+    set("screenPx", js_sys::Float64Array::from(&screen[..]).into());
+    set("tiles", js_sys::Float64Array::from(&tiles[..]).into());
+    set("cells", JsValue::from_f64(plan.cells(source) as f64));
+    set("overBudget", JsValue::from_bool(plan.over_budget));
+    o.into()
+}
+
+/// Which chunks, at which level, a view needs (`rwarp::view::plan_view`).
+///
+/// - `view_crs`, `extent` `[xmin, ymin, xmax, ymax]`, `width`, `height`:
+///   the view, in screen (device) pixels.
+/// - `source_crs`, `levels`: the source, ten numbers a level in a
+///   `Float64Array`: geotransform (6), size in cells (2), chunk shape (2).
+/// - `tile`: screen tile size in pixels (0 for the default, 64).
+/// - `quality`: below 1 asks for finer levels (0 for the default, 1).
+/// - `max_chunks`: a budget (0 for none).
+///
+/// Returns `{ chunks, screenPx, tiles, cells, overBudget }`: `chunks` is a
+/// `Uint32Array` of `level, col, row` triples, nearest the centre of the
+/// view first, with the screen pixels each serves in `screenPx`; `tiles`
+/// is a `Float64Array` of seven numbers a screen tile that sees the
+/// source: `col, row, level, planned, need, visible, pole` (`level` is
+/// what the tile needs, `planned` what the budget left it, `need` the
+/// source cell a screen pixel covers there, `visible` the share of the
+/// tile that sees the source, `pole` 1 if a pole is in it); `cells` is
+/// the cells in all the chunks.
+#[wasm_bindgen(js_name = planView)]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_view_js(
+    view_crs: &str,
+    extent: &[f64],
+    width: u32,
+    height: u32,
+    source_crs: &str,
+    levels: &[f64],
+    tile: u32,
+    quality: f64,
+    max_chunks: u32,
+) -> Result<JsValue, JsError> {
+    let opts = view_options(tile, quality, max_chunks);
+    let (plan, source) = plan_view_core(view_crs, extent, width, height, source_crs, levels, &opts, false)
+        .map_err(|e| JsError::new(&e))?;
+    Ok(plan_to_js(&plan, &source))
+}
+
+/// One box and one level for the whole view, the rule most viewers use
+/// (`rwarp::view::plan_single_box`), in `planView`'s shapes: to show
+/// beside a plan what the plan saves.
+#[wasm_bindgen(js_name = planSingleBox)]
+pub fn plan_single_box_js(
+    view_crs: &str,
+    extent: &[f64],
+    width: u32,
+    height: u32,
+    source_crs: &str,
+    levels: &[f64],
+) -> Result<JsValue, JsError> {
+    let (plan, source) =
+        plan_view_core(view_crs, extent, width, height, source_crs, levels, &ViewOptions::default(), true)
+            .map_err(|e| JsError::new(&e))?;
+    Ok(plan_to_js(&plan, &source))
+}
+
+/// `planView` with the projecting done by JavaScript functions, as
+/// `Warper.withTransforms`: `to_source(x, y, out)` takes a view
+/// coordinate to the source CRS and `to_view(x, y, out)` back, each
+/// writing `[x, y]` into `out` and returning `true`, or returning `false`
+/// for a point it cannot transform. `geographic` says the source CRS is
+/// longitude and latitude in degrees (it wraps every 360 and has poles).
+#[wasm_bindgen(js_name = planViewWith)]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_view_with_js(
+    to_source: &JsValue,
+    to_view: &JsValue,
+    extent: &[f64],
+    width: u32,
+    height: u32,
+    levels: &[f64],
+    geographic: bool,
+    tile: u32,
+    quality: f64,
+    max_chunks: u32,
+) -> Result<JsValue, JsError> {
+    let js = |e: String| JsError::new(&e);
+    let as_fn = |v: &JsValue, what: &str| -> Result<js_sys::Function, JsError> {
+        v.dyn_ref::<js_sys::Function>()
+            .cloned()
+            .ok_or_else(|| JsError::new(&format!("{what} must be a function (x, y, out) => boolean")))
+    };
+    let fwd = JsTransform::new(as_fn(to_source, "to_source")?);
+    let back = JsTransform::new(as_fn(to_view, "to_view")?);
+    let view = view_of(extent, width, height).map_err(js)?;
+    let levels = levels_from_flat(levels).map_err(js)?;
+    let source = if geographic { Source::geographic(levels) } else { Source::new(levels) };
+    let plan = plan_view(&view, &source, &fwd, Some(&back), &view_options(tile, quality, max_chunks));
+    Ok(plan_to_js(&plan, &source))
+}
+
+// ---------------------------------------------------------------------------
 // Native tests
 // ---------------------------------------------------------------------------
 
@@ -516,5 +700,47 @@ mod tests {
         assert!(valid.len() > 256 * 200, "most pixels valid: {}", valid.len());
         assert!(valid.iter().any(|v| v.fract() != 0.0), "fractions survive");
         assert!(out.iter().all(|v| !v.is_nan()));
+    }
+
+    fn mur_levels() -> Vec<f64> {
+        let mut v = Vec::new();
+        for k in 0..7 {
+            let f = (1u32 << k) as f64;
+            v.extend([-180.0, 0.01 * f, 0.0, 90.0, 0.0, -0.01 * f]);
+            v.extend([(36000.0 / f).ceil(), (18000.0 / f).ceil(), 512.0, 512.0]);
+        }
+        v
+    }
+
+    #[test]
+    fn view_plan_for_a_polar_view() {
+        let extent = [-4e6, -4e6, 4e6, 4e6];
+        let opts = ViewOptions::default();
+        let (plan, source) =
+            plan_view_core("EPSG:3031", &extent, 1024, 1024, "EPSG:4326", &mur_levels(), &opts, false).unwrap();
+        let (single, _) =
+            plan_view_core("EPSG:3031", &extent, 1024, 1024, "EPSG:4326", &mur_levels(), &opts, true).unwrap();
+        assert_eq!(source.period, Some(360.0));
+        assert_eq!(plan.chunks.len(), 36);
+        assert_eq!(single.chunks.len(), 216);
+        assert!(single.cells(&source) > 5 * plan.cells(&source));
+        assert_eq!(plan.tiles.iter().filter(|t| t.pole).count(), 1);
+        // A budget, through the options the page passes.
+        let tight = view_options(0, 0.0, 12);
+        let (small, _) =
+            plan_view_core("EPSG:3031", &extent, 1024, 1024, "EPSG:4326", &mur_levels(), &tight, false).unwrap();
+        assert!(small.chunks.len() <= 12 && !small.over_budget);
+    }
+
+    #[test]
+    fn view_plan_inputs_are_checked() {
+        let o = ViewOptions::default();
+        let l = mur_levels();
+        assert!(plan_view_core("EPSG:3031", &[0.0, 0.0, 1.0], 8, 8, "EPSG:4326", &l, &o, false).is_err());
+        assert!(plan_view_core("EPSG:3031", &[0.0, 0.0, 1.0, 1.0], 8, 8, "EPSG:4326", &l[..9], &o, false).is_err());
+        assert!(plan_view_core("+proj=nonsense", &[0.0, 0.0, 1.0, 1.0], 8, 8, "EPSG:4326", &l, &o, false).is_err());
+        let mut zero = l.clone();
+        zero[8] = 0.0;
+        assert!(levels_from_flat(&zero).is_err());
     }
 }

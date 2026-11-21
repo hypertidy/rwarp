@@ -34,6 +34,28 @@ http, not file://) after building:
 Geotransforms are GDAL order `[x0, dx, rx, y0, ry, dy]`. CRS strings are
 proj strings (`+proj=laea +lat_0=-42 +lon_0=147 ...`) or `EPSG:NNNN`.
 
+### Which chunks does a view need?
+
+For a chunked source with resolution levels (a Zarr with multiscales, a
+COG with overviews), before fetching anything:
+
+    // ten numbers a level: geotransform (6), size in cells (2), chunk shape (2)
+    const levels = new Float64Array([-180, 0.01, 0, 90, 0, -0.01, 36000, 18000, 512, 512, /* ... */]);
+    const plan = planView("EPSG:3031", [-4e6, -4e6, 4e6, 4e6], 1024, 1024,
+                          "EPSG:4326", levels, 0, 0, 0);   // tile, quality, max chunks: defaults
+    // plan.chunks: Uint32Array of level, col, row triples, nearest the centre first
+    // plan.tiles:  Float64Array, seven a screen tile: col, row, level, planned, need, visible, pole
+    // plan.cells:  cells in all the chunks; plan.overBudget
+
+The screen is planned in tiles, each with the level its own scale needs,
+so a polar view of a lon/lat grid takes a few coarse chunks at the pole
+and finer ones at the rim, and a view across 180 degrees takes both
+sides of the seam and nothing between. `planSingleBox` (same arguments,
+without the last three) is the one box, one level rule, to show the
+difference. `planViewWith(toSource, toView, extent, width, height,
+levels, geographic, tile, quality, maxChunks)` plans with JavaScript
+projection functions, as `Warper.withTransforms` below.
+
 ### Bringing your own projections
 
 `proj4rs` parses a subset of what proj4js or PROJ do. When it declines a

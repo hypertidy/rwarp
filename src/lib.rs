@@ -62,6 +62,7 @@
 //! | [`approx`] | `ApproxTransformer` (adaptive interpolation) | `GDALApproxTransform` |
 //! | [`source_window`] | `compute_source_window` (one window, quick) | `ComputeSourceWindow` |
 //! | [`plan`] | `plan_chunks`, `ChunkPlanner`, `warp_chunks`: gdalwarp's chunk list, source windows and per-chunk kernel scale as values | `GDALWarpOperation::CollectChunkList`, `ComputeSourceWindow` |
+//! | [`view`] | `plan_view`: for a view on a screen, the chunks of a levelled source it needs, with a level per screen tile; pole, seam and horizon handled; a budget; `plan_single_box` for comparison | none (`ComputeSourceWindow` with `-ovr AUTO`, asked per screen region) |
 //! | [`cutline`] | `Cutline`: polygon limiting the source pixels used, as a per-pixel density | `GDALWarpCutlineMaskerEx`, `TransformCutlineToSource` |
 //! | [`weights`] | `exact_weights`, `Weights`: conservative remapping weights from the exact footprint as values (ESMF `conserve`), normalised (`FracArea`, `DestArea`) and applied | none (ESMF `ESMF_RegridWeightGen`, SCRIP) |
 //! | [`warp`] | Resampling kernels (one-pass generic `Sample` kernel with GDAL's downsampling widening, area-weighted average and mode, and a per-band `i32` point-kernel reference) | `gdalwarpkernel.cpp` |
@@ -93,6 +94,7 @@
 //! | Longitude wrapping of a geographic source (`CENTER_LONG`) | sources across 180 degrees stored as 170..190, -190..-170, 140..200 and 0..360, and one wider than 360 under a `-te` across 180, to LAEA, Mercator, polar stereographic and lon/lat targets across 180 (`tests/chunks.rs`) | centre longitude as GDAL's; exact transformer within 1e-12 px of GDAL's (libproj); chunk lists and every output pixel identical to `gdalwarp` with both CRS backends, 11 cases |
 //! | `GeolocArrays` / `GenImgGeolocTransformer` | synthetic curvilinear swath, both georeferencing conventions, curvilinear source and curvilinear target, both inverse methods (`tests/geoloc.rs`) | coordinates within 1e-6 px of GDAL's transformer (CRS step varies slightly by PROJ version); nearest warp identical to `gdalwarp -et 0` |
 //! | GDAL's backmap geolocation inverse (`GeolocInverse::Backmap`) | swath by centres and by corners to lon/lat and polar stereographic, a polar ring and a swath across 180 degrees, holes in the arrays with source nodata, overlapping scans (`tests/geoloc_backmap.rs`) | success at every target pixel as GDAL's, positions within 5e-10 px; the backmap estimate the same; 24 warps (near, bilinear, cubic; `-et 0` and `0.125`) identical to `gdalwarp` with proj4rs and the fixtures' PROJ (nearest identical, interpolated within 2e-8 relative, with an older libproj) |
+//! | View plans (`view::plan_view`) | 12 views of global lon/lat, UTM and polar pyramids: globe, tilted perspective, both poles, across 180 degrees, whole world, no overviews (`tests/view.rs`, cases in `tests/fixtures/view/cases.json`) | every visible screen pixel (one in 16 checked) has its source cell in a planned chunk no coarser than its tile's level; against one box and one level, 0.15 times the cells for EPSG:3031 and 0.12 across 180 degrees |
 //! | Cutline (`-cutline`, `CUTLINE_ALL_TOUCHED`, `-cblend`) | synthetic Float32, ties through pixel centres, holes, multipolygons, nodata, every method, rotated and LAEA to lon/lat (`tests/cutline.rs`) | within 1e-6 relative of `gdalwarp` (67 cases); differs only at centre ties on a diagonal (rounding, 5 pixels) and where GDAL's all-touched line walker burns corner-touched pixels or uses tolerances (3 cases) |
 //!
 //! **Downsampled interpolated warps:** when the output is coarser than the
@@ -166,6 +168,7 @@ pub mod mesh;
 pub mod approx;
 pub mod source_window;
 pub mod plan;
+pub mod view;
 pub mod cutline;
 pub mod warp;
 pub mod weights;
