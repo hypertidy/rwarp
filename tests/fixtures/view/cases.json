@@ -1,0 +1,108 @@
+{
+  "format": "view-plan-cases/1",
+  "note": "Views of chunked, levelled sources, with the chunks each needs. A level's geotransform is GDAL's [x0, dx, rx, y0, ry, dy]; a source with 'levels': n is 'base' and n - 1 overviews, each half the size (rounded up) with the same chunk shape. 'geographic' sources wrap in x every 360 and have poles at y = 90 and -90. A view's extent is [xmin, ymin, xmax, ymax] in its CRS and its size is screen pixels. 'per_tile' is rwarp::view::plan_view with its defaults, 'per_tile_all' the same without dropping coarse chunks that finer ones cover, 'single_box' is plan_single_box with 64 samples a side and quality 0.7. 'cells' is the sum of the chunks' cells.",
+  "sources": {
+    "mur": {"crs": "EPSG:4326", "geographic": true, "base": {"gt": [-180.0, 0.01, 0.0, 90.0, 0.0, -0.01], "size": [36000, 18000], "chunk": [512, 512]}, "levels": 7},
+    "mur_full_resolution_only": {"crs": "EPSG:4326", "geographic": true, "base": {"gt": [-180.0, 0.01, 0.0, 90.0, 0.0, -0.01], "size": [36000, 18000], "chunk": [512, 512]}, "levels": 1},
+    "utm60": {"crs": "EPSG:32760", "geographic": false, "base": {"gt": [500000.0, 10.0, 0.0, 5900000.0, 0.0, -10.0], "size": [40960, 40960], "chunk": [1024, 1024]}, "levels": 6},
+    "antarctic": {"crs": "EPSG:3031", "geographic": false, "base": {"gt": [-3072000.0, 100.0, 0.0, 3072000.0, 0.0, -100.0], "size": [61440, 61440], "chunk": [512, 512]}, "levels": 7}
+  },
+  "cases": [
+    {"name": "globe: orthographic disk at 147E 42S", "source": "mur",
+     "view": {"crs": "+proj=ortho +lon_0=147 +lat_0=-42 +R=6371000", "extent": [-6400000, -6400000, 6400000, 6400000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 5931954, "chunks": 28, "levels": [3, 4, 5]},
+       "per_tile_all": {"cells": 6879185, "chunks": 35, "levels": [3, 4, 5]},
+       "single_box": {"cells": 7821000, "chunks": 36, "levels": [3]},
+       "pole_tiles": 1
+     }},
+    {"name": "small: orthographic 600 km at Hobart", "source": "mur",
+     "view": {"crs": "+proj=ortho +lon_0=147.3 +lat_0=-42.9 +R=6371000", "extent": [-300000, -300000, 300000, 300000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 1048576, "chunks": 4, "levels": [0]},
+       "per_tile_all": {"cells": 1048576, "chunks": 4, "levels": [0]},
+       "single_box": {"cells": 1048576, "chunks": 4, "levels": [0]},
+       "pole_tiles": 0
+     }},
+    {"name": "pole: EPSG:3031, 8000 km across", "source": "mur",
+     "view": {"crs": "EPSG:3031", "extent": [-4000000, -4000000, 4000000, 4000000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 7931592, "chunks": 36, "levels": [2, 3]},
+       "per_tile_all": {"cells": 9207418, "chunks": 45, "levels": [2, 3, 4]},
+       "single_box": {"cells": 51408000, "chunks": 216, "levels": [1]},
+       "pole_tiles": 1
+     }},
+    {"name": "pole: EPSG:3413, 6000 km across", "source": "mur",
+     "view": {"crs": "EPSG:3413", "extent": [-3000000, -3000000, 3000000, 3000000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 8064000, "chunks": 32, "levels": [2, 3, 4]},
+       "per_tile_all": {"cells": 8064000, "chunks": 32, "levels": [2, 3, 4]},
+       "single_box": {"cells": 36864000, "chunks": 144, "levels": [1]},
+       "pole_tiles": 1
+     }},
+    {"name": "seam: lon/lat 160E to 160W", "source": "mur",
+     "view": {"crs": "EPSG:4326", "extent": [160, -30, 200, 10], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 5447680, "chunks": 25, "levels": [1]},
+       "per_tile_all": {"cells": 5447680, "chunks": 25, "levels": [1]},
+       "single_box": {"cells": 46080000, "chunks": 180, "levels": [1]},
+       "pole_tiles": 0
+     }},
+    {"name": "world: lon/lat, whole", "source": "mur",
+     "view": {"crs": "EPSG:4326", "extent": [-180, -90, 180, 90], "size": [1024, 512]},
+     "expect": {
+       "per_tile": {"cells": 633375, "chunks": 6, "levels": [5]},
+       "per_tile_all": {"cells": 633375, "chunks": 6, "levels": [5]},
+       "single_box": {"cells": 2531250, "chunks": 15, "levels": [4]},
+       "pole_tiles": 2
+     }},
+    {"name": "globe, no overviews", "source": "mur_full_resolution_only",
+     "view": {"crs": "+proj=ortho +lon_0=147 +lat_0=-42 +R=6371000", "extent": [-6400000, -6400000, 6400000, 6400000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 339767808, "chunks": 1374, "levels": [0]},
+       "per_tile_all": {"cells": 339767808, "chunks": 1374, "levels": [0]},
+       "single_box": {"cells": 479232000, "chunks": 1846, "levels": [0]},
+       "pole_tiles": 1
+     }},
+    {"name": "seam, no overviews", "source": "mur_full_resolution_only",
+     "view": {"crs": "EPSG:4326", "extent": [160, -30, 200, 10], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 19611648, "chunks": 81, "levels": [0]},
+       "per_tile_all": {"cells": 19611648, "chunks": 81, "levels": [0]},
+       "single_box": {"cells": 165888000, "chunks": 639, "levels": [0]},
+       "pole_tiles": 0
+     }},
+    {"name": "seam: UTM zone 60 source in lon/lat across 180", "source": "utm60",
+     "view": {"crs": "EPSG:4326", "extent": [179.5, -38.5, 180.5, -38.0], "size": [1024, 512]},
+     "expect": {
+       "per_tile": {"cells": 4194304, "chunks": 4, "levels": [3]},
+       "per_tile_all": {"cells": 4194304, "chunks": 4, "levels": [3]},
+       "single_box": {"cells": 6291456, "chunks": 6, "levels": [2]},
+       "pole_tiles": 0
+     }},
+    {"name": "polar source on the globe", "source": "antarctic",
+     "view": {"crs": "+proj=ortho +lon_0=90 +lat_0=-70 +R=6371000", "extent": [-1600000, -1600000, 1600000, 1600000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 4784128, "chunks": 20, "levels": [4, 5]},
+       "per_tile_all": {"cells": 5308416, "chunks": 22, "levels": [4, 5]},
+       "single_box": {"cells": 4587520, "chunks": 20, "levels": [4]},
+       "pole_tiles": 0
+     }},
+    {"name": "horizon: tilted perspective from 5000 km", "source": "mur",
+     "view": {"crs": "+proj=tpers +h=5000000 +lat_0=-30 +lon_0=147 +tilt=30 +azi=20 +R=6371000", "extent": [-4000000, -4000000, 4000000, 4000000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 6642688, "chunks": 27, "levels": [2, 3, 4, 5]},
+       "per_tile_all": {"cells": 7270400, "chunks": 30, "levels": [2, 3, 4, 5]},
+       "single_box": {"cells": 23040000, "chunks": 90, "levels": [2]},
+       "pole_tiles": 0
+     }},
+    {"name": "polar source, Mercator strip across 180", "source": "antarctic",
+     "view": {"crs": "EPSG:3395", "extent": [18000000, -14000000, 22000000, -10000000], "size": [1024, 1024]},
+     "expect": {
+       "per_tile": {"cells": 2883584, "chunks": 11, "levels": [3]},
+       "per_tile_all": {"cells": 2883584, "chunks": 11, "levels": [3]},
+       "single_box": {"cells": 3145728, "chunks": 12, "levels": [3]},
+       "pole_tiles": 0
+     }}
+  ]
+}
