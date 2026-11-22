@@ -568,7 +568,7 @@ of stage 1's weights, and doesn't change the coverage engine.
 Built in three steps: 6b the world-cell grids and grids onto meshes, 6c
 the faces as sources, 6d the limiter and spherical ESMF fixtures.
 
-**Status (2026-11-20): 6a to 6d built** (`src/weights/second_order.rs`).
+**Status (2026-11-22): 6a to 6d built, and the grid's period** (`src/weights/second_order.rs`).
 
 - **What's built:** `WeightOptions::with_moments`, `Weights::moment`,
   `Weights::apply_second_order` and `Weights::second_order`, for sources
@@ -647,8 +647,8 @@ the faces as sources, 6d the limiter and spherical ESMF fixtures.
     its centre is in the middle of the grid. A neighbour whose cells'
     bounding box isn't next to the face's is left out: it is across the
     seam. So at a seam the gradients are one-sided, as a grid's are at
-    its edge. Carrying the period would give two-sided gradients for a
-    lon/lat grid only; not done.
+    its edge. That is still the rule without a period (a world-cell
+    grid's index seam); with one it is two-sided (below, the period).
   - Checks: the moments are `weights_onto`'s, turned round, to 1e-12. A
     field linear in the grid's space is exact on faces off the mesh's
     edge and whole in the window, with their neighbours: in pixels to
@@ -707,10 +707,56 @@ the faces as sources, 6d the limiter and spherical ESMF fixtures.
     order's for a grid onto a grid but next to the source's edge
     (one-sided gradients, `S` to 0.074), and elsewhere by the method
     (0.02 projected, 0.23 from a mesh).
-- **Not built:** the grid's period in a face table, for two-sided
-  gradients at a lon/lat grid's seam (and a face the seam cuts with a
-  plane): the spherical fixtures show it is where a mesh onto a global
-  grid loses most (6c's one-sided seam).
+- **The grid's period** (`tests/second_order_period.rs`), found by 6d's
+  fixtures: within 15 degrees of a global grid's seam a mesh onto it was
+  near first order. `Weights::period` (with moments, for a grid that
+  wraps every whole number of its columns, `Transformer::source_wrap`)
+  is recorded by `exact_weights`, `PolyMesh::weights_onto` and
+  `weights_to` (and `_par`); `None` for world cells.
+  - A grid source: a cell on the seam takes the cells across it (columns
+    modulo the period), centred on its side, in `apply_second_order` and
+    the fold.
+  - Faces (`Unwrap`): each face's cells are cut where they leave the
+    widest gap round the period (the gap round the seam first, so a face
+    that doesn't cross it is as before, bit for bit), and those before
+    the cut moved on a period, so its centre is on one side. A neighbour
+    is moved by the whole periods nearest the face, its bounding box too.
+    A face whose cells take every column (round a pole) has no centre in
+    the grid's columns: first order, and no one's neighbour.
+  - **Inside, relative.** Checking that the seam doesn't matter (the same
+    mesh onto a grid with its seam at 180 and at 0) found the geodesic
+    mesh's pole triangles flipping between first and second order: by
+    symmetry each face's centre is on an edge of its neighbours' polygon
+    (the pole triangles either side are in the same row), and the faces'
+    measure (refined to 1e-7 pixels, differently in the two) put it
+    4e-12 outside in one. ESMF's tolerance is 1e-14 absolute, in its
+    unit-sphere coordinates; in pixels it is below the noise. Now a
+    centre is outside only past an edge by more than 1e-14 or an angle
+    of 1e-9 (sine), seen from the edge's start.
+  - Checks: with the seam turned half the globe, second order (with and
+    without the limiter, folded too) differs by 6e-12 to 1.2e-10, as much
+    as first order (8e-11 to 3.5e-10, the refinement); without the period
+    by 3e-4 to 0.22. A face the seam cuts is exact for a field linear
+    across it; without the period it is first order, as before. A
+    mesh_dual pole face is first order and only in its own cells of the
+    fold. Each piece (both wraps, the unwrap, round, both shifts, the
+    tolerance, and recording) has a mutation that fails a test. The ORCA2
+    and second-order bitwise checks (38) and the ESMF comparisons are
+    unchanged.
+  - On the sphere, within 15 degrees of the seam and below 60 degrees,
+    rwarp 9.2e-3 and 1.4e-2 rms (was 5.3e-2 and 8.1e-2), ESMF 1.6e-2 and
+    6.0e-2: as away from the seam. Over every cell rwarp 1.5e-2 and
+    1.8e-2 (was 2.4e-2 and 3.8e-2), ESMF 1.6e-2 and 6.7e-2. A grid onto
+    the meshes 9.0e-5 and 9.1e-5 (was 1.3e-4 and 9.8e-5).
+- **Not built:** planes near the poles. Above 60 degrees a plane in
+  longitude and latitude fits a smooth field less well: from the
+  geodesic mesh, rwarp 2.3e-2 rms there, ESMF (in three dimensions)
+  1.4e-2. And `Weights::apply` under `FracArea` takes a running mean
+  (`mean += w / total * (v - mean)`, as `warp()` does), which with a
+  folded table's negative weights loses precision where the running
+  total comes near zero: the faces' fold applied is off
+  `apply_second_order` by up to 0.76 in a few cells on main (0.14 now),
+  where under `DestArea` it is 3e-15.
 
 ## 9. Interfaces and where things live
 

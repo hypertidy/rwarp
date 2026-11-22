@@ -186,9 +186,15 @@ space comes out exact to 3e-14 where the faces are whole in the grid
 (first order is off by 2.3), and on a quadratic halving both mesh and
 grid divides the error by 3.9 (`tests/second_order_faces.rs`). For a mesh
 in longitude and latitude onto a grid in them, the planes are linear in
-longitude and latitude. At the grid's seam the gradients are one-sided: a
-face the seam cuts is first order, and a face's neighbour across it is
-left out.
+longitude and latitude. Across a global grid's seam the table carries
+the grid's period (`Weights::period`, for a grid that wraps every whole
+number of its columns). So a face the seam cuts has a plane like any
+other, and the faces either side take each other as neighbours. With the
+seam on the far side of the globe the same mesh comes out the same
+(`tests/second_order_period.rs`). A face round a pole, whose cells take
+every column, is first order. Without a period, as at a world-cell grid's
+seam in its indices, the gradients there are one-sided: a face the seam
+cuts is first order, and a face's neighbour across it is left out.
 
 **A limiter.** Next to a sharp front a plane can reach past the values
 round it, so a second-order value overshoots what it is drawn from: below
@@ -215,12 +221,12 @@ spherical measure, and ESMF's in three dimensions, so the two are
 different second-order methods, and `tests/esmf_second_order_sphere.rs`
 compares their accuracy, each against exact cell means in its own cells.
 Onto a grid both are second order, close for lon/lat onto lon/lat, rwarp
-19 times closer projected; onto a mesh rwarp is 5 to 12 times closer
-(ESMF centres an overlap on its vertices' mean). From a mesh's faces rwarp
-is 1.8 to 4.4 times closer away from the grid's seam, but close to first
-order within 15° of it, where ESMF, with no seam, is 1.3 to 3.6 times
-closer: a face the seam cuts is first order, as the table doesn't carry
-the grid's period.
+19 times closer projected; onto a mesh rwarp is 5 to 17 times closer
+(ESMF centres an overlap on its vertices' mean). From a mesh's faces,
+below 60° of latitude rwarp is 1.7 to 4.9 times closer, next to the
+grid's seam and away from it alike. Nearer the poles, where a plane in
+longitude and latitude fits less well, ESMF is 1.6 times closer for a
+geodesic mesh and rwarp 2.5 times for its dual.
 
 ## Meshes of polygons
 
