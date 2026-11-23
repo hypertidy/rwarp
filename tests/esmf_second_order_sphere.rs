@@ -400,12 +400,13 @@ fn a_grid_onto_a_grid() {
 }
 
 /// A grid onto a mesh's faces (6b): the overlaps are general polygons, so
-/// ESMF's vertex means put its second order 5 to 12 times further off
+/// ESMF's vertex means put its second order 5 to 17 times further off
 /// than rwarp's, everywhere, at the grid's seam (where rwarp's gradients
-/// are one-sided) and near the poles too. Ceilings 1.5 times measured.
+/// take cells across it, by the grid's period) and near the poles too.
+/// Ceilings 1.5 times measured.
 #[test]
 fn a_grid_onto_a_mesh() {
-    for (name, ceiling) in [("mesh_ico_onto", 2.0e-4), ("mesh_dual_onto", 1.5e-4)] {
+    for (name, ceiling) in [("mesh_ico_onto", 1.4e-4), ("mesh_dual_onto", 1.4e-4)] {
         let c = case(name);
         let e = report(c, "every face", rms(c, |_| true));
         assert!(e[1] < 0.05 * e[0] && e[3] < 0.5 * e[2], "{name}: {e:?}");
@@ -414,26 +415,36 @@ fn a_grid_onto_a_mesh() {
 }
 
 /// A mesh's faces onto a grid (6c), faces of about 15 degrees onto cells
-/// of 5, so first order is far off (0.07 to 0.09 rms). Away from the
-/// grid's seam and the poles rwarp's second order is 1.8 to 4.4 times
-/// closer than ESMF's. Near the seam it is close to first order: a face
-/// the seam cuts is first order (the table doesn't carry the grid's
-/// period), and its neighbours' gradients one-sided, so within 15 degrees
-/// of it ESMF, which works on the sphere with no seam, is 1.3 to 3.6 times
-/// closer. Ceilings 1.5 times measured, there and away from it.
+/// of 5, so first order is far off (0.06 to 0.09 rms). Below 60 degrees
+/// of latitude rwarp's second order is 1.7 to 4.9 times closer than
+/// ESMF's, away from the grid's seam and next to it alike: the table
+/// carries the grid's period, so a face the seam cuts has a plane and the
+/// faces either side take each other as neighbours. (Without it, within
+/// 15 degrees of the seam rwarp was near first order, 5.3e-2 and 8.1e-2.)
+/// Nearer the poles a plane in longitude and latitude fits less well:
+/// there ESMF's method, in three dimensions, is 1.6 times closer for
+/// `mesh_ico`, and rwarp's 2.5 times for `mesh_dual`. Over every cell
+/// rwarp's is closer. Ceilings 1.5 times measured.
 #[test]
 fn a_mesh_onto_a_grid() {
-    for (name, away, near) in [("mesh_ico_to", 1.5e-2, 8.0e-2), ("mesh_dual_to", 2.4e-2, 1.2e-1)] {
+    #[rustfmt::skip]
+    let ceilings = [
+        ("mesh_ico_to",  [1.5e-2, 1.4e-2, 3.4e-2]),
+        ("mesh_dual_to", [2.2e-2, 2.1e-2, 3.6e-2]),
+    ];
+    for (name, [away, near, polar]) in ceilings {
         let c = case(name);
-        report(c, "every cell", rms(c, |_| true));
-        let a = report(c, "45+ from the seam, |lat| < 60", rms(c, |k| {
-            let p = place(c, k);
-            180.0 - p[0].abs() >= 45.0 && p[1].abs() < 60.0
-        }));
-        let n = report(c, "within 15 of the seam", rms(c, |k| 180.0 - place(c, k)[0].abs() < 15.0));
+        let e = report(c, "every cell", rms(c, |_| true));
+        let lat = |k: usize| place(c, k)[1].abs();
+        let seam = |k: usize| 180.0 - place(c, k)[0].abs();
+        let a = report(c, "45+ from the seam, |lat| < 60", rms(c, |k| seam(k) >= 45.0 && lat(k) < 60.0));
+        let n = report(c, "within 15 of the seam, |lat| < 60", rms(c, |k| seam(k) < 15.0 && lat(k) < 60.0));
+        let p = report(c, "|lat| > 60", rms(c, |k| lat(k) > 60.0));
+        assert!(e[1] < e[3], "{name}: {e:?}");
         assert!(a[1] < 0.25 * a[0] && a[3] < 0.8 * a[2], "{name}: {a:?}");
         assert!(a[1] < a[3] && a[1] < away, "{name} away from the seam: {a:?}");
-        assert!(n[1] < n[0] && n[1] < near, "{name} near the seam: {n:?}");
+        assert!(n[1] < n[3] && n[1] < 1.1 * a[1] && n[1] < near, "{name} next to the seam: {n:?}");
+        assert!(p[1] < 0.5 * p[0] && p[1] < polar, "{name} near the poles: {p:?}");
     }
 }
 
@@ -442,7 +453,8 @@ fn a_mesh_onto_a_grid() {
 /// methods' would be. For a grid onto a grid they are first order's but
 /// next to the source's edge, where the gradients are one-sided
 /// (`regular_overhang`); elsewhere, ESMF's vertex means, and from a mesh
-/// the faces the grid's seam cuts.
+/// the planes (in three dimensions in ESMF, in longitude and latitude in
+/// rwarp).
 #[test]
 fn spherical_second_order_differences_are_recorded() {
     #[rustfmt::skip]
@@ -450,10 +462,10 @@ fn spherical_second_order_differences_are_recorded() {
         ("regular_coarser",  [1.7e-3, 1.5e-4]),
         ("regular_overhang", [1.1e-1, 3.2e-3]),
         ("lonlat_3031",      [3.0e-2, 3.5e-4]),
-        ("mesh_ico_onto",    [1.7e-2, 3.8e-3]),
-        ("mesh_ico_to",      [3.5e-1, 1.5e-1]),
+        ("mesh_ico_onto",    [1.5e-2, 3.8e-3]),
+        ("mesh_ico_to",      [3.5e-1, 6.2e-2]),
         ("mesh_dual_onto",   [5.4e-3, 1.8e-3]),
-        ("mesh_dual_to",     [3.5e-1, 2.1e-1]),
+        ("mesh_dual_to",     [3.9e-1, 2.1e-1]),
     ];
     for (name, [cs, cf]) in ceilings {
         let c = case(name);

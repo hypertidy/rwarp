@@ -25,15 +25,17 @@
 //!   polygon of their centres, taken anticlockwise round `c`. It is exact
 //!   for fields linear in source pixels. It is zero (first order for that
 //!   cell) where there are fewer than three neighbours, `c` is outside
-//!   their polygon (by more than 1e-14, ESMF's tolerance), or the polygon
-//!   has no area: at a corner of the window, say.
+//!   their polygon, or the polygon has no area: at a corner of the
+//!   window, say. A source that wraps round the globe in longitude (with
+//!   [`Weights::period`]) has no corner there: a cell on its seam takes
+//!   the cells across it, centred on its side.
 //! - **A neighbour's centre** is its centroid under the table's measure:
 //!   the middle of the cell for [`Measure::Planar`] (ESMF's corner mean),
 //!   and for [`Measure::CosLatitude`] a little towards the equator, so
 //!   fields linear in source pixels (in longitude and latitude) come out
 //!   exactly there too.
 //!
-//! One difference from ESMF: an overlap's centre here is its centroid,
+//! Two differences from ESMF. First, an overlap's centre here is its centroid,
 //! from the moments controlledburn's window gives exactly. ESMF's is the
 //! mean of the overlap polygon's vertices (`_calc_centroid_2D_2D_cart` in
 //! ESMCI_SM.C), which is the centroid for a rectangle, a triangle or a
@@ -41,7 +43,14 @@
 //! from a lon/lat one. So for a grid onto a grid the two give the same
 //! weights, and elsewhere this one is exact for fields linear in source
 //! pixels and ESMF's is not. Given ESMF's vertex means instead, it gives
-//! ESMF's weights to rounding (`tests/esmf_second_order.rs`).
+//! ESMF's weights to rounding (`tests/esmf_second_order.rs`). Second, `c`
+//! is outside the neighbours' polygon if it is past one of its edges by
+//! more than ESMF's tolerance, 1e-14, *or* by an angle of more than 1e-9
+//! (its sine) seen from the edge's start. A centre on an edge (as by
+//! symmetry at a pole, or along a regular mesh) is then on it however its
+//! cells were measured: in pixels far from the origin, or with the seam
+//! somewhere else, it is off by more than 1e-14, and with ESMF's tolerance
+//! alone a whole face's plane would come and go with that.
 //!
 //! ESMF's spherical method works in three dimensions on the sphere;
 //! this works in source pixels, under the source's measure.
@@ -70,10 +79,17 @@
 //! [`PolyMesh::apply_second_order`] and [`PolyMesh::second_order`]. Each
 //! overlap's moments are about its grid cell's corner. A face's centre is
 //! the centroid of the part the table covers, and its neighbours are the
-//! faces sharing a node with it (ESMF's), each centred the same way. A
-//! face whose covered part isn't one piece in the grid's cells (cut by its
-//! seam) is first order, and a neighbour whose cells aren't next to the
-//! face's (across the seam) is left out.
+//! faces sharing a node with it (ESMF's), each centred the same way. With
+//! the grid's period in the table ([`Weights::period`]: a grid that wraps
+//! round the globe) a face's cells are taken across the seam to meet, so a
+//! face the seam cuts has a centre too, on one side of it, and a neighbour
+//! across the seam is moved by whole periods to the face; a face whose
+//! cells take every column (round a pole) has no centre in the grid's
+//! columns, so is first order and no one's neighbour. Without a period (a
+//! world-cell grid's index seam, say), a face whose covered part isn't one
+//! piece in the grid's cells (cut by a seam) is first order, and a
+//! neighbour whose cells aren't next to the face's (across it) is left
+//! out.
 //!
 //! [`Weights::apply_second_order`] estimates the gradients from the field
 //! at hand, so a neighbour without data drops out of them as a cell
@@ -105,6 +121,13 @@ use controlledburn::{CoverageWindow, Measure};
 /// ESMF's tolerance for the source centre being inside the neighbours'
 /// polygon (`is_pnt_in_polygon`).
 const INSIDE_TOL: f64 = 1e-14;
+
+/// The same, relative: a centre outside an edge of the polygon by an angle
+/// (its sine) of less than this, seen from the edge's start, is on it. A
+/// centre on an edge (as by symmetry at a pole, or along a regular mesh)
+/// is then inside however the cells were measured: in pixels far from the
+/// origin, or across a seam, its position is off by more than 1e-14.
+const INSIDE_REL: f64 = 1e-9;
 
 /// An overlap of less than this much of its source cell or face is
 /// rounding (a window leaves slivers of 1e-17 or so in cells the outline
@@ -145,8 +168,9 @@ fn green(centre: [f64; 2], nbrs: &mut [Nbr]) -> Option<[f64; 2]> {
     // inside: no edge has the centre more than the tolerance to its right
     for i in 0..m {
         let (a, b) = (nbrs[i].at, nbrs[(i + 1) % m].at);
-        let cross = (b[0] - a[0]) * (centre[1] - a[1]) - (b[1] - a[1]) * (centre[0] - a[0]);
-        if cross <= -INSIDE_TOL {
+        let (e, d) = ([b[0] - a[0], b[1] - a[1]], [centre[0] - a[0], centre[1] - a[1]]);
+        let cross = e[0] * d[1] - e[1] * d[0];
+        if cross <= -INSIDE_TOL.max(INSIDE_REL * e[0].hypot(e[1]) * d[0].hypot(d[1])) {
             return None;
         }
     }
@@ -199,6 +223,16 @@ fn buffer_index<S>(src: &SourceBuffer<'_, S>) -> impl Fn(i64, i64) -> Option<usi
     move |r: i64, c: i64| -> Option<usize> {
         let (r, c) = (r - ro, c - co);
         (r >= 0 && c >= 0 && (r as usize) < nrow && (c as usize) < ncol).then(|| r as usize * ncol + c as usize)
+    }
+}
+
+/// Full-grid column `c` where a table with [`Weights::period`] `period`
+/// holds it: moved by whole periods into the grid, for a neighbour across
+/// its seam. As it is without a period.
+fn wrap_col(period: Option<u32>) -> impl Fn(i64) -> i64 {
+    move |c| match period {
+        Some(n) => c.rem_euclid(n as i64),
+        None => c,
     }
 }
 
@@ -326,7 +360,10 @@ impl Weights {
     /// overlap's centroid. The gradients come from `src` itself, band by
     /// band: neighbours outside the buffer or without data (as
     /// [`ApplyOptions`] says) are left out of them, and a cell without data
-    /// is left out of its destinations, as in [`Weights::apply`].
+    /// is left out of its destinations, as in [`Weights::apply`]. For a
+    /// source that wraps ([`Weights::period`]), a cell on the seam's
+    /// neighbours across it are those at the buffer's other end, if it has
+    /// them.
     ///
     /// Under [`Normalization::DestArea`] the integral is conserved exactly
     /// (to rounding), as by the first order: the gradient terms integrate to
@@ -355,6 +392,7 @@ impl Weights {
             [self.src_col[k] as f64, self.src_row[k] as f64]
         });
         let mut cen = Centroids::new(self.measure);
+        let wrap = wrap_col(self.period);
         self.apply_planes(src, norm, opts, &s, &mut |i, out| {
             let [r, c] = s.rc[i];
             for dr in -1..=1 {
@@ -362,7 +400,8 @@ impl Weights {
                     if (dr, dc) == (0, 0) {
                         continue;
                     }
-                    if let Some(p) = buf(r + dr, c + dc) {
+                    // across a seam, centred on this side of it
+                    if let Some(p) = buf(r + dr, wrap(c + dc)) {
                         out.push((p, cen.at(r + dr, c + dc)));
                     }
                 }
@@ -571,6 +610,7 @@ impl Weights {
             [self.src_col[k] as f64, self.src_row[k] as f64]
         });
         let mut cen = Centroids::new(self.measure);
+        let wrap = wrap_col(self.period);
         let mut stencil = |i: usize, out: &mut Vec<Cand>| {
             let [r, c] = s.rc[i];
             for dr in -1..=1 {
@@ -578,7 +618,7 @@ impl Weights {
                     if (dr, dc) == (0, 0) {
                         continue;
                     }
-                    if let Some(p) = at(r + dr, c + dc) {
+                    if let Some(p) = at(r + dr, wrap(c + dc)) {
                         out.push((p, cen.at(r + dr, c + dc)));
                     }
                 }
@@ -677,35 +717,108 @@ impl Weights {
     }
 }
 
+/// A face table's faces across the grid's seam, with its
+/// [`Weights::period`]: each face's cells moved by the period where that
+/// puts them next to the rest, so its covered part has a centre in the
+/// grid's space, on one side of the seam. Empty without a period.
+struct Unwrap {
+    /// The grid's period in columns.
+    period: Option<u32>,
+    /// Each face's last column (as the table holds it) moved on by the
+    /// period, `-1` for none.
+    cut: Vec<i64>,
+    /// Each face whose cells take every column (round a pole, say), so
+    /// can't be unwrapped.
+    round: Vec<bool>,
+}
+
+impl Unwrap {
+    /// For the faces of `w` (`nface` of them): each face is cut where its
+    /// cells (slivers under [`SLIVER`] of it aside) leave the widest gap in
+    /// columns, round the period.
+    fn new(w: &Weights, nface: usize) -> Self {
+        let Some(n) = w.period else {
+            return Unwrap { period: None, cut: Vec::new(), round: Vec::new() };
+        };
+        let n = n as i64;
+        let (mut cut, mut round) = (vec![-1i64; nface], vec![false; nface]);
+        let mut cols: Vec<(u32, i64)> = (0..w.len())
+            .filter(|&k| w.frac[k] > SLIVER)
+            .map(|k| (w.src_col[k], (w.dst_col[k] as i64).rem_euclid(n)))
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        let mut a = 0;
+        while a < cols.len() {
+            let f = cols[a].0 as usize;
+            let mut b = a;
+            while b < cols.len() && cols[b].0 as usize == f {
+                b += 1;
+            }
+            let c = &cols[a..b];
+            if c.len() as i64 >= n {
+                round[f] = true;
+            } else {
+                // the gap round the seam to start with, so a face that
+                // doesn't cross it stays as it is
+                let mut widest = c[0].1 + n - c[c.len() - 1].1;
+                for j in 0..c.len() - 1 {
+                    if c[j + 1].1 - c[j].1 > widest {
+                        widest = c[j + 1].1 - c[j].1;
+                        cut[f] = c[j].1;
+                    }
+                }
+            }
+            a = b;
+        }
+        Unwrap { period: Some(n as u32), cut, round }
+    }
+
+    /// Entry `k`'s column, moved across the seam with its face's other
+    /// cells.
+    fn col(&self, w: &Weights, k: usize) -> i64 {
+        let c = w.dst_col[k] as i64;
+        match self.period {
+            Some(n) if c.rem_euclid(n as i64) <= self.cut[w.src_col[k] as usize] => c + n as i64,
+            _ => c,
+        }
+    }
+}
+
 /// A mesh's faces as a table's sources ([`PolyMesh::weights_to`]): each
 /// face's candidate neighbours are the faces sharing a node with it
 /// (ESMF's), centred on the parts of them the table covers. Only faces
 /// whose covered part is one piece in the grid's cells (8-connected,
 /// slivers aside) take part, and a neighbour only if its cells' bounding
 /// box is next to the face's: a face the grid's seam cuts, or one on its
-/// far side, has no centre there that means anything.
+/// far side, has no centre there that means anything. With the grid's
+/// period ([`Unwrap`]) a face's cells are moved across the seam to meet,
+/// and a neighbour across it is moved by whole periods to the face.
 struct FaceStencil<'a> {
     mesh: &'a PolyMesh,
+    /// The grid's period in columns, as `f64` and as `i64`.
+    period: Option<(f64, i64)>,
     /// The sources at each node: `at_node[start[n]..start[n + 1]]`.
     start: Vec<usize>,
     at_node: Vec<u32>,
     /// Each source's covered part is one piece.
     placed: Vec<bool>,
-    /// Its cells' bounding box: first and last row, first and last column.
-    bbox: Vec<[u32; 4]>,
+    /// Its cells' bounding box: first and last row, first and last column
+    /// (unwrapped).
+    bbox: Vec<[i64; 4]>,
 }
 
 impl<'a> FaceStencil<'a> {
-    fn new(mesh: &'a PolyMesh, w: &Weights, s: &Sources) -> Self {
+    fn new(mesh: &'a PolyMesh, w: &Weights, s: &Sources, unwrap: &Unwrap) -> Self {
         let n = s.p.len();
         // each source's cells, (row, col), sorted
-        let mut cells: Vec<(u32, u32, u32)> = (0..w.len())
+        let mut cells: Vec<(u32, i64, i64)> = (0..w.len())
             .filter(|&k| s.of[k] != u32::MAX && w.frac[k] > SLIVER)
-            .map(|k| (s.of[k], w.dst_row[k], w.dst_col[k]))
+            .map(|k| (s.of[k], w.dst_row[k] as i64, unwrap.col(w, k)))
             .collect();
         cells.sort_unstable();
         cells.dedup();
-        let (mut placed, mut bbox) = (vec![false; n], vec![[0u32; 4]; n]);
+        let (mut placed, mut bbox) = (vec![false; n], vec![[0i64; 4]; n]);
         let mut a = 0;
         while a < cells.len() {
             let i = cells[a].0 as usize;
@@ -713,9 +826,10 @@ impl<'a> FaceStencil<'a> {
             while b < cells.len() && cells[b].0 as usize == i {
                 b += 1;
             }
-            let rc: Vec<(u32, u32)> = cells[a..b].iter().map(|t| (t.1, t.2)).collect();
-            placed[i] = connected(&rc);
-            let (c0, c1) = rc.iter().fold((u32::MAX, 0), |(lo, hi), t| (lo.min(t.1), hi.max(t.1)));
+            let rc: Vec<(i64, i64)> = cells[a..b].iter().map(|t| (t.1, t.2)).collect();
+            let round = unwrap.round.get(s.rc[i][1] as usize).copied().unwrap_or(false);
+            placed[i] = !round && connected(&rc);
+            let (c0, c1) = rc.iter().fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t.1), hi.max(t.1)));
             bbox[i] = [rc[0].0, rc[rc.len() - 1].0, c0, c1];
             a = b;
         }
@@ -737,7 +851,8 @@ impl<'a> FaceStencil<'a> {
                 fill[v] += 1;
             }
         }
-        FaceStencil { mesh, start, at_node, placed, bbox }
+        let period = unwrap.period.map(|n| (n as f64, n as i64));
+        FaceStencil { mesh, period, start, at_node, placed, bbox }
     }
 
     /// Source `i`'s candidates, by its face's nodes.
@@ -746,17 +861,24 @@ impl<'a> FaceStencil<'a> {
             return;
         }
         let b = self.bbox[i];
-        let next = |c: [u32; 4]| {
-            c[0] as i64 <= b[1] as i64 + 1
-                && c[1] as i64 >= b[0] as i64 - 1
-                && c[2] as i64 <= b[3] as i64 + 1
-                && c[3] as i64 >= b[2] as i64 - 1
-        };
+        let next = |c: [i64; 4], m: i64| c[0] <= b[1] + 1 && c[1] >= b[0] - 1 && c[2] + m <= b[3] + 1 && c[3] + m >= b[2] - 1;
         for &v in self.mesh.face(s.rc[i][1] as usize) {
             for &j in &self.at_node[self.start[v]..self.start[v + 1]] {
                 let j = j as usize;
-                if j != i && self.placed[j] && next(self.bbox[j]) {
-                    out.push((s.p[j], s.centre[j]));
+                if j == i || !self.placed[j] {
+                    continue;
+                }
+                // the whole periods that bring j to i
+                let (mut at, mut m) = (s.centre[j], 0);
+                if let Some((p, n)) = self.period {
+                    let k = ((s.centre[i][0] - at[0]) / p).round();
+                    if k != 0.0 {
+                        at[0] += k * p;
+                        m = k as i64 * n;
+                    }
+                }
+                if next(self.bbox[j], m) {
+                    out.push((s.p[j], at));
                 }
             }
         }
@@ -767,20 +889,16 @@ impl<'a> FaceStencil<'a> {
 
 /// Whether the cells `rc` (sorted, distinct) are one piece, each reached
 /// from the first through cells sharing a side or a corner.
-fn connected(rc: &[(u32, u32)]) -> bool {
+fn connected(rc: &[(i64, i64)]) -> bool {
     let mut seen = vec![false; rc.len()];
     let mut todo = vec![0usize];
     seen[0] = true;
     let mut reached = 1;
     while let Some(i) = todo.pop() {
-        let (r, c) = (rc[i].0 as i64, rc[i].1 as i64);
+        let (r, c) = rc[i];
         for dr in -1..=1 {
             for dc in -1..=1 {
-                let (r, c) = (r + dr, c + dc);
-                if r < 0 || c < 0 || r > u32::MAX as i64 || c > u32::MAX as i64 {
-                    continue;
-                }
-                if let Ok(j) = rc.binary_search(&(r as u32, c as u32)) {
+                if let Ok(j) = rc.binary_search(&(r + dr, c + dc)) {
                     if !seen[j] {
                         seen[j] = true;
                         reached += 1;
@@ -818,8 +936,9 @@ impl Weights {
     ) -> Vec<D> {
         self.check_faces(mesh);
         let buf = buffer_index(src);
-        let s = self.sources(|k| buf(0, self.src_col[k] as i64), |k| [self.dst_col[k] as f64, self.dst_row[k] as f64]);
-        let faces = FaceStencil::new(mesh, self, &s);
+        let unwrap = Unwrap::new(self, mesh.nface());
+        let s = self.sources(|k| buf(0, self.src_col[k] as i64), |k| [unwrap.col(self, k) as f64, self.dst_row[k] as f64]);
+        let faces = FaceStencil::new(mesh, self, &s, &unwrap);
         self.apply_planes(src, norm, opts, &s, &mut |i, out| faces.cands(&s, i, out))
     }
 
@@ -830,11 +949,12 @@ impl Weights {
         if let Some(v) = valid {
             assert_eq!(v.len(), nface, "valid must have one value per face");
         }
+        let unwrap = Unwrap::new(self, nface);
         let s = self.sources(
             |k| Some(self.src_col[k] as usize).filter(|&f| valid.is_none_or(|v| v[f])),
-            |k| [self.dst_col[k] as f64, self.dst_row[k] as f64],
+            |k| [unwrap.col(self, k) as f64, self.dst_row[k] as f64],
         );
-        let faces = FaceStencil::new(mesh, self, &s);
+        let faces = FaceStencil::new(mesh, self, &s, &unwrap);
         let mut area = vec![f64::NAN; nface];
         for (i, &p) in s.p.iter().enumerate() {
             area[p] = self.src_cell_area[s.entries(i)[0] as usize];
@@ -898,8 +1018,14 @@ mod tests {
         let mut n: Vec<Nbr> = ring(5.0, 0.0).into_iter().filter(|v| v.at[0] > 0.0).collect();
         assert_eq!(n.len(), 5);
         assert!(green([0.5, 5.5], &mut n).is_some());
-        // ... and just outside it, which doesn't
-        assert!(green([0.5 - 1e-13, 5.5], &mut n).is_none());
+        // ... and outside it by next to nothing, which is on it too
+        assert!(green([0.5 - 1e-12, 5.5], &mut n).is_some());
+        // ... but not by more
+        assert!(green([0.5 - 1e-6, 5.5], &mut n).is_none());
+        // the same far from the origin, where 1e-14 is rounding
+        let mut far: Vec<Nbr> = ring(5.0, 4000.0).into_iter().filter(|v| v.at[0] > 4000.0).collect();
+        assert!(green([4000.5 - 1e-11, 5.5], &mut far).is_some());
+        assert!(green([4000.5 - 1e-6, 5.5], &mut far).is_none());
         // two neighbours
         let mut n: Vec<Nbr> = ring(5.0, 5.0).into_iter().take(2).collect();
         assert!(green([5.5, 5.5], &mut n).is_none());
@@ -929,10 +1055,11 @@ mod tests {
             dst_off: [0, 0],
             dst_size: [6, 1],
             measure: Measure::Planar,
+            period: None,
         };
         let placed = |w: &Weights| {
             let s = w.sources(|k| Some(w.src_col[k] as usize), |k| [w.dst_col[k] as f64, w.dst_row[k] as f64]);
-            let f = FaceStencil::new(&mesh, w, &s);
+            let f = FaceStencil::new(&mesh, w, &s, &Unwrap::new(w, 1));
             (f.placed[0], f.bbox[0])
         };
         assert_eq!(placed(&w), (true, [0, 0, 0, 1]));

@@ -103,6 +103,9 @@
 //! planes are in the grid's space and the neighbours are faces sharing a
 //! node: [`PolyMesh::apply_second_order`](crate::mesh::PolyMesh::apply_second_order)
 //! and [`PolyMesh::second_order`](crate::mesh::PolyMesh::second_order).
+//! A grid that wraps round the globe has its period in the table
+//! ([`Weights::period`]), so second order takes neighbours across its
+//! seam, the grid's cells' and the faces' alike.
 //! [`Limiter::BarthJespersen`] in [`ApplyOptions::limiter`] keeps values
 //! next to a sharp front within their sources' range (off by default, as
 //! ESMF has none). See the `weights::second_order` module
@@ -472,6 +475,26 @@ pub struct Weights {
     /// not [`Weights::apply_second_order`].
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub moment: Vec<[f64; 2]>,
+    /// With [`WeightOptions::moments`], for a grid that wraps round the
+    /// globe in longitude ([`Transformer::source_wrap`]) every whole number
+    /// of its columns: that number, so that second order takes neighbours
+    /// across its seam. The grid is the transformer's source: the source
+    /// for [`exact_weights`] and
+    /// [`PolyMesh::weights_onto`](crate::mesh::PolyMesh::weights_onto),
+    /// the destination for
+    /// [`PolyMesh::weights_to`](crate::mesh::PolyMesh::weights_to). `None`
+    /// otherwise: without moments, for a source with world cells, or for a
+    /// period that isn't whole (a grid that can't be all the way round).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub period: Option<u32>,
+}
+
+/// [`Weights::period`] for a grid with `wrap` ([`Transformer::source_wrap`])
+/// and moments on: its period, if it is a whole number of columns.
+pub(crate) fn whole_period(wrap: Option<crate::transform::SourceWrap>, moments: bool) -> Option<u32> {
+    let p = wrap.filter(|_| moments)?.period;
+    let n = p.round();
+    (n >= 1.0 && n <= u32::MAX as f64 && (p - n).abs() <= 1e-9 * n).then_some(n as u32)
 }
 
 /// A limit on second-order gradients ([`ApplyOptions::limiter`]), so that
@@ -699,7 +722,7 @@ pub fn exact_weights(
     dst_nrow: usize,
     opts: &WeightOptions,
 ) -> Weights {
-    let mut w = empty_weights(dst_ncol, dst_nrow, opts);
+    let mut w = empty_weights(transformer, dst_ncol, dst_nrow, opts);
     let world = transformer.source_cells().is_some();
     exact_weights_with(transformer, src, dst_ncol, dst_nrow, opts, |cell| w.push_cell(&cell, world));
     w
@@ -787,20 +810,23 @@ pub fn exact_weights_par<X: Transformer>(
         return Err(e);
     }
     done.sort_by_key(|d| d.0);
-    let mut w = empty_weights(dst_ncol, dst_nrow, opts);
+    let mut w = empty_weights(&first, dst_ncol, dst_nrow, opts);
     for (_, part) in done {
         w.append(part);
     }
     Ok(w)
 }
 
-/// A table of no entries yet for a `dst_ncol` by `dst_nrow` window.
-fn empty_weights(dst_ncol: usize, dst_nrow: usize, opts: &WeightOptions) -> Weights {
+/// A table of no entries yet for a `dst_ncol` by `dst_nrow` window from
+/// `transformer`'s source.
+fn empty_weights(transformer: &impl Transformer, dst_ncol: usize, dst_nrow: usize, opts: &WeightOptions) -> Weights {
+    let wrap = transformer.source_cells().is_none().then(|| transformer.source_wrap()).flatten();
     Weights {
         dst_off: [opts.dst_col_off, opts.dst_row_off],
         dst_size: [dst_ncol, dst_nrow],
         dst_area: Vec::with_capacity(dst_ncol * dst_nrow),
         measure: opts.measure,
+        period: whole_period(wrap, opts.moments),
         ..Weights::default()
     }
 }

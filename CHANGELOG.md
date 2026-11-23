@@ -146,11 +146,11 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     covers. A field linear in the grid's space comes out exact to 3e-14,
     in pixels, on the sphere and in a curvilinear grid's indices (first
     order is off by 1.2 to 2.3). On a quadratic, halving mesh and grid
-    divides the error by 3.9. At the grid's seam the gradients are
-    one-sided: a face the seam cuts is first order (its cells aren't one
-    piece), and a neighbour across the seam is left out (its cells aren't
-    next to the face's). Without moments the tables are as before, bit
-    for bit.
+    divides the error by 3.9. At a seam without a period in the table
+    (see below for one with it), the gradients are one-sided: a face the
+    seam cuts is first order (its cells aren't one piece), and a neighbour
+    across the seam is left out (its cells aren't next to the face's).
+    Without moments the tables are as before, bit for bit.
   - **A limiter (6d), opt-in:** `ApplyOptions::with_limiter(Limiter::BarthJespersen)`
     (new `weights::Limiter`, `Off` by default, as in ESMF). Barth and
     Jespersen's: each source cell's gradient scaled so its plane, at each
@@ -177,12 +177,42 @@ All notable changes to rwarp. Dates are when the change reached `main`.
     circles for ESMF's, parallels for rwarp's). A grid onto a grid: both
     second order, 15 to 1,300 times closer than first inside, close to
     each other for lon/lat onto lon/lat and rwarp 19 times closer
-    projected. A grid onto a mesh: rwarp 5 to 12 times closer than ESMF
-    everywhere (ESMF's vertex means). A mesh onto a grid: rwarp 1.8 to
-    4.4 times closer away from the grid's seam, and close to first order
-    within 15 degrees of it, where ESMF is 1.3 to 3.6 times closer: a
-    face the seam cuts is first order, as the table doesn't carry the
-    grid's period.
+    projected. A grid onto a mesh: rwarp 5 to 17 times closer than ESMF
+    everywhere (ESMF's vertex means). A mesh onto a grid: below 60 degrees
+    of latitude rwarp is 1.7 to 4.9 times closer, next to the grid's seam
+    (with its period, below) and away from it. Nearer the poles, where a
+    plane in longitude and latitude fits less well, ESMF is 1.6 times
+    closer for the geodesic mesh and rwarp 2.5 times for its dual.
+  - **Across a global grid's seam:** a table made with moments on a
+    grid that wraps round the globe every whole number of its columns
+    (`Transformer::source_wrap`) records that number in the new
+    `Weights::period`. That covers `exact_weights`,
+    `PolyMesh::weights_onto` and `PolyMesh::weights_to`, and their `_par`
+    forms. It is `None` without moments, for world cells, or for a period
+    that isn't whole. Second order then takes neighbours across the seam:
+    - a grid cell on the seam takes the cells at the grid's other end;
+    - a mesh face the seam cuts has its cells taken across it to meet, so
+      it has a plane;
+    - a face's neighbour across the seam is moved by whole periods to it;
+    - a face whose cells take every column (round a pole) is first order
+      and no one's neighbour.
+
+    With the seam on the far side of the globe, the same mesh comes out
+    the same to 1e-10 (its faces' refinement differs by as much in first
+    order); without the period, by up to 0.22. Within 15 degrees of the
+    seam and below 60 degrees of latitude, a mesh onto a global grid had
+    been near first order (rms 5.3e-2 and 8.1e-2). It is now 9.2e-3 and
+    1.4e-2, as away from the seam, against ESMF's 1.6e-2 and 6.0e-2
+    (`tests/second_order_period.rs`, `tests/esmf_second_order_sphere.rs`).
+    `Weights` is `non_exhaustive`, so the field isn't breaking, and tables
+    without it come out as before, bit for bit.
+  - **Inside, relative to the polygon:** a cell's centre is outside its
+    neighbours' polygon if it is past an edge by more than ESMF's 1e-14,
+    or by an angle of more than 1e-9 seen from the edge's start. A centre
+    on an edge by symmetry (as for a geodesic mesh's faces at a pole) had
+    been in or out as the faces' measure rounded. So a whole face's plane
+    came and went with where the seam was. The ORCA2 and second-order
+    bitwise checks and the ESMF comparisons are unchanged.
   - **Dependency:** controlledburn 0.3.3 (from 0.3.1), for `set_moments`.
 
 ### Changed

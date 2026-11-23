@@ -6,7 +6,7 @@ use controlledburn::{CoverageWindow, Measure};
 
 use crate::transform::{SourceCells, SourceWrap, Transformer};
 use crate::warp::{cover_outline, unwrap_outline, Cover, OutlineScratch, Sample, SourceBuffer, WorldCells};
-use crate::weights::{shift_rows, to_u32, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
+use crate::weights::{shift_rows, to_u32, whole_period, ApplyOptions, GridWindow, Normalization, WeightOptions, Weights};
 
 /// Points of the faces transformed at once, at most (a chunk ends after
 /// the face that reaches it).
@@ -301,7 +301,8 @@ impl PolyMesh {
         let mut m = Measurer::new(self, inner, grid, opts)?;
         let mut part = OntoPart::default();
         m.run(self, inner, 0..self.nface(), &mut |f, area, cells, mo| part.add(grid, opts, f, area, cells, mo));
-        Ok(self.onto_weights(vec![part], &m.areas, inner.source_cells().is_some(), opts))
+        let period = whole_period(m.wrap, opts.moments);
+        Ok(self.onto_weights(vec![part], &m.areas, inner.source_cells().is_some(), period, opts))
     }
 
     /// [`PolyMesh::weights_onto`] on up to `threads` threads (0 for all
@@ -327,14 +328,15 @@ impl PolyMesh {
         threads: usize,
     ) -> Result<Weights, String> {
         check_indices(grid, self.nface());
-        let (parts, areas, world) = self.in_ranges(inner, grid, opts, threads, |p: &mut OntoPart, f, area, cells, mo| {
+        let (parts, areas, world, period) = self.in_ranges(inner, grid, opts, threads, |p: &mut OntoPart, f, area, cells, mo| {
             p.add(grid, opts, f, area, cells, mo)
         })?;
-        Ok(self.onto_weights(parts, &areas, world, opts))
+        Ok(self.onto_weights(parts, &areas, world, period, opts))
     }
 
-    /// The weights onto the mesh from the ranges' parts, in order.
-    fn onto_weights(&self, parts: Vec<OntoPart>, areas: &[f64], world: bool, opts: &WeightOptions) -> Weights {
+    /// The weights onto the mesh from the ranges' parts, in order, with
+    /// the grid's [`Weights::period`].
+    fn onto_weights(&self, parts: Vec<OntoPart>, areas: &[f64], world: bool, period: Option<u32>, opts: &WeightOptions) -> Weights {
         let nface = self.nface();
         let n: usize = parts.iter().map(|p| p.frac.len()).sum();
         let mut w = Weights {
@@ -343,6 +345,7 @@ impl PolyMesh {
             dst_area: Vec::with_capacity(nface),
             measure: opts.measure,
             dst_row: vec![0; n],
+            period,
             ..Weights::default()
         };
         for mut p in parts {
@@ -386,7 +389,11 @@ impl PolyMesh {
     /// grid's pixels (or, with world cells, their index space). That is for
     /// second order from the faces, [`PolyMesh::apply_second_order`] and
     /// [`PolyMesh::second_order`], not [`Weights::apply_second_order`],
-    /// whose sources are a grid's cells.
+    /// whose sources are a grid's cells. For a grid that wraps round the
+    /// globe ([`Transformer::source_wrap`]) every whole number of its
+    /// columns, [`Weights::period`] is that number, for second order across
+    /// its seam (as from [`PolyMesh::weights_onto`], where the grid is the
+    /// source).
     ///
     /// Errors and panics as [`PolyMesh::weights_onto`].
     pub fn weights_to<T: Transformer>(&self, inner: &T, grid: &GridWindow, opts: &WeightOptions) -> Result<Weights, String> {
@@ -395,7 +402,7 @@ impl PolyMesh {
         let mut part = ToPart::default();
         m.run(self, inner, 0..self.nface(), &mut |f, area, cells, mo| part.add(f, area, cells, mo));
         let areas = std::mem::take(&mut m.areas);
-        Ok(to_weights(vec![part], areas, grid, opts))
+        Ok(to_weights(vec![part], areas, grid, whole_period(m.wrap, opts.moments), opts))
     }
 
     /// [`PolyMesh::weights_to`] on up to `threads` threads (0 for all
@@ -409,9 +416,9 @@ impl PolyMesh {
         threads: usize,
     ) -> Result<Weights, String> {
         check_indices(grid, self.nface());
-        let (parts, areas, _) =
+        let (parts, areas, _, period) =
             self.in_ranges(inner, grid, opts, threads, |p: &mut ToPart, f, area, cells, mo| p.add(f, area, cells, mo))?;
-        Ok(to_weights(parts, areas, grid, opts))
+        Ok(to_weights(parts, areas, grid, period, opts))
     }
 
     /// Second-order conservative remapping from the faces to the grid
@@ -442,13 +449,28 @@ impl PolyMesh {
     /// in longitude and latitude. A face the window's edge cuts is centred
     /// on the part in it, and a face with no entries is no one's neighbour.
     ///
-    /// **Across a seam.** A face whose covered part isn't one piece in the
-    /// grid's cells (through cells sharing a side or a corner) is first
-    /// order: one the grid's seam in longitude cuts, say, has a centre in
-    /// the middle of the grid. A neighbour whose cells' bounding box isn't
-    /// next to the face's (one across the seam) is left out. So at a seam
-    /// the gradients are one-sided, as a grid's cells' are at the edge of
-    /// the source window.
+    /// **Across a seam.** A grid that wraps round the globe in longitude
+    /// every whole number of its columns has that number in the table
+    /// ([`Weights::period`]), and then:
+    ///
+    /// - a face the seam cuts has its cells taken across it to meet, so it
+    ///   has a centre and a plane like any other, on one side of the seam;
+    /// - a neighbour across the seam is moved by whole periods to the face,
+    ///   so the gradients there are two-sided;
+    /// - a face whose cells take every column (one round a pole) has no
+    ///   centre in the grid's columns, so is first order and no one's
+    ///   neighbour.
+    ///
+    /// So second order doesn't see the seam: with it on the far side of
+    /// the globe, the same mesh comes out the same (`tests/second_order_period.rs`).
+    ///
+    /// Without a period (a grid whose index space has a seam of its own,
+    /// such as a world-cell grid's), a face whose covered part isn't one
+    /// piece in the grid's cells (through cells sharing a side or a corner)
+    /// is first order: one a seam cuts has a centre in the middle of the
+    /// grid. A neighbour whose cells' bounding box isn't next to the face's
+    /// (one across the seam) is left out, so there the gradients are
+    /// one-sided, as a grid's cells' are at the edge of the source window.
     ///
     /// Faces without data (as `opts` says) are left out of the gradients
     /// band by band, and out of their grid cells, as in
@@ -498,7 +520,7 @@ impl PolyMesh {
     /// Each range of faces' part, in order, made by `add` face by face on
     /// up to `threads` threads, each with a transformer from `inner()` and
     /// its own [`Measurer`]; the window cells' measures; whether the
-    /// source has world cells.
+    /// source has world cells; the grid's [`Weights::period`].
     fn in_ranges<X: Transformer, A: Default + Send>(
         &self,
         inner: impl Fn() -> Result<X, String> + Sync,
@@ -506,7 +528,7 @@ impl PolyMesh {
         opts: &WeightOptions,
         threads: usize,
         add: impl Fn(&mut A, usize, f64, &Cells, &[[f64; 2]]) + Sync,
-    ) -> Result<(Vec<A>, Vec<f64>, bool), String> {
+    ) -> Result<Ranges<A>, String> {
         let threads = match threads {
             0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
             n => n,
@@ -514,13 +536,14 @@ impl PolyMesh {
         let first = inner()?;
         let mut m = Measurer::new(self, &first, grid, opts)?;
         let world = first.source_cells().is_some();
+        let period = whole_period(m.wrap, opts.moments);
         let nface = self.nface();
         let per = nface.div_ceil(threads * 4).max(1);
         let ranges: Vec<std::ops::Range<usize>> = (0..nface).step_by(per).map(|a| a..(a + per).min(nface)).collect();
         if threads <= 1 || ranges.len() <= 1 {
             let mut a = A::default();
             m.run(self, &first, 0..nface, &mut |f, area, cells, mo| add(&mut a, f, area, cells, mo));
-            return Ok((vec![a], std::mem::take(&mut m.areas), world));
+            return Ok((vec![a], std::mem::take(&mut m.areas), world, period));
         }
         let areas = std::mem::take(&mut m.areas);
         drop((m, first));
@@ -541,7 +564,7 @@ impl PolyMesh {
                 a
             },
         )?;
-        Ok((parts, areas, world))
+        Ok((parts, areas, world, period))
     }
 
     /// The sign of face `f`'s turn in the mesh's coordinates, from its
@@ -805,9 +828,15 @@ impl ToPart {
     }
 }
 
+/// What [`PolyMesh::in_ranges`] gives: each range's part, the window
+/// cells' measures, whether the source has world cells, and the grid's
+/// [`Weights::period`].
+type Ranges<A> = (Vec<A>, Vec<f64>, bool, Option<u32>);
+
 /// The weights from the mesh to the grid from the ranges' parts, in
-/// order, with the window cells' measures `areas`.
-fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, opts: &WeightOptions) -> Weights {
+/// order, with the window cells' measures `areas` and the grid's
+/// [`Weights::period`].
+fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, period: Option<u32>, opts: &WeightOptions) -> Weights {
     // each overlap's measure, over its face's, by window cell (a counting
     // sort: in face order within a cell, as a stable sort would leave them)
     // with moments, the same over the face's measure: about the grid
@@ -858,6 +887,7 @@ fn to_weights(parts: Vec<ToPart>, areas: Vec<f64>, grid: &GridWindow, opts: &Wei
         dst_off: [grid.col_off, grid.row_off],
         dst_size: [grid.ncol, grid.nrow],
         measure: opts.measure,
+        period,
     }
 }
 

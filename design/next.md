@@ -103,11 +103,13 @@ In main for 0.5.1 (unreleased), by the changelog's 0.5.1 section:
    `CoverageWindow::set_moments`), 6b (world-cell grids, in their index
    space, and grids onto meshes), 6c (a `PolyMesh`'s faces as sources,
    in the grid's space) and 6d (an opt-in Barth-Jespersen limiter, and
-   spherical ESMF fixtures). Possible next, found by 6d's fixtures: the
-   grid's period in a face table, so faces at a global lon/lat grid's
-   seam get two-sided gradients; within 15 degrees of the seam a mesh
-   onto the grid is near first order now, and ESMF 1.3 to 3.6 times
-   closer.
+   spherical ESMF fixtures), and the grid's period (`Weights::period`),
+   so a mesh onto a global grid is as close at its seam as away from it.
+   Possible next: `Weights::apply`'s `FracArea` running mean with a
+   folded table's negative weights (off by up to 0.14 in a few cells,
+   design/conservative.md section 8), and planes near the poles, where
+   ESMF's three-dimensional method is 1.6 times closer from a geodesic
+   mesh.
 2. **Decisions**: none waiting. N2, N5 and C1 to C4 were decided on
    2026-11-19 (#111). N5 (#47) is built, and adaptive predicates weren't
    needed (see N5 in decisions.md).

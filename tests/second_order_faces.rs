@@ -11,8 +11,11 @@
 //!   sphere, and in a curvilinear grid's index space; a quadratic's error
 //!   falls as the square of the size;
 //! - the integral is conserved and the folded table is the same method;
-//! - a face the grid's seam cuts is first order, and the faces either
-//!   side of the seam keep one-sided gradients;
+//! - across a global grid's seam, with its period in the table, the
+//!   faces either side are each other's neighbours and a face the seam
+//!   cuts has a plane, so a field linear across it is exact; without the
+//!   period a cut face is first order (`tests/second_order_period.rs`
+//!   has more);
 //! - threads keep the moments bit for bit.
 
 use std::collections::HashMap;
@@ -482,25 +485,32 @@ fn global_px(p: [f64; 2]) -> [f64; 2] {
     [(p[0] + 180.0) / 10.0, (90.0 - p[1]) / 10.0]
 }
 
-#[test]
-fn faces_either_side_of_the_seam_keep_one_sided_gradients() {
-    // nodes on the seam: the faces either side of it share them, but are
-    // at the grid's two ends, so neither is the other's neighbour there
-    let (t, grid) = global();
-    let mesh = belt(-180.0);
-    let w = mesh.weights_to(&t, &grid, &WeightOptions::new(1).with_moments(true)).unwrap();
-    // a field linear across the seam: in the grid's columns with its east
-    // half taken a period west, so a face's neighbour over the seam has the
-    // value of a face beside it, not of one at the far end
-    let across = |p: [f64; 2]| linear([if p[0] >= 18.0 { p[0] - 36.0 } else { p[0] }, p[1]]);
-    let data: Vec<f64> = (0..mesh.nface())
+/// A field linear across the grid's seam: in its columns with its east
+/// half taken a period west.
+fn across(p: [f64; 2]) -> f64 {
+    linear([if p[0] >= 18.0 { p[0] - 36.0 } else { p[0] }, p[1]])
+}
+
+/// Each face's value of [`across`], at its centre on its side of the seam.
+fn across_faces(mesh: &PolyMesh) -> Vec<f64> {
+    (0..mesh.nface())
         .map(|f| {
-            // each face's centre in the grid's columns, on its side of the seam
-            let c = area_centroid(&unwrapped(&mesh, f)).1;
+            let c = area_centroid(&unwrapped(mesh, f)).1;
             let lon = if c[0] < -180.0 { c[0] + 360.0 } else { c[0] };
             across(global_px([lon, c[1]]))
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn faces_either_side_of_the_seam_are_exact() {
+    // nodes on the seam: the faces either side of it share them, at the
+    // grid's two ends, and are each other's neighbours a period across
+    let (t, grid) = global();
+    let mesh = belt(-180.0);
+    let w = mesh.weights_to(&t, &grid, &WeightOptions::new(1).with_moments(true)).unwrap();
+    assert_eq!(w.period, Some(36));
+    let data = across_faces(&mesh);
     let second: Vec<f64> = mesh.apply_second_order(&w, &faces(&data), Normalization::FracArea, &ApplyOptions::new());
     let first: Vec<f64> = w.apply(&faces(&data), Normalization::FracArea, &ApplyOptions::new());
     // the middle rows of faces (latitudes -30 to 30, rows 6 to 11) have
@@ -519,30 +529,35 @@ fn faces_either_side_of_the_seam_keep_one_sided_gradients() {
 }
 
 #[test]
-fn a_face_the_seam_cuts_is_first_order() {
+fn a_face_the_seam_cuts_has_a_plane() {
     // the belt from -165: each row's last face is 165 to 195, cut by the
     // seam, its cells at both ends of the grid
     let (t, grid) = global();
     let mesh = belt(-165.0);
     let w = mesh.weights_to(&t, &grid, &WeightOptions::new(1).with_moments(true)).unwrap();
-    let cut = |f: usize| f % 12 == 11;
-    let data: Vec<f64> = (0..mesh.nface())
-        .map(|f| if cut(f) { 5.0 + f as f64 } else { linear(global_px(area_centroid(&unwrapped(&mesh, f)).1)) })
-        .collect();
-    let second: Vec<f64> = mesh.apply_second_order(&w, &faces(&data), Normalization::FracArea, &ApplyOptions::new());
-    let first: Vec<f64> = w.apply(&faces(&data), Normalization::FracArea, &ApplyOptions::new());
+    let data = across_faces(&mesh);
+    let a = ApplyOptions::new();
+    let second: Vec<f64> = mesh.apply_second_order(&w, &faces(&data), Normalization::FracArea, &a);
+    let first: Vec<f64> = w.apply(&faces(&data), Normalization::FracArea, &a);
+    // without the period (a world-cell grid's index seam, say) a cut face
+    // is first order, and the faces beside it keep one-sided gradients
+    let mut none = w.clone();
+    none.period = None;
+    let one_sided: Vec<f64> = mesh.apply_second_order(&none, &faces(&data), Normalization::FracArea, &a);
     for r in 6..12 {
-        // a cell wholly in a cut face is its value: no gradient
+        // a cell wholly in a cut face, and those beside it: exact
+        for c in [35, 0, 2, 3, 32, 33] {
+            let (k, v) = (r * 36 + c, across([c as f64 + 0.5, r as f64 + 0.5]));
+            assert!((second[k] - v).abs() < 1e-12, "row {r} col {c}: {} vs {v}", second[k]);
+            assert!((first[k] - v).abs() > 0.1, "row {r} col {c}");
+        }
         for c in [35, 0] {
             let k = r * 36 + c;
-            assert!((second[k] - first[k]).abs() < 1e-13, "row {r} col {c}: {} vs {}", second[k], first[k]);
+            assert!((one_sided[k] - first[k]).abs() < 1e-13, "row {r} col {c}: {} vs {}", one_sided[k], first[k]);
         }
-        // the faces beside it keep a one-sided gradient: exact for a
-        // linear field
         for c in [2, 3, 32, 33] {
-            let v = linear([c as f64 + 0.5, r as f64 + 0.5]);
-            assert!((second[r * 36 + c] - v).abs() < 1e-12, "row {r} col {c}: {} vs {v}", second[r * 36 + c]);
-            assert!((first[r * 36 + c] - v).abs() > 0.1);
+            let (k, v) = (r * 36 + c, across([c as f64 + 0.5, r as f64 + 0.5]));
+            assert!((one_sided[k] - v).abs() < 1e-12, "row {r} col {c}: {} vs {v}", one_sided[k]);
         }
     }
 }
